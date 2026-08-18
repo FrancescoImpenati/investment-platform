@@ -1,0 +1,53 @@
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "investment-intelligence-platform"
+version = "0.1.0"
+description = "Local-first foundation for deterministic investment data workflows."
+readme = "README.md"
+requires-python = ">=3.13,<3.14"
+dependencies = [
+    "duckdb>=1.4,<2",
+    "polars[pyarrow]>=1.35,<2",
+    "pydantic>=2.12,<3",
+    "tzdata>=2025.2",
+]
+
+[dependency-groups]
+dev = [
+    "mypy>=1.18,<2",
+    "pytest>=9,<10",
+    "ruff>=0.14,<1",
+]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/investment_platform"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/investment_platform"]
+
+[tool.ruff]
+target-version = "py313"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["investment_platform"]
+
+[tool.mypy]
+python_version = "3.13"
+strict = true
+plugins = ["pydantic.mypy"]
+files = ["src", "tests"]
+
+[tool.pytest.ini_options]
+addopts = ["--strict-config", "--strict-markers"]
+testpaths = ["tests"]
+markers = [
+    "unit: isolated unit test",
+    "integration: filesystem and analytical-engine integration test",
+]

@@ -1,0 +1,53 @@
+# Local environments and secrets
+.env
+.env.*
+!.env.example
+.venv/
+venv/
+env/
+.secrets/
+
+# Python caches and bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+
+# Coverage and test reports
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+junit.xml
+
+# Build and package artifacts
+build/
+dist/
+site/
+*.egg-info/
+.eggs/
+
+# Local analytical databases and logs
+*.duckdb
+*.duckdb.wal
+*.duckdb.tmp
+*.log
+.codex-log/
+
+# Private or generated market data; data/sample remains trackable
+data/raw/
+data/normalized/
+data/curated/
+data/features/
+
+# Editors and operating systems
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+Desktop.ini
