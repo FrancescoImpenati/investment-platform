@@ -1,0 +1,1 @@
+{"ticker":"XPH1","status":"OK","adjusted":false,"results":[{"t":1751463000000,"o":100.0,"h":101.0,"l":99.5,"c":100.5,"v":1200,"vw":100.25}],"next_url":"https://api.massive.com/v2/aggs/ticker/XPH1/range/5/minute/1751463000000/1751486399999?cursor=SYNTHETIC_PAGE_2"}

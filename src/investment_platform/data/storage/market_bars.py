@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -12,7 +13,7 @@ from uuid import UUID, uuid4
 import duckdb
 import polars as pl
 
-from investment_platform.data.models import AdjustmentState, Timeframe, TradingSession
+from investment_platform.data.models import AdjustmentState, PriceBar, Timeframe, TradingSession
 
 PRICE_BAR_SCHEMA: Final[pl.Schema] = pl.Schema(
     {
@@ -246,6 +247,25 @@ def _coerce_canonical_frame(frame: pl.DataFrame) -> pl.DataFrame:
     return canonical.with_columns(pl.col("quality_flags").list.sort())
 
 
+def price_bars_to_frame(bars: Iterable[PriceBar]) -> pl.DataFrame:
+    """Materialize validated canonical models in the exact analytical storage schema."""
+
+    rows: list[dict[str, object]] = []
+    for bar in bars:
+        row = bar.model_dump(mode="python")
+        row["instrument_id"] = str(bar.instrument_id)
+        row["timeframe"] = bar.timeframe.value
+        row["session"] = bar.session.value
+        row["adjustment_state"] = bar.adjustment_state.value
+        row["source_id"] = str(bar.source_id)
+        row["raw_batch_id"] = str(bar.raw_batch_id)
+        row["quality_flags"] = list(bar.quality_flags)
+        rows.append(row)
+    if not rows:
+        return empty_price_bar_frame()
+    return _coerce_canonical_frame(pl.DataFrame(rows, schema=PRICE_BAR_SCHEMA))
+
+
 class ParquetBarStore:
     """Append-safe Parquet dataset queried through an in-memory DuckDB connection."""
 
@@ -395,4 +415,5 @@ __all__ = [
     "BarSchemaError",
     "ParquetBarStore",
     "empty_price_bar_frame",
+    "price_bars_to_frame",
 ]

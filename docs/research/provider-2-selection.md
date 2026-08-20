@@ -1,22 +1,30 @@
 # Phase 1 Provider 2 selection
 
-> **Status: PROPOSAL — AWAITING APPROVAL**
+> **Status: APPROVED AS PHASE 1 BAKE-OFF PROVIDER 2**
 >
-> Research performed on 2026-08-19. No provider API was called, no credentials were used, and no
-> market-data payload was downloaded. This document selects a candidate for the Phase 1 bake-off;
-> it does not select the production canonical provider.
+> At the 2026-08-19 provider-selection checkpoint, no provider API had been called, no credentials
+> had been used, and no market-data payload had been downloaded. This document records the
+> candidate selection for the Phase 1 bake-off; it does not select the production canonical
+> provider. Subsequent implementation status is recorded below.
 
-## Decision requested
+## Decision recorded
 
-Use **Alpaca Basic** as Provider 2 alongside the required primary candidate, Massive. Use yfinance
-only as a sanity/reference check and never as a production-canonical provider.
+On 2026-08-19, **Alpaca Basic** was approved as Provider 2 alongside the required primary
+candidate, Massive. The approval authorizes an empirical comparison only. It does not select
+Alpaca or Massive as the production-canonical provider. yfinance remains only a sanity/reference
+check and never a production-canonical provider.
 
-The proposal is conditional on two live preflight checks before any meaningful download:
+The approval establishes three separate checks rather than one combined licensing/entitlement
+gate:
 
-1. the configured Alpaca account must actually authorize historical SIP data older than 15 minutes
-   and the corporate-actions endpoint; and
-2. the applicable account and market-data agreements must permit the immutable private raw
-   retention required by the Phase 0 architecture for this research use.
+1. one transient historical SIP API entitlement preflight determines whether the configured Alpaca
+   account authorizes `feed=sip` for data older than 15 minutes; it may run while retention remains
+   ambiguous, discards the response body, and persists no raw artifact;
+2. a later, separate corporate-action endpoint access check determines that endpoint's account and
+   regional entitlement; SIP success does not prove corporate-action access; and
+3. review of the applicable account and market-data agreements determines whether substantive
+   responses may be downloaded and retained as immutable private raw artifacts for this research
+   use. This contractual review is not answered by either API result.
 
 No paid plan is proposed. The adapter must not silently substitute the IEX feed if SIP is not
 entitled, because that would materially change the intended comparison.
@@ -42,7 +50,7 @@ judgment. Terms are summarized for engineering evaluation, not as legal advice.
 | Candidate | Daily and 5-minute US equities | Corporate actions / identifiers | Bake-off access | Licensing fit | International path | Assessment |
 | --- | --- | --- | --- | --- | --- | --- |
 | Massive | Yes; daily and custom 5-minute aggregates | Splits, dividends, point-in-time ticker reference, CIK and FIGI | Basic is free but limited to 5 calls/minute and two years | Private/internal use only unless separately licensed; retention needs confirmation | No established international cash-equity path | Required primary candidate |
-| Alpaca Basic | Yes; bars support `1Day` and `5Min`; historical SIP older than 15 minutes is documented, subject to account entitlement | Rich corporate-actions endpoint; Alpaca UUID, ticker, exchange, CUSIP lookup, and ticker-change `asof` | Free, documented 200 historical requests/minute, history from 2016 | Suitable only for private internal research on the material reviewed; durable raw retention remains unresolved | Global corporate actions exist, but broad international price history is not established | **Recommended Provider 2** |
+| Alpaca Basic | Yes; bars support `1Day` and `5Min`; historical SIP older than 15 minutes is documented, subject to account entitlement | Rich corporate-actions endpoint; Alpaca UUID, ticker, exchange, CUSIP lookup, and ticker-change `asof` | Free, documented 200 historical requests/minute, history from 2016 | **Unresolved**; reviewed material does not establish durable private raw retention or all intended non-display uses | Global corporate actions exist, but broad international price history is not established | **Recommended Provider 2 for the bake-off, subject to the separate gates above** |
 | Twelve Data Basic | Yes, but the standard free US intraday feed represents about 5% of total volume; daily is consolidated EOD | Broad global identifiers; dividend/split endpoints require Grow or Venture | Free tier is rate-limited; required corporate-action coverage is paid | Internal non-display use; termination/deletion obligations reduce long-term fit | Strongest documented international trajectory of the shortlist | Retain as future international candidate |
 | Tiingo Starter | EOD plus 5-minute IEX history | Split/dividend data and Tiingo symbology | Technically accessible on Starter | Current terms prohibit persistent storage on Starter, constrain benchmark analysis, and prohibit reconstructable normalization | Limited evidence of broad multi-exchange equity coverage | Exclude absent written permission |
 | Alpha Vantage free | Daily is available; historical 5-minute and adjusted daily capabilities needed here are premium | Listing-status and split endpoints; weaker stable-identifier story | Free limit is 25 requests/day; core comparison requires premium access | Not evaluated far enough to justify live use | Global-symbol coverage is documented | Reject for this no-purchase bake-off |
@@ -72,7 +80,7 @@ judgment. Terms are summarized for engineering evaluation, not as legal advice.
   agreement applies. The right to retain immutable raw artifacts for the complete intended project
   lifetime is not explicit in the public material reviewed.
 
-### Alpaca Basic — recommended Provider 2
+### Alpaca Basic — recommended Provider 2; licensing fit unresolved
 
 - Alpaca's [market-data overview](https://docs.alpaca.markets/us/docs/about-market-data-api)
   documents a free Basic plan for US stocks and ETFs, history since 2016, and 200 historical
@@ -165,7 +173,10 @@ judgment. Terms are summarized for engineering evaluation, not as legal advice.
   before the feature branch was created.
 - The existing CI runs on both `push` and `pull_request`; it is offline and does not expose provider
   credentials. No CI change is needed for this selection stage.
-- The repository has no live adapter, HTTP dependency, provider SDK, or opt-in live-test mechanism.
+- At the selection checkpoint the repository had no live adapter or opt-in preflight mechanism.
+  Subsequently, Massive and Alpaca adapters, provider-specific normalizers, and a transient Alpaca
+  SIP preflight were implemented and tested offline without a vendor SDK. That implementation does
+  not constitute a live provider observation.
 - None of `MASSIVE_API_KEY`, `APCA_API_KEY_ID`, or `APCA_API_SECRET_KEY` was configured in the
   current process when checked. Only presence was tested; no value was read or logged.
 - No provider endpoint was called. There is therefore no observed claim yet about coverage,
@@ -173,10 +184,12 @@ judgment. Terms are summarized for engineering evaluation, not as legal advice.
 
 ## Interpretation
 
-Alpaca is the best fit for the bounded Phase 1 experiment because it offers, without a proposed
-purchase, the closest match to all three required datasets: daily bars, historical 5-minute bars,
-and corporate actions. It also exposes adjustment controls, pagination, a provider UUID, and
-point-in-time ticker behavior that exercise the Phase 0 boundary meaningfully.
+Alpaca is the best *technical experiment candidate* for the bounded Phase 1 comparison because it
+offers, without a proposed purchase, the closest documented match to all three required datasets:
+daily bars, historical 5-minute bars, and corporate actions. It also exposes adjustment controls,
+pagination, a provider UUID, and point-in-time ticker behavior that exercise the Phase 0 boundary
+meaningfully. This assessment does not establish licensing suitability; durable private raw
+retention and the intended non-display uses remain unresolved.
 
 Massive and Alpaca may both derive US stock data from SIP. Their comparison is consequently not a
 fully independent validation of the underlying tape. It is still useful for testing aggregation,
@@ -208,13 +221,16 @@ minimal live calls:
 7. Can yfinance be kept isolated as a reference tool without adding overlapping Pandas/NumPy
    dependencies to the production environment?
 
-If a preflight denies SIP or corporate-actions access, or if the applicable license forbids the
-required raw retention, stop and request a new decision. Do not substitute a different feed, buy a
-plan, discard raw payloads, or weaken the canonical model.
+If the one SIP entitlement preflight denies SIP, or the later corporate-action access check denies
+that endpoint, stop and request a new decision. If the applicable license forbids the required raw
+retention **or retention remains unresolved**, stop before substantive download or persistence. Do
+not substitute a different feed, buy a plan, run substantive ingestion without the required
+raw-artifact path, or weaken the canonical model. The entitlement-only SIP preflight is deliberately
+transient, may precede retention resolution, and persists no payload.
 
-## Approval gate and exact resume point
+## Approval scope and resume point
 
-No Provider 2 adapter is authorized by this proposal alone. After approval:
+The approval authorizes the Alpaca adapter and bounded bake-off work under these conditions:
 
 1. keep working on `phase-1-provider-bakeoff`;
 2. define the 10–20-instrument sample and bounded date windows;
@@ -223,8 +239,16 @@ No Provider 2 adapter is authorized by this proposal alone. After approval:
    SDKs unless a concrete dependency is separately justified;
 5. require `MASSIVE_API_KEY`, `APCA_API_KEY_ID`, and `APCA_API_SECRET_KEY` only through the process
    environment;
-6. make only minimal entitlement/licensing preflight requests before the reproducible bake-off;
-7. preserve raw artifacts privately and keep every ordinary test offline and deterministic.
+6. make exactly the bounded transient SIP entitlement preflight first, then treat any later
+   corporate-action endpoint check and the contractual retention review as separate gates;
+7. preserve substantive raw artifacts privately only after retention rights are affirmatively
+   established; forbidden or unresolved retention stops substantive download and persistence; and
+   keep every ordinary test offline and deterministic.
 
+The adapters, transient SIP preflight, normalizers, and offline harness are now implemented on the
+same feature branch. The next live step remains the one transient historical-SIP entitlement
+preflight after local credentials are available. A later corporate-action endpoint access check and
+the contractual retention review remain distinct open items; no IEX substitution, paid upgrade, or
+raw persistence is authorized by the Provider 2 approval.
 This stage changes no Phase 0 invariant and makes no recommendation yet about the final canonical
 provider.

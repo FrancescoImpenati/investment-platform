@@ -1,0 +1,1 @@
+{"status":"OK","results":[{"id":"SYNTHETIC-SPLIT-1","ticker":"XPH1","execution_date":"2025-06-10","adjustment_type":"forward_split","split_from":1,"split_to":15},{"id":"SYNTHETIC-STOCK-DIVIDEND-1","ticker":"XPH1","execution_date":"2025-08-01","adjustment_type":"stock_dividend","split_from":1,"split_to":2}]}
