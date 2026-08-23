@@ -1,239 +1,286 @@
-# Provider quality report — Phase 1 intermediate state
+# Provider quality report — Phase 1 licensing stop checkpoint
 
-> **Status: FULL OFFLINE QUALITY GATE PASSED; LIVE BAKE-OFF PENDING**
+> **Status: OFFLINE IMPLEMENTATION AND LIVE ACCESS PREFLIGHTS PASSED; SUBSTANTIVE BAKE-OFF
+> BLOCKED BY MASSIVE'S DEFAULT INDIVIDUAL MARKET-DATA TERMS**
 >
-> Alpaca Basic is approved as Provider 2. The Massive and Alpaca adapters, provider-specific
-> normalizers, comparison harness, and synthetic offline fixtures are implemented. At this
-> intermediate checkpoint no provider API has been called, no credential has been used, and no real
-> or licensed market-data payload has been downloaded. Therefore this report makes **no final
-> primary-provider recommendation**.
+> This is an evidence-bearing Phase 1 checkpoint, not the final provider recommendation. The
+> approved 16-security experiment was not downloaded or compared. No real provider payload,
+> price, volume, corporate action, raw artifact, normalized dataset, or Parquet file is retained in
+> the repository.
 
-The approved research basis is recorded in
-[Provider 2 selection](provider-2-selection.md). The frozen sample, half-open windows, adjustment
-matrix, request budget, calendar oracle, and stop rules are in the
-[provider bake-off design](provider_bakeoff_design.md).
+## Scope and methodology
 
-The four sections below deliberately separate what this repository has measured, what providers
-state in official documentation, project interpretation, and questions that remain open.
+Phase 1 asks whether Massive and Alpaca SIP can feed the Phase 0 market-data foundation reliably
+and sustainably. The preregistered sample, windows, adjustment matrix, session oracle, and request
+budget remain frozen in the [provider bake-off design](provider_bakeoff_design.md). Alpaca Basic is
+the approved Provider 2; the decision record is [Provider 2 selection](provider-2-selection.md).
+
+Evidence is separated as follows:
+
+- **Documented:** a current official provider or exchange statement.
+- **Observed:** something measured directly in an offline test or a deliberately minimal live
+  preflight.
+- **Interpretation:** a project conclusion drawn from documented or observed evidence.
+- **Unresolved:** a question this checkpoint cannot answer.
+
+The operating policy approved after preregistration permits an external private temporary data
+root when durable retention is ambiguous but temporary private processing is not clearly
+restricted. Such a run must still exercise raw artifact, replay, normalization, validation,
+Parquet, DuckDB, and comparison before cleanup. That policy does not override a provider term that
+restricts the non-display processing itself.
+
+## Providers considered
+
+- **Massive Stocks Basic:** required primary *candidate*, not a preselected canonical provider.
+- **Alpaca Trading API Basic:** approved second bake-off provider, with SIP and IEX treated as
+  different datasets.
+- **yfinance:** optional sanity/reference source only; it was not called at this checkpoint and is
+  not a canonical-provider candidate.
+- Twelve Data, Tiingo, EODHD, Finnhub, and other candidates remain background evidence from the
+  Provider 2 selection. They were not promoted into this bake-off.
+
+## Documented capabilities
+
+Official sources were rechecked on **2026-08-23**. These are provider claims, not measured quality.
+
+### Massive
+
+- [Stocks pricing](https://massive.com/pricing?product=stocks) advertises Basic at $0, five API
+  calls per minute, a rolling two years of history, end-of-day recency, US tickers, minute and
+  daily aggregates, reference data, and corporate actions.
+- [Custom Bars](https://massive.com/docs/rest/stocks/aggregates/custom-bars) supports custom
+  five-minute and daily aggregates, one ticker per path, split adjustment, `next_url`, and up to
+  50,000 base aggregates per request.
+- Official split, dividend, and ticker-event endpoints expose the corporate-action families needed
+  by the design, subject to the same rolling Basic history and account entitlement.
+
+### Alpaca
+
+- [About Market Data API](https://docs.alpaca.markets/us/docs/about-market-data-api) documents Basic
+  as free, with historical US stock/ETF data since 2016 and 200 historical requests per minute.
+- [Market Data FAQ](https://docs.alpaca.markets/us/docs/market-data-faq) states that a historical
+  SIP request whose `end` is at least 15 minutes old can be made without the paid subscription.
+  Recent/latest SIP and historical SIP are therefore different entitlement cases.
+- The FAQ defines SIP as consolidated US-exchange activity and IEX as a single exchange. No
+  automatic SIP-to-IEX fallback is methodologically valid.
+- Historical bars support `5Min`, daily bars, multi-symbol batching, a 10,000-point page limit,
+  `next_page_token`, explicit feed selection, adjustment choices, and `asof`. The corporate-action
+  endpoint documents split, dividend, merger, spin-off, name-change, and other action families.
 
 ## Observed evidence
 
-### What was observed offline
+### Recovery and offline checkpoint
 
-The following evidence comes only from deterministic tests against hand-authored synthetic,
-provider-shaped JSON fixtures:
+- Branch, local `HEAD`, and `origin/phase-1-provider-bakeoff` were aligned at
+  `0dc037e Implement Phase 1 offline provider bake-off`; `main` remained at
+  `0355d3f Complete Phase 0 foundation`; the working tree was clean before live preflight.
+- The GitHub Actions push run for `0dc037e` completed successfully:
+  [CI run 32399788050](https://github.com/FrancescoImpenati/investment-platform/actions/runs/32399788050).
+- The Phase 0 + Phase 1 deterministic suite had passed 157 tests with lock check, locked sync,
+  Ruff format/lint, strict mypy, pytest, package build, and `git diff --check` at the offline
+  checkpoint.
+- The finite session schedule is an explicit lookup limited to the preregistered dates and early
+  closes. It is not a production trading-calendar engine.
+- All three required environment variables were present in the live process. Only presence was
+  inspected; values, prefixes, suffixes, and fingerprints were not printed or persisted.
 
-- On 2026-08-20 the complete Phase 0 + Phase 1 offline suite collected and passed **157 tests** on
-  Python 3.13.14. `uv lock --check`, locked dependency sync, Ruff formatting and lint, strict mypy,
-  the complete pytest suite, package build, and `git diff --check` all passed.
+### Alpaca historical SIP preflight
 
-- Both adapters construct bounded daily and 5-minute bar requests and corporate-action requests,
-  emit unchanged paginated `RawBatch` payloads, retain sanitized request metadata, and expose
-  typed authentication, entitlement, rate-limit, HTTP, transport, and malformed-response failures.
-- Massive pagination rejects a `next_url` that changes origin, endpoint, request semantics, or
-  carries a credential parameter. Alpaca pagination preserves page tokens and the requested feed
-  identity. The shared transport does not follow redirects and bounds both success and error
-  response bodies.
-- Alpaca defaults explicitly to SIP, has an explicit old-data SIP entitlement preflight, and does
-  not silently fall back to IEX.
-- Provider-specific normalizers map synthetic Massive and Alpaca bars, splits, dividends, and
-  ticker/name changes into Phase 0 canonical contracts. Malformed or canonically
-  unrepresentable records remain available in the immutable raw artifact and produce diagnostics
-  rather than being silently rewritten or discarded.
-- Phase 1 strengthens request/response validation and provenance binding at the provider boundary.
-  Those boundary checks do not change the Phase 0 canonical schemas or their invariants, and their
-  fixture coverage is not evidence that every live provider case is representable.
-- Synthetic Massive and Alpaca SIP integration paths both exercise the required flow: provider
-  response -> immutable raw artifact -> integrity-checked replay -> provider-specific
-  normalization -> canonical bars -> validation -> Parquet -> DuckDB query. The stored manifests
-  do not contain the synthetic test credentials, and a replayed artifact is reverified before its
-  bytes are exposed to normalization.
-- The deterministic comparison harness measures observation availability, expected missing keys,
-  duplicates, interval boundaries, session and adjustment state, currency, OHLC, volume, VWAP,
-  splits, dividends, and ticker changes. Each discrepancy preserves raw-batch provenance and can
-  be classified as definitional, adjustment, timing/session, missing observation, likely provider
-  issue, or unresolved; ambiguous matches remain unresolved rather than being selected.
-- A runtime summary can recover sanitized response status, page count, latency, and rate-limit
-  fields from raw manifests when a live run eventually provides them.
+On **2026-08-23**, the existing opt-in preflight requested one AAPL historical `5Min` interval,
+`[2025-07-02T13:30:00Z, 2025-07-02T13:35:00Z)`, with explicit `feed=sip`.
 
-The fixtures in `tests/fixtures/providers/` are synthetic. Their symbols, identifiers, values,
-actions, request IDs, and pagination tokens were invented for tests; they are not observations
-from Massive, Alpaca, Yahoo, an exchange, or an issuer.
+- Authentication: **PASS**
+- HTTP result: **200**
+- Requested/served feed: **SIP / SIP**
+- Historical SIP entitlement for the tested old interval: **CONFIRMED**
+- Essential response shape: a non-empty bars collection with the expected symbol/feed context
+- Observed historical rate-limit header: capacity 200; 199 remaining after the request
+- Permanent raw persistence: **NO**
 
-### What has not been observed
+This supports only the statement: **Alpaca historical SIP entitlement confirmed for the tested
+request.** It does not establish corporate-action access, data quality, or retention rights.
 
-No empirical statement can yet be made about either provider's:
+### Massive minimal access preflight
 
-- daily or 5-minute coverage, missing bars, duplicates, OHLC, volume, or VWAP accuracy;
-- actual timestamp, DST, early-close, holiday, session, or daily-bar semantics;
-- split, dividend, or adjusted-versus-unadjusted values;
-- identifier continuity or the SQ-to-XYZ ticker transition;
-- pagination size, batching behavior, latency, rate-limit headers, corrections, or service
-  stability under live conditions;
-- entitlement, historical depth, or permission to retain immutable raw artifacts for this use.
+On **2026-08-23**, a transient request used the implemented adapter for the same AAPL five-minute
+interval with `adjusted=false`.
 
-There are consequently no live raw batch IDs, row counts, discrepancy counts, latency samples, or
-observed rate-limit measurements to report.
+- Authentication: **PASS**
+- HTTP result: **200**
+- Endpoint/timeframe access: **PASS** for the tested historical US-equity aggregate
+- Essential response shape: status `OK`, matching ticker, non-empty result array, adjustment flag,
+  and no continuation URL for this tiny request
+- Adapter compatibility with the observed envelope: **PASS**
+- Indicative single-call latency: approximately **519 ms**
+- Provider request identifier present: **YES**, not retained
+- Rate-limit headers on this response: **NOT OBSERVED**
+- Permanent raw persistence: **NO**
 
-### Intermediate multidimensional evidence grid
+This preflight proves technical access and basic response-envelope compatibility only. It did not
+run the provider response through raw storage, normalization, Parquet, DuckDB, or comparison.
 
-| Dimension | Massive Basic | Alpaca Basic | Current evidence status |
+## Data-quality results
+
+No live data-quality comparison was legally authorized after the licensing gate. Consequently,
+there are no observed paired metrics for availability, expected count, missing bars, duplicates,
+OHLC, volume, VWAP, adjustment behavior, splits, dividends, ticker changes, DST, holidays, or early
+closes. No discrepancy is classified as definitional, adjustment, venue/feed, timing/session,
+missing observation, likely provider issue, or unresolved because no paired core dataset exists.
+
+Synthetic fixture results remain useful engineering evidence but are not market-data-quality
+evidence. The repository must not present fixture agreement as a live provider finding.
+
+## API and engineering results
+
+The offline checkpoint verifies both adapters, paginated raw batches, redirect rejection,
+credential-safe metadata, provider-specific normalizers, canonical validation, Parquet/DuckDB
+integration, corporate-action mapping, malformed responses, and discrepancy provenance with
+synthetic provider-shaped fixtures. The live preflights add only access and response-envelope
+evidence.
+
+| Real-data pipeline stage | Massive | Alpaca SIP | Evidence |
 | --- | --- | --- | --- |
-| Data quality | Adapter and normalizer behavior verified with synthetic Massive-shaped pages | Adapter and normalizer behavior verified with synthetic Alpaca-shaped pages | **Live quality unknown**; no provider observation has been compared |
-| Technical fit | Bounded requests, pagination, immutable raw batches, actions, failures, and normalization implemented | Multi-symbol bars, page tokens, feed provenance, SIP preflight implementation, assets/actions, failures, and normalization implemented | **Full offline repository gate passed**; live endpoint compatibility remains pending |
-| Economics and scalability | Request budget can be estimated from documented Basic limits | Request budget can be estimated from documented Basic limits | **Documentation only**; no billing, throttling, or observed throughput evidence |
-| Licensing and governance | Public material does not resolve durable immutable-raw retention | Public material does not resolve durable immutable-raw retention | **Blocking ambiguity**; no live retention until permission is confirmed |
+| Provider authentication/access | **PASS** | **PASS** | Minimal transient requests |
+| Requested feed entitlement | Not a separate feed parameter | **PASS** | Historical SIP explicitly served |
+| Immutable raw artifact | **NOT RUN** | **NOT RUN** | Substantive run stopped at licensing gate |
+| Checksum/replay | **NOT RUN** | **NOT RUN** | No real raw artifact created |
+| Provider normalization | **NOT RUN** | **NOT RUN** | No live value mapping performed |
+| Canonical validation | **NOT RUN** | **NOT RUN** | No live canonical records created |
+| Analytical Parquet | **NOT RUN** | **NOT RUN** | No real analytical dataset created |
+| DuckDB query | **NOT RUN** | **NOT RUN** | No real Parquet dataset existed |
+| Cross-provider comparison | **NOT RUN** | **NOT RUN** | Massive non-display license missing |
 
-This grid is a readiness assessment, not a provider score and not a winner selection.
+The full real-data pipeline acceptance criterion is therefore **not met**. No canonical-model or
+Phase 0 invariant change was requested or made.
 
-## Provider documentation
+## Licensing and data governance
 
-Official sources were reviewed on 2026-08-19 and are summarized more fully, with links, in
-[Provider 2 selection](provider-2-selection.md). These are provider claims, not observations from
-the implemented adapters.
+This is a pragmatic project assessment, not legal advice. Technical access, feed entitlement,
+observed semantics, and retention/reuse rights are deliberately separate.
 
-### Massive Basic
+### Massive default Individual terms
 
-- Massive advertises a free Stocks Basic tier with five API calls per minute, two years of history,
-  US stocks, end-of-day and minute aggregates, reference data, and corporate actions.
-- Its custom-bars documentation supports daily bars and custom five-minute aggregates, labels an
-  aggregate at interval start, omits a bar when there is no qualifying trade, and documents a
-  maximum of 50,000 base aggregates per query.
-- Aggregates are documented as split-adjusted by default, with an explicit unadjusted option;
-  dividends are not part of that adjustment.
-- Ticker reference, split, dividend, and ticker-event documentation exposes useful identifier and
-  corporate-action fields, including CIK and FIGI when available.
-- The public pricing language describes a rolling two-year availability window. It does not settle
-  whether a response retrieved legitimately during that window may be retained indefinitely as a
-  private immutable raw artifact after it ages out or after access ends.
-- The public market-data terms impose personal/non-commercial, display, derived-use, and
-  redistribution constraints unless another agreement applies. The exact fit for long-lived
-  private raw retention in this platform remains ambiguous.
+The [Massive for Individuals Terms](https://massive.com/legal/individuals-terms-of-service) cover
+the API and incorporate the
+[Market Data Terms](https://massive.com/legal/market-data-terms-of-service). The latter were last
+updated 2025-08-28. They default Market Data to display-only use, restrict non-display use and
+creation of derivative works without a separate license, broadly restrict third-party transfer of
+analytics/research based on Market Data, and require deletion of all Market Data after account
+termination, restriction, or suspension. No public subsequent agreement granting an Individual
+Stocks account the required non-display rights was found.
 
-### Alpaca Basic
-
-- Alpaca documents Basic as free, with US stock and ETF historical data since 2016, a restriction
-  around the latest 15 minutes, and 200 historical API calls per minute.
-- Historical-bars documentation supports daily and five-minute bars, multiple symbols, pagination,
-  `raw`, `split`, `dividend`, `spin-off`, and `all` adjustment values, an `asof` mapping, and an
-  explicit feed parameter.
-- Corporate-actions and assets documentation exposes action families and provider identifiers,
-  including an Alpaca UUID and other identifiers when present.
-- Alpaca's market-data FAQ says historical SIP queries ending at least 15 minutes ago can be made
-  without a paid subscription. A separate official historical-stock-data page describes IEX as the
-  only feed usable without a subscription. The documents therefore do not establish that this
-  particular Basic account will authorize the intended historical SIP request.
-- “History since 2016” describes advertised data availability, not necessarily a contractual right
-  to retain complete raw responses indefinitely. The reviewed agreements do not remove the
-  platform's uncertainty about durable private raw retention after account or agreement changes.
-
-### SIP versus IEX
-
-SIP and IEX are not interchangeable experimental inputs. SIP is intended to represent consolidated
-US market activity, while IEX is a single-venue feed. Substituting IEX after an SIP entitlement
-failure would change coverage, volume, bar construction, and therefore the question being tested.
-The approved adapter behavior is to preserve the requested feed in provenance and stop on SIP
-denial rather than silently continue with IEX.
-
-## Interpretation
-
-### Provider 2 and current decision state
-
-Alpaca Basic is the approved second bake-off provider. It was selected because the documented free
-tier can plausibly exercise the required daily, five-minute, corporate-action, identifier,
-adjustment, pagination, and error paths without a purchase, while providing a materially different
-API and feed model from Massive.
-
-The offline implementation uses the existing `MarketDataProvider` and canonical contracts while
-adding stricter provider-boundary validation and provenance checks; it does not change the Phase 0
-canonical model. Synthetic fixture success does not yet prove that the boundary is sufficient for
-every live response shape or semantic case, nor that either provider's live data is more complete,
-correct, economically sustainable, or legally suitable. Massive remains the required primary
-*candidate*, not the recommended canonical provider. No primary or fallback recommendation is
-justified before the live comparison and retention review.
-
-### Interpretation by decision dimension
-
-| Dimension | Current interpretation | What is needed for a decision |
+| Use | Classification under the default public terms | Phase 1 consequence |
 | --- | --- | --- |
-| Data quality | The harness is capable of preserving disagreement without automatically declaring a winner | Live paired raw batches over the preregistered symbols/windows, session oracle, and investigated discrepancies |
-| Technical architecture | The implemented adapters use the Phase 0 boundary, with Phase 1 validation and provenance hardening confined to that boundary | Live confirmation that response shapes, pagination, timestamps, action date bases, and error behavior remain representable without a canonical-model change |
-| Economics/scalability | The bounded experiment appears to fit documented free-tier request budgets; this is an estimate, not measured throughput | Rechecked current tiers, observed calls/pages/latency/limits, and a later Phase 2 scale model |
-| Licensing/governance | Redistribution is out of scope and raw data must remain private; durable retention permission is not established | Account-specific agreement review or written provider clarification before retaining live raw data |
-| International expansion | Neither implemented adapter currently proves a broad international cash-equity path | A later separately scoped provider evaluation; it must not distort the US-equity bake-off |
+| API access | **CLEARLY PERMITTED**, subject to account/tier | Minimal access preflight was technically successful |
+| Private personal/non-commercial display use | **CLEARLY PERMITTED, BUT LIMITED** | Not a general analytics license |
+| Transient buffering solely incident to receipt/display | **AMBIGUOUS / NEEDS CLARIFICATION** | Does not authorize the bake-off pipeline |
+| Ephemeral raw -> normalization -> Parquet/DuckDB -> comparison | **CLEARLY RESTRICTED absent separate license** | Material stop condition triggered |
+| Durable raw archive for replay/re-normalization | **CLEARLY RESTRICTED for this intended non-display use** | No real raw artifact created |
+| Normalized/derived private storage | **CLEARLY RESTRICTED absent separate license** | No real dataset created |
+| Public display / redistribution | **CLEARLY RESTRICTED absent consent/license** | Out of scope and not attempted |
+| Sanitized data-quality findings in Git/GitHub | **RESTRICTED OR NEEDS WRITTEN CLARIFICATION** | No Massive quality findings were produced or pushed |
+| Account termination/restriction/suspension | **CLEAR OBLIGATION TO CEASE USE AND DELETE** | Phase 2 cannot assume durable history |
 
-### Phase 2 recommendation: private data root
+Temporary lifetime does not change the requested pipeline's non-display character. The approved
+ephemeral policy therefore cannot cure the Massive restriction. An account-specific order form or
+written authorization could change this conclusion; possession of a working API key cannot.
 
-Phase 1 does not relocate the data root or change the Phase 0 storage contract. Based on the
-licensing ambiguity exposed here, Phase 2 should evaluate formally requiring a configurable
-**private data root outside the Git working tree**, on storage with access controls,
-backup/retention rules, and an explicit deletion procedure. The existing
-[storage-layout rule](../data/storage-layout.md) already says storage code must not assume the
-repository's `data/` directory; using a caller-supplied private runtime path for any authorized
-Phase 1 artifact is operator configuration, not a foundation mutation. The repository should retain
-only sanitized manifests or aggregated results that the applicable agreement permits; provider
-payloads must never be added as fixtures. No hard-coded external path or Phase 2 implementation is
-introduced in this phase.
+### Alpaca terms
 
-### Residual role of yfinance
+Alpaca's current [Terms and Conditions](https://files.alpaca.markets/disclosures/library/TermsAndConditions.pdf)
+cover the API and Market Data as Service/Content and permit personal non-commercial use. The
+applicable [Customer Agreement](https://files.alpaca.markets/disclosures/library/AcctAppMarginAndCustAgmt.pdf)
+and incorporated exchange agreements restrict reproduction and furnishing data to others and
+define derived/processed market data broadly.
 
-yfinance remains only an optional sanity/reference check. It is not a production provider, a
-canonical candidate, or an oracle. It has deliberately not been implemented in this stage:
+| Use | Classification | Phase 1 consequence |
+| --- | --- | --- |
+| API access | **CLEARLY PERMITTED**, subject to account/tier | Preflight passed |
+| Historical SIP ending at least 15 minutes ago | **CLEARLY PERMITTED technically** | Tested entitlement passed; not a retention grant |
+| Qualifying private personal/non-commercial processing | **CLEARLY PERMITTED at access/use level** | Ephemeral mode is appropriate |
+| Durable raw retention | **AMBIGUOUS / NEEDS CLARIFICATION** | Do not retain durable raw |
+| Normalized/derived durable storage | **AMBIGUOUS / NEEDS CLARIFICATION** | Do not assume normalization frees the data |
+| Public display / redistribution | **CLEARLY RESTRICTED without suitable authorization** | Out of scope and not attempted |
+| Post-termination retained-data use | **AMBIGUOUS / NEEDS CLARIFICATION** | Requires provider-specific Phase 2 policy |
 
-- adding it would introduce Pandas/NumPy and overlap with the approved Polars-first dependency
-  policy for a component that cannot become the production provider; and
-- spending implementation effort on an unofficial reference path before the two approved live
-  providers run would not resolve the current credential or retention blockers.
+Alpaca alone passes the approved ephemeral-mode gate, but the mandated comparison cannot proceed
+after Massive fails it.
 
-If used later, yfinance results must be labeled separately, must not bypass immutable-raw and
-licensing rules, and agreement among three sources still must not be treated as proof of truth.
+## Cost and scalability
 
-### Authorized stop
+The frozen experiment remains bounded and no download estimate changed:
 
-The Phase 1 live run is stopped before substantive provider download. Once credentials are supplied
-through the approved environment variables, one bounded historical SIP entitlement preflight may
-run even while retention rights remain ambiguous: its response body is discarded and no raw
-artifact is persisted. A successful sanitized result is observed entitlement evidence only. The
-later corporate-action access check is a separate endpoint check, and contractual retention review
-is a separate governance gate. If retention is forbidden or remains unresolved, the substantive
-bake-off and raw persistence remain stopped. No purchase, paid-plan activation, IEX substitution,
-or architectural change is authorized by this intermediate report.
+- Massive: **191 nominal requests**, plus any pagination; at five calls/minute this implies at
+  least 38.2 minutes and roughly 40-45 minutes with conservative pacing.
+- Alpaca: **41 nominal requests**, plus the separate completed SIP preflight and any pagination;
+  the historical-bars portion fits well within the documented 200 requests/minute.
+- Estimated raw responses remain below approximately 5 MB/provider and 10 MB combined, with
+  roughly 0.5-2 MB/provider of analytical Parquet. These remain estimates, not observed byte
+  counts.
 
-## Unresolved questions
+At approximately 500 stocks, Massive's one-ticker aggregate path scales request count much more
+steeply than Alpaca's multi-symbol endpoint; Alpaca's total-point page limit still makes page count
+and ordering important. No throughput or cost conclusion may be upgraded from estimate to evidence
+until an authorized run measures pages, latency, throttling, and correction behavior.
 
-1. **Credentials:** live access still requires `MASSIVE_API_KEY`, `APCA_API_KEY_ID`, and
-   `APCA_API_SECRET_KEY`. Values must remain outside code, tests, logs, manifests, documentation,
-   and Git.
-2. **Massive retention:** does the applicable Basic agreement permit indefinite private retention
-   of immutable raw payloads retrieved while they are within the rolling two-year access window?
-3. **Alpaca retention:** does the applicable account agreement permit indefinite private retention
-   of immutable historical SIP, assets, and corporate-action responses, including after an account
-   or plan change?
-4. **Alpaca SIP entitlement:** will the configured Basic account authorize one historical SIP query
-   ending more than 15 minutes ago? If the preflight returns authentication or entitlement denial,
-   the bake-off must stop; it must not retry the experiment on IEX.
-5. **Alpaca corporate-action access:** after the SIP entitlement result, does a separate minimal
-   check show that the configured account and region authorize the corporate-actions endpoint? SIP
-   success does not answer this question, and neither endpoint result answers the contractual
-   retention question.
-6. **Retention-window gate:** immediately before retrieval, do all Massive request starts still fall
-   inside the then-current advertised two-year window, and do Alpaca endpoints authorize the same
-   fixed windows? A failed gate requires redesign/approval, not silent date movement.
-7. **Live data quality:** what are the paired row counts, expected missing counts, duplicates,
-   OHLC/volume/VWAP discrepancies, and their defensible classifications for the frozen sample?
-8. **Time semantics:** how do both providers actually label daily bars, regular sessions, DST
-   transitions, holidays, and the 2025 early closes? Is a full trading-calendar dependency required
-   for Phase 2?
-9. **Adjustment and actions:** do raw/split-adjusted bars, split ratios, dividends, and event dates
-   agree definitionally, and which action-date fields cannot be represented canonically without
-   losing necessary meaning?
-10. **Identifiers:** can both providers resolve stable provider identifiers and reproduce the
-   SQ-to-XYZ history without treating ticker text as instrument identity?
-11. **Operational behavior:** what pagination, latency, error, rate-limit, and correction behavior
-    is observed under the bounded run?
-12. **Economics at Phase 2 scale:** after empirical page sizes and throughput are known, what plan
-    would be required for bounded backfill, incremental ingestion, and repair? No such plan should
-    be inferred from headline price alone.
-13. **Final recommendation:** which provider, if either, should be primary for US equities, which
-    should be fallback/cross-check, and what residual role should yfinance retain? This decision is
-    explicitly deferred until the live evidence and governance gates are complete.
+No purchase or plan activation was attempted. A paid Massive Individual tier would change history,
+recency, and rate limits but does not by itself demonstrate non-display licensing.
+
+## Recommendation
+
+No canonical US-equity provider recommendation is justified at this checkpoint.
+
+- **Massive** remains the preregistered primary technical candidate, but its default Individual
+  terms are incompatible with the required analytical bake-off absent a separate non-display
+  license. Technical access success does not cure that governance failure.
+- **Alpaca SIP** has confirmed historical entitlement for the tested old request and remains the
+  approved comparison provider. Its durable retention and derived-storage rights still need
+  clarification before an operational historical database.
+- **yfinance** remains an unexecuted sanity/reference option, never a production or canonical
+  provider.
+
+The next decision is not "which values win"; it is whether an applicable Massive agreement grants
+the required private non-display research rights, or whether Phase 1 should be explicitly
+redesigned around a different authorized Provider 1. That decision changes the approved bake-off
+and requires human approval.
+
+## Phase 2 implications
+
+**durable private market-data retention remains a Phase 2 prerequisite.** In particular, durable
+private market-data retention/data root must be solved before relying on Phase 2 as a persistent
+historical market database.
+
+Before Phase 2 can maintain history, the project must define:
+
+- a physically external, configurable private data root with access control and deletion policy;
+- provider-specific rights for raw retention, normalized/derived storage, non-display use, and
+  post-termination handling;
+- long-term licensing and cost assumptions;
+- a reconciliation/winner policy that preserves provenance without averaging disagreements;
+- backfill, incremental update, repair, watermarks, scheduler, retry, and correction behavior;
+- a trading-calendar solution if an authorized live bake-off demonstrates that the finite Phase 1
+  oracle is insufficient.
+
+Loss of raw artifacts after an ephemeral run reduces re-normalization, auditability, correction
+investigation, reproducibility, reconstruction after bugs, and repair/reconciliation reliability.
+Ephemeral processing is therefore a Phase 1 risk-control mechanism, not the target architecture.
+None of these Phase 2 capabilities is implemented here.
+
+## Unresolved questions and exact resume point
+
+1. Does the account have an order form, addendum, or written Massive authorization that expressly
+   permits transient private non-display research, temporary immutable raw artifacts,
+   normalization, Parquet/DuckDB analysis, comparison, and permitted sanitized aggregate
+   reporting?
+2. If authorized, what are Massive's durable raw/derived retention rights during the account term,
+   after downgrade, and after termination?
+3. Does Alpaca corporate-action access work for this account, and how do its action dates behave?
+4. What live paired row counts, discrepancies, action semantics, and calendar behavior occur over
+   the frozen sample?
+5. Does any live case require a canonical-model change? No such evidence exists yet.
+
+Resume only after evidence of the Massive non-display authorization is available, or after an
+explicitly approved Provider 1 redesign. The exact next operation is the Step 6 request-budget
+recheck followed by construction/execution of the external-temporary bake-off runner. No runner was
+implemented at this checkpoint because it could not lawfully be exercised against Massive under
+the default public terms.

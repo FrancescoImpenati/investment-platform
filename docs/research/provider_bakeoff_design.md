@@ -330,12 +330,17 @@ Run these checks in order before the first substantive download.
 3. Do not activate, trial, or purchase a paid plan.
 4. Recheck current rate limits, history, endpoint access, and licensing from official sources.
 
-Failure or ambiguity stops the run before the core dataset.
+A credential, tier, or access failure stops the affected provider before the core dataset. A clear
+contractual restriction on the temporary non-display processing required by this experiment also
+stops the affected provider. Ambiguity limited to *durable* retention does not by itself stop the
+run: if temporary private processing is not clearly restricted, use a private temporary data root
+outside the repository for the complete pipeline, then delete raw and analytical artifacts after
+retaining only permitted sanitized aggregate evidence. This later Phase 1 operating policy
+supersedes the stricter retention-ambiguity stop recorded at preregistration.
 
-This documentary ambiguity does not prevent the single transient SIP entitlement preflight in
-Section 10.3, because that call discards its response body and persists no raw payload. Retention is
-a gate for substantive download and persistence: if the applicable right is forbidden or remains
-unresolved, the run stops before those operations.
+The single transient SIP entitlement preflight in Section 10.3 always discards its response body
+and persists no raw payload. It establishes technical entitlement only; it does not establish
+temporary-processing or durable-retention rights.
 
 ### 10.2 Massive rolling-retention gate
 
@@ -372,10 +377,11 @@ historical-bars probe with explicit `feed=sip`, ending well over 15 minutes in t
   from Massive's consolidated coverage and requires explicit approval as a separate experiment.
 - Do not purchase or activate Algo Trader Plus.
 
-No Alpaca raw response, including the successful preflight body, may be persisted until the
-applicable agreement or an authoritative provider clarification establishes the intended private
-retention and non-display rights. The same documentary gate applies independently to Massive
-before its substantive raw batches are written.
+The successful Alpaca preflight body is never persisted. For the substantive run, durable
+retention ambiguity permits only a private external temporary root when temporary personal
+processing is not clearly restricted. The same documentary assessment applies independently to
+Massive. A provider whose applicable terms clearly restrict this experiment's non-display pipeline
+cannot enter the substantive run without a separate license or written authorization.
 
 The successful transient preflight is an intentional exception to ordinary successful-page
 evidence rules: it has no `RawBatch`, batch ID, payload checksum, persisted page, or replay artifact.
@@ -384,9 +390,11 @@ not prove it, and neither API result resolves the contractual retention review.
 
 ### 10.4 Pagination and size gate
 
-After each **substantive, persistable** response, record status, elapsed time, sanitized provider
-request ID, row count, page number, byte count, checksum, and whether a next page exists. Never log
-a next URL, page token, authenticated URL, or credential. The transient SIP preflight follows the
+After each authorized **substantive** response, record status, elapsed time, sanitized provider
+request ID, row count, page number, byte count, checksum, and whether a next page exists. Durable
+artifacts require affirmative retention rights; otherwise these records and the complete
+raw-to-query flow live only in the external temporary root and are deleted at run end. Never log a
+next URL, page token, authenticated URL, or credential. The transient SIP preflight follows the
 sanitized evidence rule in Section 10.3 instead and is exempt from raw-page/checksum requirements.
 Stop if pagination or bytes materially exceed the preregistered budget before continuing to later
 symbols.

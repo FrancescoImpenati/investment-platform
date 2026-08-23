@@ -120,9 +120,12 @@ AGENTS.md                  Root-wide repository instructions for Codex
 ```
 
 The foundation provides ignored local paths such as `data/raw/` and `data/normalized/`, but a
-technical storage path is not permission to retain licensed data. Phase 1 does not persist live
-provider payloads until the applicable private-retention rights are established. The bake-off
-report evaluates a physically external private data root as a Phase 2 recommendation.
+technical storage path is not permission to retain licensed data. When durable retention is
+ambiguous but temporary private processing is permitted, Phase 1 may use an external temporary
+data root for the complete raw-to-query pipeline and delete it at run end. A provider agreement
+that restricts the required non-display processing still stops that provider's run. The bake-off
+report evaluates a physically external private data root and durable provider-specific retention
+rules as Phase 2 prerequisites.
 
 ## Data, secrets, and licensing
 
