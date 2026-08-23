@@ -31,13 +31,18 @@ pipeline.
 - an intentional 16-security experiment design, sanitized synthetic fixtures, and fully offline
   deterministic tests.
 
-No live market-data request has been made yet. The current implementation and test evidence use
-only hand-authored synthetic provider-shaped payloads. Alpaca is the approved second bake-off
-candidate, not an approved canonical provider; Massive remains the primary candidate under study.
+Minimal transient access preflights succeeded for Alpaca historical SIP and Massive, without
+persisting real payloads. The full 16-security dataset has not been downloaded. Alpaca remains the
+approved comparison provider, not a canonical provider. Massive is a technically validated
+candidate whose full real bake-off is blocked by standard Individual market-data licensing; its
+implementation and synthetic evidence remain intact. Twelve Data Basic was considered as the
+replacement Provider 1 but failed the no-purchase documentary gate because split and dividend
+endpoints require Grow or above, so no Twelve Data adapter or live call was added.
 
 ### Remaining Phase 1 work
 
-- entitlement and retention gates, then a bounded live bake-off of Massive and Alpaca SIP;
+- approval of an eligible Provider 1 path, then a bounded full empirical bake-off against Alpaca
+  SIP;
 - measured provider-quality, technical-capability, economics, and licensing evidence;
 - yfinance only as a bounded sanity check, never as a canonical production source;
 - the final provider recommendation, Phase 1 report, CI-verified pull request, and human review.

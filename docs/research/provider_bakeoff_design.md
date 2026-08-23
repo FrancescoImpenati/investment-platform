@@ -7,6 +7,15 @@
 > evidence. Later observations must be recorded in the provider quality report. Purchases,
 > paid-plan activation, and automatic fallback to a non-comparable feed are not authorized.
 
+> **Provider 1 redesign note (2026-08-23):** Massive is retained as a technically validated
+> candidate whose full real bake-off is blocked by its standard Individual market-data licensing.
+> A user-approved documentary preflight considered Twelve Data as the operational replacement.
+> Twelve Data Basic passed the bars, history, request-budget, and internal non-display gates but
+> failed the mandatory no-purchase corporate-actions gate because `/splits` and `/dividends`
+> require Grow or above. No Twelve Data adapter or revised execution matrix was implemented. See
+> [Provider 1 redesign](provider-1-redesign.md). The frozen sample and time windows below remain
+> reusable after a new Provider 1 decision.
+
 ## 1. Objective and evidence labels
 
 The experiment compares Massive Stocks Basic and Alpaca Trading API Basic for the first real
