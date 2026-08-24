@@ -209,11 +209,17 @@ def test_pipeline_aggregation_is_sanitized_and_contains_no_provenance_fields() -
     assert summary.total_latency_ms == 25
     assert summary.maximum_latency_ms == 15
     assert summary.api_credit_usage_sample_count == 2
-    assert summary.total_api_credits_used == 2
+    assert summary.maximum_api_credits_used_in_window == 1
     assert summary.pipeline_pass is True
     names = {item.name for item in fields(summary)}
     assert not names.intersection({"batch_id", "sha256", "path", "payload", "url"})
     assert aggregate_pipeline_metrics("twelve_data", ()).pipeline_pass is False
+    assert (
+        aggregate_pipeline_metrics(
+            "twelve_data", (_batch_metrics(latency_ms=10, rows=0),)
+        ).pipeline_pass
+        is False
+    )
 
 
 def test_comparison_summary_drops_values_and_raw_batch_provenance() -> None:

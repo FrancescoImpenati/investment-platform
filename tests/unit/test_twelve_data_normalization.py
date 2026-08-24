@@ -288,6 +288,34 @@ def test_twelve_data_inclusive_wire_end_is_filtered_by_canonical_half_open_inter
     ]
 
 
+def test_twelve_data_daily_wire_guard_record_is_filtered_from_half_open_interval() -> None:
+    payload = json.loads(_fixture("bars_daily_standard.json"))
+    payload["values"] = [
+        {**payload["values"][0], "datetime": market_date}
+        for market_date in ("2025-07-02", "2025-07-03")
+    ]
+    request = _request(
+        refs=(_REFS[0],),
+        timeframe=Timeframe.ONE_DAY,
+        start=datetime(2025, 7, 2, tzinfo=UTC),
+        end=datetime(2025, 7, 3, tzinfo=UTC),
+    )
+
+    result = normalize_twelve_data_bars(
+        _batch(json.dumps(payload).encode(), request),
+        request,
+        ingested_at=_INGESTED,
+        session_schedule=_SCHEDULE,
+        daily_semantics=DailyBarSemantics.REGULAR_SESSION,
+    )
+
+    assert len(result.bars) == 1
+    assert result.bars[0].timestamp_start == _SUMMER.start
+    assert [issue.code for issue in result.issues] == [
+        NormalizationIssueCode.OUTSIDE_REQUESTED_INTERVAL
+    ]
+
+
 def test_twelve_data_malformed_and_out_of_session_records_are_not_silently_rewritten() -> None:
     payload = json.loads(_fixture("bars_daily_standard.json"))
     payload["meta"]["interval"] = "5min"

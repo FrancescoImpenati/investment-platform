@@ -136,15 +136,18 @@ def _wire_datetime_ceiling(value: datetime) -> str:
 
 def _wire_bounds(request: BarRequest) -> tuple[str, str]:
     if request.timeframe is Timeframe.ONE_DAY:
-        inclusive_end = request.end - timedelta(microseconds=1)
-        return request.start.date().isoformat(), inclusive_end.date().isoformat()
+        # Twelve Data's daily end_date behaved as an exclusive exchange-date bound in the
+        # Phase 1 live response. Over-fetch through the last UTC date that can contain an
+        # admissible bar; the normalizer still enforces the canonical [start, end) interval.
+        exclusive_end_date = (request.end - timedelta(microseconds=1)).date() + timedelta(days=1)
+        return request.start.date().isoformat(), exclusive_end_date.isoformat()
     return _wire_datetime_floor(request.start), _wire_datetime_ceiling(request.end)
 
 
 def _maximum_possible_points(request: BarRequest) -> int:
     if request.timeframe is Timeframe.ONE_DAY:
-        inclusive_end = request.end - timedelta(microseconds=1)
-        return (inclusive_end.date() - request.start.date()).days + 1
+        exclusive_end_date = (request.end - timedelta(microseconds=1)).date() + timedelta(days=1)
+        return (exclusive_end_date - request.start.date()).days
     return math.ceil((request.end - request.start) / timedelta(minutes=5)) + 1
 
 

@@ -1,345 +1,473 @@
-# Provider quality report — Phase 1 Provider 1 redesign gate checkpoint
+# Provider quality report — Phase 1 final empirical evidence
 
-> **Status: MASSIVE LICENSING STOP APPROVED; TWELVE DATA BASIC DOCUMENTARY GATE FAILED;
-> FULL EMPIRICAL BAKE-OFF STILL PENDING**
+> **Status: BARS-FIRST EMPIRICAL BAKE-OFF COMPLETE; FINAL REVIEW CANDIDATE**
 >
-> This is an evidence-bearing Phase 1 checkpoint, not the final provider recommendation. The
-> approved 16-security experiment was not downloaded or compared. No real provider payload,
-> price, volume, corporate action, raw artifact, normalized dataset, or Parquet file is retained in
-> the repository.
+> The full empirical comparison is **Alpaca historical SIP versus Twelve Data Basic**. Corporate
+> actions are an asymmetric capability assessment. Massive remains a technically evaluated but
+> licensing-blocked candidate; yfinance remains a sanity source only. No real market-data payload,
+> raw artifact, canonical observation, Parquet part, credential, or provider response is retained
+> in Git.
 
 ## Scope and methodology
 
-Phase 1 asks which provider combination can feed the Phase 0 market-data foundation reliably and
-sustainably. The preregistered sample, windows, adjustment matrix, and session oracle remain frozen
-in the [provider bake-off design](provider_bakeoff_design.md). Alpaca Basic is the approved Provider
-2; the decision record is [Provider 2 selection](provider-2-selection.md). After Massive's
-licensing stop, Twelve Data was approved for a documentary Provider 1 preflight. Its result is in
-[Provider 1 redesign](provider-1-redesign.md).
+Phase 1 tested whether the Phase 0 boundary can carry real US-equity data through the complete
+pipeline and what provider combination is technically, economically, and contractually plausible.
+The frozen design used 16 securities and bounded 2025 windows for daily bars, five-minute bars,
+split adjustment, ticker continuity, DST, holidays, and early closes. The sample and dates are in
+[provider_bakeoff_design.md](provider_bakeoff_design.md).
 
-Evidence is separated as follows:
+The approved execution amendment replaced the licensing-blocked Massive substantive run with
+Twelve Data Basic and made corporate actions asymmetric. The principal empirical comparison was:
 
-- **Documented:** a current official provider or exchange statement.
-- **Observed:** something measured directly in an offline test or a deliberately minimal live
-  preflight.
-- **Interpretation:** a project conclusion drawn from documented or observed evidence.
-- **Unresolved:** a question this checkpoint cannot answer.
+```text
+Alpaca historical SIP
+vs
+Twelve Data Basic standard partial-volume intraday feed and separately documented consolidated EOD
+```
 
-The operating policy approved after preregistration permits an external private temporary data
-root when durable retention is ambiguous but temporary private processing is not clearly
-restricted. Such a run must still exercise raw artifact, replay, normalization, validation,
-Parquet, DuckDB, and comparison before cleanup. That policy does not override a provider term that
-restricts the non-display processing itself.
+The substantive run took place on **2026-08-24** using the account's Alpaca historical SIP access
+and Twelve Data Basic entitlement. Execution started from implementation checkpoint `740d671`;
+provider-boundary differences discovered live were converted into synthetic regressions and are
+included in the final Phase 1 commit.
+
+| Evidence window | Securities | Effective request |
+| --- | ---: | --- |
+| Daily core, raw and split-adjusted | 16 | `[2025-05-27, 2025-12-06)`; 135 expected sessions each |
+| Calendar/DST five-minute probes | 16 | 2025-03-07, 03-10, 07-02, 07-03, 10-31, and 11-03 regular-session bounds |
+| Split-boundary five-minute probes | ORLY, IBKR, NFLX | Sessions immediately before/on their 2025 adjusted-trading dates, raw and split-adjusted |
+| Ticker continuity | SQ/XYZ | `[2025-01-13, 2025-01-29)`; 11 expected sessions |
+| Dividend/all adjustment evidence | KO | `[2025-06-09, 2025-06-21)`; 9 expected sessions |
+| Corporate-action capability | 16 | Alpaca 2025 `process_date` query; Twelve action endpoints documented but not Basic-entitled |
+
+Every substantive provider page followed this flow inside a private Windows temporary directory
+physically outside the repository:
+
+```text
+HTTP response
+-> immutable RawArtifact
+-> checksum/replay
+-> provider-specific normalization
+-> canonical validation
+-> Parquet
+-> DuckDB query
+-> pairwise comparison
+-> aggregate non-substitutive evidence
+-> cleanup
+```
+
+The comparison never averages discordant values and never selects a winner per observation.
+Twelve Data has no native per-bar VWAP in `/time_series`, so VWAP was excluded rather than compared
+to its separate technical-indicator endpoint. Values from raw or canonical live datasets were not
+copied into this report.
+
+Evidence labels used below are:
+
+- **DOCUMENTED:** stated in current official documentation or applicable public terms;
+- **OBSERVED:** measured directly in the Phase 1 run;
+- **INTERPRETATION:** a project conclusion from documented and observed evidence;
+- **UNRESOLVED:** not established by this experiment.
 
 ## Providers considered
 
-- **Full empirical bake-off:** no Provider 1 is currently eligible; Alpaca SIP remains ready as the
-  approved comparison provider.
-- **Massive Stocks Basic:** **technically validated candidate — full real bake-off blocked by
-  standard Individual market-data licensing**. Its implementation and evidence remain intact.
-- **Twelve Data Basic:** proposed operational Provider 1, stopped before implementation because
-  corporate-action endpoints require a paid tier.
-- **yfinance:** optional sanity/reference source only; it was not called at this checkpoint and is
-  not a canonical-provider candidate.
-- Tiingo, Alpha Vantage, EODHD, Finnhub, and other candidates remain alternatives considered in the
-  Provider 2 research. None currently has an approved no-purchase full-bake-off path.
+### Full empirical bake-off
+
+- **Alpaca historical SIP:** consolidated US market feed for the tested historical requests.
+- **Twelve Data Basic:** standard US intraday feed, explicitly not SIP-equivalent.
+
+### Technically evaluated but licensing-blocked
+
+- **Massive:** **technically validated candidate — full real bake-off blocked by standard
+  Individual market-data licensing**. The adapter, normalizer, synthetic fixtures, tests, minimal
+  access preflight, and engineering/licensing findings remain intact. No further Massive
+  market-data processing was performed after the approved stop.
+
+### Sanity/reference
+
+- **yfinance 1.6.0:** isolated research-only sanity source. It is not a `MarketDataProvider`, was
+  not added to project dependencies, and is not a production or canonical-provider candidate.
+
+### Alternatives considered
+
+Tiingo, Alpha Vantage, EODHD, Finnhub, and other candidates remain background to the provider
+selection. They were not expanded into third or fourth empirical bake-offs. The prior research is
+preserved in [provider-2-selection.md](provider-2-selection.md).
 
 ## Documented capabilities
 
-Official sources were rechecked on **2026-08-23**. These are provider claims, not measured quality.
+### Alpaca
+
+- **DOCUMENTED:** [About Market Data API](https://docs.alpaca.markets/us/docs/about-market-data-api)
+  describes historical US stocks/ETFs since 2016 and 200 historical requests per minute on Basic.
+- **DOCUMENTED:** the [Market Data FAQ](https://docs.alpaca.markets/us/docs/market-data-faq) says an
+  historical SIP request ending at least 15 minutes in the past can be made without the paid market
+  data subscription. SIP consolidates US-exchange activity; IEX is a distinct partial feed.
+- **DOCUMENTED:** [historical bars](https://docs.alpaca.markets/us/reference/stockbars) support
+  multi-symbol queries, `5Min`/daily data, paging, adjustments, explicit feed selection, and `asof`
+  ticker mapping.
+- **DOCUMENTED:** [corporate actions](https://docs.alpaca.markets/us/reference/corporateactions-1)
+  expose multiple event families and paginate using a query bounded by `process_date`.
+
+### Twelve Data
+
+- **DOCUMENTED:** [Individual pricing](https://twelvedata.com/pricing) lists Basic at eight API
+  credits/minute and 800/day, with internal non-display usage, US equities/ETFs, batch requests,
+  and reference data.
+- **DOCUMENTED:** [`/time_series`](https://twelvedata.com/docs#time-series) supports `5min`, `1day`,
+  date bounds, up to 5,000 points, and `none`, `splits`, `dividends`, and `all` adjustment modes.
+- **DOCUMENTED:** the [historical-data guide](https://support.twelvedata.com/en/articles/5214728-getting-historical-data)
+  says combined `start_date`/`end_date` returns the bounded period and that adding `outputsize`
+  would restrict it. The live daily boundary behavior is recorded separately below.
+- **DOCUMENTED:** the [US equities guide](https://support.twelvedata.com/en/articles/9935903-us-equities-market-data)
+  says the default feed covers all listed US symbols but represents approximately **5% of total US
+  trading volume**. It separately describes next-day EOD as consolidated full-market data.
+- **DOCUMENTED:** `/splits` and `/dividends` require Grow or above. No equivalent official
+  ticker-change-history endpoint was identified. Basic was used without purchase or upgrade.
 
 ### Massive
 
-- [Stocks pricing](https://massive.com/pricing?product=stocks) advertises Basic at $0, five API
-  calls per minute, a rolling two years of history, end-of-day recency, US tickers, minute and
-  daily aggregates, reference data, and corporate actions.
-- [Custom Bars](https://massive.com/docs/rest/stocks/aggregates/custom-bars) supports custom
-  five-minute and daily aggregates, one ticker per path, split adjustment, `next_url`, and up to
-  50,000 base aggregates per request.
-- Official split, dividend, and ticker-event endpoints expose the corporate-action families needed
-  by the design, subject to the same rolling Basic history and account entitlement.
+- **DOCUMENTED:** [Stocks pricing](https://massive.com/pricing?product=stocks) and
+  [custom bars](https://massive.com/docs/rest/stocks/aggregates/custom-bars) describe Basic US
+  aggregates, minute/daily support, split adjustment, reference data, corporate actions, and
+  pagination.
+- **DOCUMENTED:** the default [Individual terms](https://massive.com/legal/individuals-terms-of-service)
+  and [Market Data terms](https://massive.com/legal/market-data-terms-of-service) do not grant the
+  non-display processing and derived-use rights required by this bake-off without a separate
+  license.
 
-### Alpaca
+### yfinance
 
-- [About Market Data API](https://docs.alpaca.markets/us/docs/about-market-data-api) documents Basic
-  as free, with historical US stock/ETF data since 2016 and 200 historical requests per minute.
-- [Market Data FAQ](https://docs.alpaca.markets/us/docs/market-data-faq) states that a historical
-  SIP request whose `end` is at least 15 minutes old can be made without the paid subscription.
-  Recent/latest SIP and historical SIP are therefore different entitlement cases.
-- The FAQ defines SIP as consolidated US-exchange activity and IEX as a single exchange. No
-  automatic SIP-to-IEX fallback is methodologically valid.
-- Historical bars support `5Min`, daily bars, multi-symbol batching, a 10,000-point page limit,
-  `next_page_token`, explicit feed selection, adjustment choices, and `asof`. The corporate-action
-  endpoint documents split, dividend, merger, spin-off, name-change, and other action families.
-
-### Twelve Data documentary preflight
-
-- [Individual pricing](https://twelvedata.com/pricing) lists Basic as free with internal
-  non-display use, eight API credits per minute, 800 per day, US equities/ETFs, reference data, and
-  batch requests.
-- `/time_series` supports `5min`, `1day`, bounded dates, up to 5,000 points per symbol, and
-  adjustment values `none`, `splits`, `dividends`, and `all`. Every frozen 2025 bar window is inside
-  the documented US daily and intraday history.
-- The official [US equities guide](https://support.twelvedata.com/en/articles/9935903-us-equities-market-data)
-  states that the default feed covers all listed symbols but represents approximately **5% of
-  total US trading volume**. It separately describes next-day EOD as consolidated full-market
-  data. Twelve Data five-minute data is therefore not SIP-equivalent.
-- `/splits` and `/dividends` each cost 20 credits per symbol and require Grow individual or above;
-  their calendar variants are also paid-tier-only. No official ticker-change-history endpoint was
-  found.
-- The no-purchase full-bake-off gate therefore failed before adapter implementation, credential
-  configuration, or API access.
+- **DOCUMENTED:** [PyPI](https://pypi.org/project/yfinance/) describes yfinance as unaffiliated
+  with Yahoo, intended for research/education, and reminds users that Yahoo data is for personal
+  use and subject to Yahoo terms.
+- **DOCUMENTED:** [`yfinance.download`](https://ranaroussi.github.io/yfinance/reference/api/yfinance.download.html)
+  documents an exclusive `end`, explicit adjustment controls, actions, and the limitation that
+  intraday data cannot extend beyond the last 60 days.
 
 ## Observed evidence
 
-### Recovery and offline checkpoint
+### Access and entitlement preflights
 
-- Branch, local `HEAD`, and `origin/phase-1-provider-bakeoff` were aligned at
-  `0dc037e Implement Phase 1 offline provider bake-off`; `main` remained at
-  `0355d3f Complete Phase 0 foundation`; the working tree was clean before live preflight.
-- The GitHub Actions push run for `0dc037e` completed successfully:
-  [CI run 32399788050](https://github.com/FrancescoImpenati/investment-platform/actions/runs/32399788050).
-- The Phase 0 + Phase 1 deterministic suite had passed 157 tests with lock check, locked sync,
-  Ruff format/lint, strict mypy, pytest, package build, and `git diff --check` at the offline
-  checkpoint.
-- The finite session schedule is an explicit lookup limited to the preregistered dates and early
-  closes. It is not a production trading-calendar engine.
-- All three required environment variables were present in the live process. Only presence was
-  inspected; values, prefixes, suffixes, and fingerprints were not printed or persisted.
+- **OBSERVED — Alpaca:** one old AAPL `5Min` request with explicit `feed=sip` returned HTTP 200 and
+  SIP data. Historical SIP entitlement was confirmed for that request; there was no IEX fallback.
+- **OBSERVED — Massive:** one tiny AAPL aggregate request returned HTTP 200 with a compatible
+  envelope and approximately 519 ms latency. This proved technical access only, before the
+  licensing stop.
+- **OBSERVED — Twelve Data:** a one-bar AAPL `5min` preflight returned HTTP 200, one canonical row,
+  and passed raw artifact, replay, normalization, validation, Parquet, and DuckDB. The provider
+  returned the wire `end` observation; the canonical half-open guard correctly excluded it.
+- Two Twelve Data preflight calls were made because the first local result renderer referenced an
+  obsolete metric name. The duplicate was minimal and no response survived cleanup.
 
-### Provider 1 redesign recovery
+### Frozen sample and request budget
 
-- The redesign resumed with local and remote `phase-1-provider-bakeoff` aligned at
-  `ce2b63a Document live preflights and licensing stop`; `main` remained frozen at `0355d3f` and
-  the working tree was clean.
-- Twelve Data research used only current official public documentation. No account, credential,
-  endpoint, demo key, trial symbol, or response was used.
-- The documentary gate stopped before adapter implementation because Basic lacks split/dividend
-  endpoint entitlement. This is a tier finding, not a live provider-quality observation.
+The sample was AAPL, MSFT, NVDA, AMZN, NFLX, JPM, IBKR, BRK.B, XYZ, XOM, JNJ, KO, BA, ORLY, NEE,
+and SPY. Provider identifiers remained external to the stable internal UUIDs. BRK.B/BRK-B and
+SQ/XYZ exercised punctuation and temporal identity.
 
-### Alpaca historical SIP preflight
+The successful substantive run used:
 
-On **2026-08-23**, the existing opt-in preflight requested one AAPL historical `5Min` interval,
-`[2025-07-02T13:30:00Z, 2025-07-02T13:35:00Z)`, with explicit `feed=sip`.
+| Provider | Reference | Canonical bars | Auxiliary evidence | Successful-run total |
+| --- | ---: | ---: | ---: | ---: |
+| Alpaca | 16 asset lookups | 20 frozen requests + 1 mapped ticker request | 1 unmapped ticker control + 1 action page + 2 adjustment probes | **41 calls** |
+| Twelve Data | 16 symbol searches | 30 batched requests | 2 adjustment probes | **48 calls / 160 reserved credits** |
 
-- Authentication: **PASS**
-- HTTP result: **200**
-- Requested/served feed: **SIP / SIP**
-- Historical SIP entitlement for the tested old interval: **CONFIRMED**
-- Essential response shape: a non-empty bars collection with the expected symbol/feed context
-- Observed historical rate-limit header: capacity 200; 199 remaining after the request
-- Permanent raw persistence: **NO**
+Twelve Data pacing held each rolling minute to eight credits. Provider headers exposed current
+window usage and remaining capacity; `api-credits-used` was observed to be cumulative within the
+window, not a per-call cost. A live regression changed the aggregate from an invalid sum to the
+observed maximum of eight. The successful run plus preflight, one early interrupted reference
+pass, and bounded corrective diagnostics consumed an estimated **210 Twelve Data credits**, safely
+below the 800/day Basic allowance.
 
-This supports only the statement: **Alpaca historical SIP entitlement confirmed for the tested
-request.** It does not establish corporate-action access, data quality, or retention rights.
+The successful main run created approximately **2.96 MB** of raw HTTP bodies across both providers
+before cleanup. The main analytical pipelines wrote 35 Alpaca and 58 Twelve Data Parquet parts.
+Corrective reruns were bounded and ephemeral.
 
-### Massive minimal access preflight
+### Live differences from synthetic fixtures
 
-On **2026-08-23**, a transient request used the implemented adapter for the same AAPL five-minute
-interval with `adjusted=false`.
+Three provider-boundary differences were found and converted to offline regressions:
 
-- Authentication: **PASS**
-- HTTP result: **200**
-- Endpoint/timeframe access: **PASS** for the tested historical US-equity aggregate
-- Essential response shape: status `OK`, matching ticker, non-empty result array, adjustment flag,
-  and no continuation URL for this tiny request
-- Adapter compatibility with the observed envelope: **PASS**
-- Indicative single-call latency: approximately **519 ms**
-- Provider request identifier present: **YES**, not retained
-- Rate-limit headers on this response: **NOT OBSERVED**
-- Permanent raw persistence: **NO**
+1. Alpaca's live Asset Object used official field `class=us_equity`; the synthetic fixture used
+   `asset_class`. Reference verification now accepts either official wire spelling.
+2. Twelve Data daily `end_date` behaved as an **exclusive exchange-date bound**. The adapter now
+   sends the exclusive date after the last potentially admissible UTC day, while the normalizer
+   retains strict `[start, end)` filtering. A targeted rerun restored the missing 2025-12-05 daily
+   bars and the 2025-01-28 XYZ bar; a synthetic non-midnight regression protects the generic
+   boundary.
+3. Twelve Data's `api-credits-used` header is a cumulative current-window counter. It is no longer
+   summed as though it were the cost of each request.
 
-This preflight proves technical access and basic response-envelope compatibility only. It did not
-run the provider response through raw storage, normalization, Parquet, DuckDB, or comparison.
+No canonical model or Phase 0 architectural invariant changed.
 
 ## Data-quality results
 
-No live data-quality comparison was legally authorized after the licensing gate. Consequently,
-there are no observed paired metrics for availability, expected count, missing bars, duplicates,
-OHLC, volume, VWAP, adjustment behavior, splits, dividends, ticker changes, DST, holidays, or early
-closes. No discrepancy is classified as definitional, adjustment, venue/feed, timing/session,
-missing observation, likely provider issue, or unresolved because no paired core dataset exists.
+### Availability, missing bars, and duplicates
 
-Synthetic fixture results remain useful engineering evidence but are not market-data-quality
-evidence. The repository must not present fixture agreement as a live provider finding.
+The frozen design expected 12,179 canonical rows per provider across distinct adjustment segments.
+After the daily-boundary regression and targeted real-data rerun:
+
+| Segment | Expected | Alpaca SIP | Twelve Data Basic | Finding |
+| --- | ---: | ---: | ---: | --- |
+| Daily unadjusted | 2,160 | 2,160 | 2,160 | Complete on both |
+| Daily split-adjusted | 2,160 | 2,160 | 2,160 | Complete on both |
+| Six calendar `5m` sessions | 6,912 | 6,906 | 6,912 | Six Alpaca missing observations, all ORLY |
+| Split-boundary `5m` unadjusted | 468 | 460 | 468 | Eight Alpaca ORLY observations missing on 2025-06-09 |
+| Split-boundary `5m` split-adjusted | 468 | 460 | 468 | Same eight wire observations absent in the separate adjustment segment |
+| SQ/XYZ ticker continuity | 11 | 11 | 11 | Complete after Twelve daily-boundary fix |
+| **Total** | **12,179** | **12,157** | **12,179** | No duplicates on either provider |
+
+The six calendar gaps were ORLY at 2025-03-07 19:35/19:40 UTC and 2025-03-10
+15:50/16:45/18:30/18:45 UTC. These remain **missing observations**, consistent with a bar service
+that emits intervals only when eligible trades exist; Phase 1 does not label them a provider error.
+
+### OHLC and volume discrepancies
+
+Strict numeric tolerances deliberately count small rounding differences. Counts below are metric
+findings, not numbers of bad rows.
+
+| Segment | Classification | Key observed result |
+| --- | --- | --- |
+| Daily unadjusted | unresolved discrepancy | 5,920 metric differences; maximum OHLC absolute difference about 0.00503; mean relative volume difference about 0.0269%, maximum about 23.94% |
+| Daily split-adjusted | unresolved discrepancy | 5,990 metric differences; similarly small maximum OHLC difference; daily volume outlier remains unresolved |
+| Calendar `5m` | volume: venue/feed; OHLC: unresolved | 6,701 volume and 12,427 OHLC metric differences; mean relative volume difference about 15.27%, maximum about 99.05% |
+| Split-boundary `5m` raw | volume: venue/feed; OHLC: unresolved | 454 volume and 787 OHLC metric differences; mean relative volume difference about 19.71%, maximum about 98.38% |
+| Split-boundary `5m` split-adjusted | volume: venue/feed; OHLC: unresolved | 454 volume and 1,006 OHLC metric differences; mean relative volume difference about 19.71%, maximum about 98.38% |
+| Ticker continuity daily | unresolved discrepancy | 13 small metric differences; no availability gap after correction |
+
+Intraday OHLC outliers were materially larger than daily rounding differences: across the six
+calendar sessions the maximum absolute differences were approximately 10.39 open, 5.27 high,
+2.22 low, and 4.08 close in provider price units. The known feed coverage can affect which trades
+set OHLC as well as volume, but it does not prove the cause of every outlier. OHLC remains an
+**unresolved discrepancy**; the partial venue/feed coverage is the leading interpretation, not an
+automatic provider-error label or a demonstrated causal classification.
+
+The documented “approximately 5%” feed statement does not imply that every Twelve Data bar must
+show exactly 5% of SIP volume; observed relative differences were heterogeneous. Future volume,
+VWAP, liquidity, breadth, and trade-intensity features must not treat the standard Twelve Data US
+intraday feed as interchangeable with SIP.
+
+### VWAP and adjustments
+
+- **OBSERVED:** Alpaca bars exposed native per-bar VWAP; Twelve Data `/time_series` did not.
+  Cross-provider VWAP was therefore **not semantically comparable**.
+- **OBSERVED:** raw versus split-adjusted daily values differed on 147 matched rows for each
+  provider.
+- **OBSERVED:** around the three split cases, 234/468 Twelve Data five-minute rows changed under
+  split adjustment. Alpaca changed 226/460 because the eight missing ORLY pre-split bars were not
+  present in either adjustment segment.
+- **OBSERVED:** for KO over `[2025-06-09, 2025-06-21)`, Alpaca `dividend` and `all` each differed
+  from unadjusted on all 9 matched daily rows. After the daily-boundary fix, Twelve Data
+  `dividends` and `all` likewise differed on all 9 matched rows.
+- **INTERPRETATION:** dividend-only and provider `all` modes remain provider-native evidence; they
+  were not forced into a canonical adjustment enum with stronger semantics.
 
 ## API and engineering results
 
-The offline checkpoint verifies both adapters, paginated raw batches, redirect rejection,
-credential-safe metadata, provider-specific normalizers, canonical validation, Parquet/DuckDB
-integration, corporate-action mapping, malformed responses, and discrepancy provenance with
-synthetic provider-shaped fixtures. The live preflights add only access and response-envelope
-evidence.
+### Real pipeline acceptance
 
-| Real-data pipeline stage | Massive | Alpaca SIP | Evidence |
-| --- | --- | --- | --- |
-| Provider authentication/access | **PASS** | **PASS** | Minimal transient requests |
-| Requested feed entitlement | Not a separate feed parameter | **PASS** | Historical SIP explicitly served |
-| Immutable raw artifact | **NOT RUN** | **NOT RUN** | Substantive run stopped at licensing gate |
-| Checksum/replay | **NOT RUN** | **NOT RUN** | No real raw artifact created |
-| Provider normalization | **NOT RUN** | **NOT RUN** | No live value mapping performed |
-| Canonical validation | **NOT RUN** | **NOT RUN** | No live canonical records created |
-| Analytical Parquet | **NOT RUN** | **NOT RUN** | No real analytical dataset created |
-| DuckDB query | **NOT RUN** | **NOT RUN** | No real Parquet dataset existed |
-| Cross-provider comparison | **NOT RUN** | **NOT RUN** | Massive non-display license missing |
+| Stage | Alpaca SIP | Twelve Data Basic |
+| --- | --- | --- |
+| Provider authentication/access | **PASS** | **PASS** |
+| Exact US-equity reference resolution (16/16) | **PASS** | **PASS** |
+| Requested feed/dataset | **PASS — SIP** | **PASS — standard US feed** |
+| Immutable raw artifact before inspection | **PASS** | **PASS** |
+| Checksum/replay | **PASS** | **PASS** |
+| Provider-specific normalization | **PASS** | **PASS** |
+| Canonical validation | **PASS; zero flags** | **PASS; zero flags** |
+| Analytical Parquet | **PASS** | **PASS** |
+| DuckDB replay/query | **PASS** | **PASS** |
+| Pairwise comparison | **PASS** | **PASS** |
+| Temporary-root cleanup | **PASS** | **PASS** |
 
-The full real-data pipeline acceptance criterion is therefore **not met**. No canonical-model or
-Phase 0 invariant change was requested or made.
+Comparison `PASS` means that every designed segment exercised the harness with nonempty provider
+observations and no duplicates. It does not mean perfect completeness: missing expected keys and
+numeric discrepancies remain explicit quality evidence below that structural acceptance result.
+
+The successful main pipelines processed 21 Alpaca raw batches/12,157 rows and 30 Twelve Data raw
+batches/12,146 rows before the end-boundary correction. The affected targeted rerun processed all
+4,331 daily/ticker rows per provider and passed every pipeline stage, producing the corrected
+12,179-row Twelve total stated above.
+
+Main-run response latency was indicative, not a benchmark: Alpaca averaged about 806 ms across 21
+bar pages (maximum 1,260 ms); Twelve Data averaged about 580 ms across 30 bar pages (maximum
+1,729 ms). No bar request paginated in the bounded sample. Alpaca corporate actions returned one
+page. No authentication, entitlement, rate-limit, redirect, or malformed-response error occurred
+during the successful run. Offline tests cover those failures and forbid silent retries/fallbacks.
+
+### Corporate-action capability assessment
+
+Alpaca corporate-action entitlement passed for the current account and one 2025 `process_date`
+query over the sample.
+
+| Family | Live records | Canonical result |
+| --- | ---: | --- |
+| Forward splits | 3 | 3 canonical split actions |
+| Cash dividends | 33 | Not canonicalized: live records lacked currency and USD was not invented |
+| Name changes | 1 | Not canonicalized: no reliable effective date beyond process-date semantics |
+| Cash mergers | 1 | Retained in raw; unsupported by the Phase 0 action union |
+| Stock mergers | 1 | Retained in raw; unsupported by the Phase 0 action union |
+
+This produced 34 `incomplete_corporate_action` and two `unsupported_corporate_action` findings,
+plus one warning that the query is bounded by process date. The canonical model correctly refuses
+to invent dividend currency or event effective dates. Phase 1 does not require a model expansion
+for merger types.
+
+Twelve Data Basic `/splits` and `/dividends` were **not called** because they are not entitled.
+No official equivalent ticker-change-history endpoint was identified. Higher-tier capabilities
+remain **DOCUMENTED**, not empirically tested.
+
+Ticker continuity was nevertheless tested through bars: Alpaca `asof` mapping returned all 11
+expected SQ/XYZ sessions, while a mapping-disabled control returned only 6 current-symbol rows.
+Twelve Data returned 5 SQ plus 6 XYZ rows after the end-boundary fix. yfinance returned all 11
+under XYZ and zero under SQ, demonstrating a third, distinct identifier mapping policy.
+
+## Trading-calendar findings
+
+- **OBSERVED:** full sessions contained 78 five-minute intervals per symbol. Twelve Data returned
+  all expected intervals in every calendar window. Alpaca's only calendar gaps were six ORLY bars.
+- **OBSERVED:** the 2025-07-03 early close contained 42 intervals per symbol, or 672 rows/provider.
+- **OBSERVED:** 2025-03-07/10 and 2025-10-31/11-03 used the correct UTC shift across US DST; no
+  normalization issue or out-of-session bar was produced.
+- **OBSERVED:** daily completeness was consistent with the five frozen closed sessions in scope,
+  including exchange holidays; no holiday bar was introduced.
+- **INTERPRETATION:** Phase 2 needs a maintained exchange-calendar source for scalable expected-row
+  checks and early closes. The 148-session frozen lookup remains experiment-only and is not a
+  production calendar engine.
+
+## yfinance sanity/reference result
+
+Using yfinance 1.6.0 in an isolated temporary environment with `auto_adjust=False`:
+
+- all 16 symbols returned 135 daily rows, or **2,160 total**, for the core daily window;
+- the core window exposed one split each for IBKR, NFLX, and ORLY and 25 dividend events across ten
+  sample securities;
+- the old AAPL 2025-07-02 five-minute query returned **zero rows**, consistent with the documented
+  60-day intraday limitation;
+- SQ returned zero continuity rows while XYZ returned all 11, reflecting Yahoo's mapping policy;
+- cache and downloaded data were deleted; no dependency or lockfile change was made.
+
+This is useful sanity evidence for daily availability and the three split cases, not an independent
+production feed or a substitute for licensed provider data.
 
 ## Licensing and data governance
 
-This is a pragmatic project assessment, not legal advice. Technical access, feed entitlement,
-observed semantics, and retention/reuse rights are deliberately separate.
+This is an engineering assessment, not legal advice. Technical access, feed entitlement, data
+semantics, and retention/reuse rights remain separate.
 
-### Massive default Individual terms
+| Provider | Temporary private processing | Durable raw/reversible retention | Public display/redistribution | Termination consequence |
+| --- | --- | --- | --- | --- |
+| Alpaca | **CLEARLY PERMITTED at personal/non-commercial access/use level** | **AMBIGUOUS / NEEDS CLARIFICATION** | **RESTRICTED without authorization** | Retained-data rights unresolved |
+| Twelve Data | **CLEARLY PERMITTED for entitled internal use** | **AMBIGUOUS on exact duration/operational use** | **RESTRICTED; underlying values not published** | Public terms require deletion within 30 days after expiration/termination |
+| Massive Individual | **CLEARLY RESTRICTED for this non-display bake-off absent separate license** | **CLEARLY RESTRICTED for intended use** | **RESTRICTED** | Cease use/delete under applicable terms |
+| yfinance/Yahoo | Research/personal sanity use only | Not assessed as a durable project source | Not authorized by this experiment | Subject to Yahoo terms |
 
-The [Massive for Individuals Terms](https://massive.com/legal/individuals-terms-of-service) cover
-the API and incorporate the
-[Market Data Terms](https://massive.com/legal/market-data-terms-of-service). The latter were last
-updated 2025-08-28. They default Market Data to display-only use, restrict non-display use and
-creation of derivative works without a separate license, broadly restrict third-party transfer of
-analytics/research based on Market Data, and require deletion of all Market Data after account
-termination, restriction, or suspension. No public subsequent agreement granting an Individual
-Stocks account the required non-display rights was found.
+The approved **ephemeral/private mode** was applied to Alpaca, Twelve Data, and yfinance. One
+interrupted live run left a temporary directory because the process received an external interrupt;
+the exact verified root was immediately removed. The successful run and every corrective diagnostic
+reported cleanup `PASS`. Repository and environment scans found no credential or real/private
+market-data file.
 
-| Use | Classification under the default public terms | Phase 1 consequence |
-| --- | --- | --- |
-| API access | **CLEARLY PERMITTED**, subject to account/tier | Minimal access preflight was technically successful |
-| Private personal/non-commercial display use | **CLEARLY PERMITTED, BUT LIMITED** | Not a general analytics license |
-| Transient buffering solely incident to receipt/display | **AMBIGUOUS / NEEDS CLARIFICATION** | Does not authorize the bake-off pipeline |
-| Ephemeral raw -> normalization -> Parquet/DuckDB -> comparison | **CLEARLY RESTRICTED absent separate license** | Material stop condition triggered |
-| Durable raw archive for replay/re-normalization | **CLEARLY RESTRICTED for this intended non-display use** | No real raw artifact created |
-| Normalized/derived private storage | **CLEARLY RESTRICTED absent separate license** | No real dataset created |
-| Public display / redistribution | **CLEARLY RESTRICTED absent consent/license** | Out of scope and not attempted |
-| Sanitized data-quality findings in Git/GitHub | **RESTRICTED OR NEEDS WRITTEN CLARIFICATION** | No Massive quality findings were produced or pushed |
-| Account termination/restriction/suspension | **CLEAR OBLIGATION TO CEASE USE AND DELETE** | Phase 2 cannot assume durable history |
+The public/private boundary emerging from Phase 1 is:
 
-Temporary lifetime does not change the requested pipeline's non-display character. The approved
-ephemeral policy therefore cannot cure the Massive restriction. An account-specific order form or
-written authorization could change this conclusion; possession of a working API key cannot.
+```text
+Public repository: code, architecture, tests, schemas, synthetic fixtures, aggregate findings
+Private runtime: credentials, licensed raw, canonical real data, restricted derivatives
+```
 
-### Alpaca terms
+**durable provider-compatible private market-data retention must be solved before a persistent
+historical ingestion system is deployed.** Ephemeral mode proves the pipeline but sacrifices raw
+replay, re-normalization, correction investigation, historical audit, reproducibility, and robust
+repair/reconciliation.
 
-Alpaca's current [Terms and Conditions](https://files.alpaca.markets/disclosures/library/TermsAndConditions.pdf)
-cover the API and Market Data as Service/Content and permit personal non-commercial use. The
-applicable [Customer Agreement](https://files.alpaca.markets/disclosures/library/AcctAppMarginAndCustAgmt.pdf)
-and incorporated exchange agreements restrict reproduction and furnishing data to others and
-define derived/processed market data broadly.
-
-| Use | Classification | Phase 1 consequence |
-| --- | --- | --- |
-| API access | **CLEARLY PERMITTED**, subject to account/tier | Preflight passed |
-| Historical SIP ending at least 15 minutes ago | **CLEARLY PERMITTED technically** | Tested entitlement passed; not a retention grant |
-| Qualifying private personal/non-commercial processing | **CLEARLY PERMITTED at access/use level** | Ephemeral mode is appropriate |
-| Durable raw retention | **AMBIGUOUS / NEEDS CLARIFICATION** | Do not retain durable raw |
-| Normalized/derived durable storage | **AMBIGUOUS / NEEDS CLARIFICATION** | Do not assume normalization frees the data |
-| Public display / redistribution | **CLEARLY RESTRICTED without suitable authorization** | Out of scope and not attempted |
-| Post-termination retained-data use | **AMBIGUOUS / NEEDS CLARIFICATION** | Requires provider-specific Phase 2 policy |
-
-Alpaca passes the approved ephemeral-mode gate, but it still lacks an eligible Provider 1 for the
-mandated comparison.
-
-### Twelve Data terms and tier entitlement
-
-The [Twelve Data Terms](https://twelvedata.com/terms) grant authorized Internal Use access,
-processing, storage, and non-reversible Derived Data. Basic pricing explicitly includes internal
-non-display usage, and official personal-use guidance includes education, research, development,
-and testing. The default US feed is described as requiring no additional exchange license for
-internal use.
-
-| Use | Classification | Phase 1 consequence |
-| --- | --- | --- |
-| Basic personal/internal/non-commercial use | **CLEARLY PERMITTED** | Licensing scope matches this project |
-| Basic internal non-display processing | **CLEARLY PERMITTED** | Ephemeral pipeline would be authorized for entitled datasets |
-| Temporary raw and analytical storage | **CLEARLY PERMITTED for authorized data** | External temporary root and cleanup remain appropriate |
-| Durable raw/reversible normalized storage | **AMBIGUOUS on exact duration** | Treat normalized bars as provider Data |
-| Non-reversible derived aggregates | **CLEARLY PERMITTED during subscription** | Keep any future report non-substitutive and attributed |
-| Redistribution/public underlying values | **RESTRICTED without add-on/agreement** | Out of scope |
-| Termination/expiration | **DELETE DATA WITHIN 30 DAYS** | Durable operational history still requires Phase 2 resolution |
-| Basic split/dividend endpoints | **NOT ENTITLED** | Technical tier gate fails despite licensing pass |
-
-Licensing and endpoint entitlement are separate. The former passes; the paid corporate-action
-entitlement prevents Twelve Data Basic from entering the full empirical bake-off.
+Reversible normalized bars remain close enough to provider data that Phase 1 does not assume they
+are freely retainable derived data. The retained report metrics are deliberately aggregate,
+non-substitutive analytical evidence; that distinction does not replace provider-specific legal
+clarification for a durable history.
 
 ## Cost and scalability
 
-The frozen experiment remains bounded and no download estimate changed:
-
-- Massive: **191 nominal requests**, plus any pagination; at five calls/minute this implies at
-  least 38.2 minutes and roughly 40-45 minutes with conservative pacing.
-- Alpaca: **41 nominal requests**, plus the separate completed SIP preflight and any pagination;
-  the historical-bars portion fits well within the documented 200 requests/minute.
-- Twelve Data Basic bars/reference plan: **161 credits across approximately 49 HTTP requests**,
-  within its 800-credit daily cap and requiring roughly 22-25 minutes at eight credits/minute.
-  Full-sample splits and dividends would add at least 640 credits but are unavailable on Basic.
-- Estimated raw responses remain below approximately 5 MB/provider and 10 MB combined, with
-  roughly 0.5-2 MB/provider of analytical Parquet. These remain estimates, not observed byte
-  counts.
-
-At approximately 500 stocks, Massive's one-ticker aggregate path scales request count much more
-steeply than Alpaca's multi-symbol endpoint; Alpaca's total-point page limit still makes page count
-and ordering important. No throughput or cost conclusion may be upgraded from estimate to evidence
-until an authorized run measures pages, latency, throttling, and correction behavior.
-
-No purchase, trial, account creation, API key use, or plan activation was attempted. Twelve Data
-Grow could expose split/dividend endpoints, but purchase is not authorized and no documented
-ticker-change-history endpoint has been identified.
+- **Alpaca:** the 16-security successful run required 41 calls and stayed well inside the observed
+  historical allowance. Multi-symbol requests are efficient, though approximately 500 symbols
+  will increase points, pages, and request partitioning materially.
+- **Twelve Data Basic:** the successful run required 48 calls/160 credits and roughly 20 minutes at
+  eight credits/minute. The experiment fit within 800/day without purchase. At 500 symbols, even
+  one batched request dimension approaches 500 credits; the full multi-window design cannot scale
+  on Basic's daily allowance. Paid economics must be evaluated before operational ingestion.
+- **Massive:** the one-ticker aggregate surface is technically capable but scales request count more
+  steeply and remains blocked by default Individual licensing, regardless of API price.
+- **Storage:** the bounded raw run was under 3 MB, but 500-stock backfill, corrections, and replay
+  would create a materially different durable storage and licensing problem.
 
 ## Recommendation
 
-No canonical US-equity provider recommendation is justified at this checkpoint.
+Phase 1 does not support one global winner for all datasets.
 
-- **Massive** is a **technically validated candidate — full real bake-off blocked by standard
-  Individual market-data licensing**. Its adapter, normalizer, tests, fixtures, preflight, and
-  findings remain retained.
-- **Alpaca SIP** has confirmed historical entitlement for the tested old request and remains the
-  approved comparison provider. Its durable retention and derived-storage rights still need
-  clarification before an operational historical database.
-- **Twelve Data Basic** is licensing-compatible for internal non-display bars and has a useful
-  deliberately partial intraday feed, but cannot be the approved full Provider 1 without paid
-  corporate actions or an explicit bars-only methodology change.
-- **yfinance** remains an unexecuted sanity/reference option, never a production or canonical
-  provider.
+1. **Primary US historical consolidated-bars candidate: Alpaca SIP.** It is the strongest tested
+   fit for five-minute US bars where consolidated volume, per-bar VWAP, and trade coverage matter.
+   It also remains a future broker/paper-trading candidate. This recommendation is conditional on
+   resolving durable retention and long-term non-display rights before Phase 2 persists history.
+2. **Secondary/reference and future international-bars candidate: Twelve Data.** Daily US bars
+   showed strong OHLC agreement and complete corrected availability, and the internal-use terms
+   fit the research workflow better. Its standard US intraday feed must not back volume, VWAP,
+   liquidity, breadth, or similar consolidated-market features. International coverage was
+   documented but not empirically tested in Phase 1.
+3. **Corporate actions: use a dataset-specific source policy.** Alpaca is technically useful for
+   splits and raw event discovery, but current cash-dividend and name-change fields were
+   insufficient for the canonical contract. Twelve Data Basic actions are unavailable. A dedicated
+   or separately licensed source may be required.
+4. **Massive:** retain the exact status **technically validated candidate — full real bake-off
+   blocked by standard Individual market-data licensing**. Reconsider only with explicit written
+   rights or a different agreement.
+5. **yfinance:** retain solely as a bounded sanity/reference source; never make it canonical.
 
-The next decision is whether to authorize Twelve Data Grow/temporary research entitlement, approve
-a bars-only methodological exception, or select another Provider 1. No empirical winner can be
-chosen before one of those paths is approved and executed.
+No multi-provider orchestration, curated winner policy, or automatic reconciliation is implemented
+in Phase 1.
+
+## Unresolved questions
+
+- What durable raw, normalized, and derived-data retention rights apply to the exact Alpaca account
+  and SIP use after subscription/account termination?
+- What Twelve Data retention duration and operational-history rights apply beyond the public
+  internal-use/deletion language?
+- Can Alpaca supply an authoritative currency for cash dividends and an effective date for name
+  changes, or must another action source be used?
+- What explains the largest daily-volume and intraday-OHLC outliers after feed-definition effects?
+- Which provider/tier is economically viable for approximately 500 symbols, corrections, and
+  recurrent updates?
+- How does Twelve Data perform on the international markets that motivate its future role?
 
 ## Phase 2 implications
 
-**durable private market-data retention remains a Phase 2 prerequisite.** In particular, durable
-private market-data retention/data root must be solved before relying on Phase 2 as a persistent
-historical market database.
+Before operational historical ingestion, Phase 2 must explicitly design and approve:
 
-Before Phase 2 can maintain history, the project must define:
+- a physically external durable private data root and provider-specific retention policy;
+- long-term licensing assumptions and deletion behavior;
+- a dataset/provider selection and reconciliation/winner policy;
+- backfill partitioning and request budgeting;
+- incremental updates, persistent watermarks, and correction windows;
+- repair/replay from retained raw evidence;
+- scheduler, retry, pacing, and failure-state behavior;
+- a maintained exchange calendar for holidays, DST, early closes, and expected counts;
+- a corporate-action source capable of currency and reliable effective-date semantics.
 
-- a physically external, configurable private data root with access control and deletion policy;
-- provider-specific rights for raw retention, normalized/derived storage, non-display use, and
-  post-termination handling;
-- long-term licensing and cost assumptions;
-- a reconciliation/winner policy that preserves provenance without averaging disagreements;
-- backfill, incremental update, repair, watermarks, scheduler, retry, and correction behavior;
-- a trading-calendar solution if an authorized live bake-off demonstrates that the finite Phase 1
-  oracle is insufficient.
+For Phase 3/4 feature work, consolidated volume, provider-native VWAP, breadth, liquidity, and
+trade-intensity inputs must come from a consolidated or otherwise explicitly fit-for-purpose feed.
+Twelve Data's standard partial-volume US intraday feed cannot be substituted silently for SIP,
+although its international coverage remains a separate future hypothesis to test.
 
-Loss of raw artifacts after an ephemeral run reduces re-normalization, auditability, correction
-investigation, reproducibility, reconstruction after bugs, and repair/reconciliation reliability.
-Ephemeral processing is therefore a Phase 1 risk-control mechanism, not the target architecture.
-None of these Phase 2 capabilities is implemented here.
+None of those Phase 2 capabilities is implemented by this report or the finite Phase 1 runner.
 
-## Unresolved questions and exact resume point
+## Learning notes
 
-1. Will a paid Twelve Data Grow plan or a temporary research entitlement be explicitly authorized?
-2. If Twelve Data is retained, can its support identify a ticker-event/history endpoint for the
-   SQ-to-XYZ case?
-3. Alternatively, is a bars-only Twelve Data vs Alpaca SIP experiment acceptable even though it is
-   not a complete corporate-action head-to-head comparison?
-4. Should another Provider 1 be selected under the original no-purchase requirements?
-5. Does Alpaca corporate-action access work for this account, and how do its action dates behave?
-6. What live paired row counts, discrepancies, action semantics, and calendar behavior occur over
-   the frozen sample?
-7. Does any live case require a canonical-model change? No such evidence exists yet.
+Real data validated the Phase 0 separation of concerns. Raw-first persistence made it possible to
+discover provider wire behavior without contaminating the canonical contract. The strict half-open
+boundary caught an end-date mismatch rather than silently losing or duplicating a trading day.
+Stable UUIDs allowed SQ/XYZ to expose three different ticker-history policies without changing
+instrument identity. Explicit adjustment states prevented provider `all` and dividend-only modes
+from being mislabeled as a stronger canonical guarantee.
 
-Resume only after one of the Provider 1 alternatives in
-[Provider 1 redesign](provider-1-redesign.md) is explicitly approved. No Twelve Data adapter or
-runner was implemented because Basic cannot complete the authorized experiment.
+The bake-off also showed that “data quality” is multidimensional. Twelve Data was complete after a
+wire fix yet definitionally unsuitable for consolidated intraday volume. Alpaca SIP had six
+legitimate-looking ORLY gaps while providing the richer feed. Corporate-action access did not imply
+canonical completeness because currency and effective date were absent. Finally, API access did
+not settle retention rights. Those distinctions are precisely why provider boundaries, provenance,
+validation, and data governance must stay separate in the platform architecture.

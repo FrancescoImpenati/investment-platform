@@ -121,7 +121,8 @@ def _persist_aux_pages(
 
 
 def _is_alpaca_us_equity(root: Mapping[str, object], expected_symbol: str) -> bool:
-    return root.get("symbol") == expected_symbol and root.get("asset_class") == "us_equity"
+    asset_class = root.get("asset_class", root.get("class"))
+    return root.get("symbol") == expected_symbol and asset_class == "us_equity"
 
 
 def _is_twelve_data_us_equity(value: Mapping[str, object], expected_symbol: str) -> bool:
@@ -649,7 +650,12 @@ def _compare_segments(
             excluded_metrics=(ComparisonMetric.VWAP,),
         )
         sanitized = sanitize_comparison_report(segment, report)
-        segment_pass = sanitized.left_duplicate_count == 0 and sanitized.right_duplicate_count == 0
+        segment_pass = (
+            sanitized.left_observation_count > 0
+            and sanitized.right_observation_count > 0
+            and sanitized.left_duplicate_count == 0
+            and sanitized.right_duplicate_count == 0
+        )
         all_pass = all_pass and segment_pass
         output.append(
             {
@@ -660,6 +666,7 @@ def _compare_segments(
                 "volume_classification": (
                     "venue_feed_difference" if intraday else "unresolved_discrepancy"
                 ),
+                "ohlc_classification": "unresolved_discrepancy",
             }
         )
     return output, all_pass
@@ -823,6 +830,16 @@ def run_live_bakeoff(
             },
             "adjustment_evidence": adjustment_evidence,
             "pipeline_acceptance": {
+                "alpaca_reference": (
+                    "PASS"
+                    if alpaca_references["exactly_resolved"] == len(PHASE1_SECURITIES)
+                    else "FAIL"
+                ),
+                "twelve_data_reference": (
+                    "PASS"
+                    if twelve_references["exactly_resolved"] == len(PHASE1_SECURITIES)
+                    else "FAIL"
+                ),
                 "alpaca_sip": "PASS" if alpaca_summary.pipeline_pass else "FAIL",
                 "twelve_data_basic": "PASS" if twelve_summary.pipeline_pass else "FAIL",
                 "comparison": "PASS" if comparison_pass else "FAIL",

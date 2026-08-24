@@ -2,6 +2,7 @@
 
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import cast
 from uuid import UUID
 
 import pytest
@@ -58,6 +59,9 @@ def test_reference_matching_rejects_cross_market_symbol_collisions() -> None:
     assert phase1_bakeoff_live._is_alpaca_us_equity(
         {"symbol": "XPH1", "asset_class": "us_equity"}, "XPH1"
     )
+    assert phase1_bakeoff_live._is_alpaca_us_equity(
+        {"symbol": "XPH1", "class": "us_equity"}, "XPH1"
+    )
     assert not phase1_bakeoff_live._is_alpaca_us_equity(
         {"symbol": "XPH1", "asset_class": "crypto"}, "XPH1"
     )
@@ -77,6 +81,64 @@ def test_reference_matching_rejects_cross_market_symbol_collisions() -> None:
         },
         "XPH1",
     )
+
+
+def test_empty_provider_segments_cannot_pass_comparison_acceptance() -> None:
+    comparisons, passed = phase1_bakeoff_live._compare_segments({}, {})
+
+    assert passed is False
+    assert comparisons
+    assert all(item["comparison_pass"] is False for item in comparisons)
+
+
+def test_intraday_volume_is_feed_defined_but_ohlc_differences_remain_unresolved() -> None:
+    start = datetime(2025, 7, 2, 13, 30, tzinfo=UTC)
+    left = PriceBar(
+        instrument_id=UUID("10000000-0000-4000-8000-000000000001"),
+        timeframe=Timeframe.FIVE_MINUTES,
+        timestamp_start=start,
+        timestamp_end=start + timedelta(minutes=5),
+        open=100,
+        high=101,
+        low=99,
+        close=100.5,
+        volume=1_000,
+        session=TradingSession.REGULAR,
+        adjustment_state=AdjustmentState.UNADJUSTED,
+        source_id=UUID("20000000-0000-4000-8000-000000000001"),
+        raw_batch_id=UUID("30000000-0000-4000-8000-000000000001"),
+        retrieved_at=datetime(2026, 8, 24, 12, tzinfo=UTC),
+        ingested_at=datetime(2026, 8, 24, 12, tzinfo=UTC),
+    )
+    right = left.model_copy(
+        update={
+            "open": 101,
+            "volume": 100,
+            "source_id": UUID("20000000-0000-4000-8000-000000000002"),
+            "raw_batch_id": UUID("30000000-0000-4000-8000-000000000002"),
+        }
+    )
+
+    comparisons, _ = phase1_bakeoff_live._compare_segments(
+        {Phase1BarSegment.CALENDAR_FIVE_MINUTE: (left,)},
+        {Phase1BarSegment.CALENDAR_FIVE_MINUTE: (right,)},
+    )
+    calendar = next(
+        item
+        for item in comparisons
+        if item["segment"] == Phase1BarSegment.CALENDAR_FIVE_MINUTE.value
+    )
+
+    assert calendar["ohlc_classification"] == "unresolved_discrepancy"
+    assert calendar["volume_classification"] == "venue_feed_difference"
+    classifications = dict(
+        cast(
+            tuple[tuple[str, int], ...],
+            calendar["discrepancy_counts_by_classification"],
+        )
+    )
+    assert classifications["unresolved_discrepancy"] == 1
+    assert classifications["venue_feed_difference"] == 1
 
 
 def test_adjustment_summary_does_not_treat_two_missing_volumes_as_different() -> None:

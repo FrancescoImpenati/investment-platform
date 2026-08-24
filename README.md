@@ -4,9 +4,9 @@ Investment Intelligence Platform is a Python-first, local-first foundation for c
 validating, storing, and analyzing market data. The long-term goal is a daily research system that
 combines deterministic quantitative analytics with later, clearly separated AI interpretation.
 
-The approved Phase 0 foundation is frozen. **Phase 1 — Provider Bake-off** is in progress on its
-feature branch. It is not an investment product, a live trading system, or a complete market-data
-pipeline.
+The approved Phase 0 foundation is frozen. **Phase 1 — Provider Bake-off** is a final review
+candidate on its feature branch. It is not an investment product, a live trading system, or a
+production market-data ingestion service.
 
 ## Current status
 
@@ -21,31 +21,26 @@ pipeline.
   in-memory DuckDB queries;
 - tests, locked Python tooling, CI, architecture documentation, and durable repository guidance.
 
-### Phase 1 work in progress
+### Phase 1 review candidate
 
-- bounded standard-library HTTP adapters for Massive and Alpaca, with no provider SDKs;
+- bounded standard-library HTTP adapters for Massive, Alpaca, and Twelve Data, with no provider
+  SDKs;
 - explicit Alpaca SIP/IEX source identity and no implicit feed fallback;
 - provider-specific normalization with finite session oracles and explicit semantic-gap findings;
 - a pairwise quality harness that preserves raw-batch provenance and does not average or select
   conflicting provider values;
-- an intentional 16-security experiment design, sanitized synthetic fixtures, and fully offline
-  deterministic tests.
+- an intentional 16-security experiment design, sanitized synthetic fixtures, fully offline
+  deterministic tests, and an opt-in ephemeral live runner.
 
-Minimal transient access preflights succeeded for Alpaca historical SIP and Massive, without
-persisting real payloads. The full 16-security dataset has not been downloaded. Alpaca remains the
-approved comparison provider, not a canonical provider. Massive is a technically validated
-candidate whose full real bake-off is blocked by standard Individual market-data licensing; its
-implementation and synthetic evidence remain intact. Twelve Data Basic was considered as the
-replacement Provider 1 but failed the no-purchase documentary gate because split and dividend
-endpoints require Grow or above, so no Twelve Data adapter or live call was added.
-
-### Remaining Phase 1 work
-
-- approval of an eligible Provider 1 path, then a bounded full empirical bake-off against Alpaca
-  SIP;
-- measured provider-quality, technical-capability, economics, and licensing evidence;
-- yfinance only as a bounded sanity check, never as a canonical production source;
-- the final provider recommendation, Phase 1 report, CI-verified pull request, and human review.
+Minimal transient access preflights succeeded for Alpaca historical SIP, Twelve Data Basic, and
+Massive. The complete bounded bar pipeline and comparison ran ephemerally for Alpaca SIP versus
+Twelve Data Basic; yfinance remained an isolated sanity source. Real payloads and analytical data
+were deleted after the runs and never entered Git. Massive remains a **technically validated
+candidate — full real bake-off blocked by standard Individual market-data licensing**; its
+implementation and synthetic evidence remain intact. Twelve Data corporate actions were not
+upgraded: `/splits` and `/dividends` are unavailable on Basic, so actions were assessed
+asymmetrically. See the [provider quality report](docs/research/provider_quality_report.md) for the
+measured evidence and dataset-specific recommendation.
 
 Later phases may add:
 
@@ -107,9 +102,9 @@ uv build
 ```
 
 Normal tests and CI require no API credentials or network. Opt-in live Phase 1 work reads
-`MASSIVE_API_KEY`, `APCA_API_KEY_ID`, and `APCA_API_SECRET_KEY` from the process environment.
-`.env.example` contains empty names for local setup, but the application does not load `.env`
-files; secrets must never be committed or printed.
+`MASSIVE_API_KEY`, `APCA_API_KEY_ID`, `APCA_API_SECRET_KEY`, and `TWELVE_DATA_API_KEY` from the
+process environment. `.env.example` contains empty names for local setup, but the application does
+not load `.env` files; secrets must never be committed or printed.
 
 ## Repository layout
 
@@ -119,7 +114,7 @@ tests/                     Unit and integration tests
 data/sample/               Synthetic or explicitly redistributable examples only
 docs/architecture/         Design document and ADRs
 docs/data/                 Storage and data-contract documentation
-docs/research/             Provider bake-off template and later research
+docs/research/             Provider selection, frozen design, and empirical evidence
 PLAN.md                    Phase 0 implementation contract
 AGENTS.md                  Root-wide repository instructions for Codex
 ```

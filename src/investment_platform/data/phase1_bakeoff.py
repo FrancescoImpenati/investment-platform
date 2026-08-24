@@ -715,7 +715,7 @@ class SanitizedProviderPipelineSummary:
     maximum_latency_ms: float | None
     minimum_rate_limit_remaining: float | None
     api_credit_usage_sample_count: int
-    total_api_credits_used: float
+    maximum_api_credits_used_in_window: float | None
     pipeline_pass: bool
 
 
@@ -894,11 +894,12 @@ def aggregate_pipeline_metrics(
         and batch.duckdb_query_pass
         for batch in batches
     )
+    canonical_row_count = sum(batch.normalized_row_count for batch in batches)
     return SanitizedProviderPipelineSummary(
         provider=normalized_provider,
         batch_count=len(batches),
         raw_size_bytes=sum(batch.raw_size_bytes for batch in batches),
-        canonical_row_count=sum(batch.normalized_row_count for batch in batches),
+        canonical_row_count=canonical_row_count,
         parquet_part_count=sum(batch.parquet_part_count for batch in batches),
         duckdb_row_count=sum(batch.duckdb_row_count for batch in batches),
         normalization_issue_counts=tuple(sorted(normalization_counts.items())),
@@ -908,8 +909,8 @@ def aggregate_pipeline_metrics(
         maximum_latency_ms=max(latencies, default=None),
         minimum_rate_limit_remaining=min(remaining, default=None),
         api_credit_usage_sample_count=len(api_credits_used),
-        total_api_credits_used=sum(api_credits_used),
-        pipeline_pass=bool(batches) and all(flags),
+        maximum_api_credits_used_in_window=max(api_credits_used, default=None),
+        pipeline_pass=bool(batches) and canonical_row_count > 0 and all(flags),
     )
 
 

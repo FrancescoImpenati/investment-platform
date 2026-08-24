@@ -171,13 +171,31 @@ def test_twelve_data_daily_bounds_source_and_split_adjustment_are_explicit() -> 
     query = dict(transport.requests[0].query)
     assert query["interval"] == "1day"
     assert query["start_date"] == "2025-05-27"
-    assert query["end_date"] == "2025-12-05"
+    assert query["end_date"] == "2025-12-06"
     assert query["adjust"] == "splits"
     assert "outputsize" not in query
     assert "dp" not in query
     assert batch.metadata.source == TWELVE_DATA_DAILY_BAR_SOURCE
     assert batch.metadata.request_metadata["adjustment_state"] == "split_adjusted"
     assert batch.metadata.request_metadata["provider_adjustment"] == "splits"
+
+
+def test_twelve_data_daily_wire_bound_includes_last_admissible_non_midnight_date() -> None:
+    transport = QueueHttpTransport(
+        [HttpResponse(200, _fixture("bars_daily_standard.json"), elapsed_ms=8.0)]
+    )
+    provider = _provider(transport, batch_ids=_BATCH_IDS[:1])
+    request = _bar_request(
+        timeframe=Timeframe.ONE_DAY,
+        start=datetime(2025, 12, 5, tzinfo=UTC),
+        end=datetime(2025, 12, 5, 22, tzinfo=UTC),
+    )
+
+    tuple(provider.get_bars(request))
+
+    query = dict(transport.requests[0].query)
+    assert query["start_date"] == "2025-12-05"
+    assert query["end_date"] == "2025-12-06"
 
 
 def test_twelve_data_wire_bounds_expand_subsecond_intervals_without_omitting_data() -> None:

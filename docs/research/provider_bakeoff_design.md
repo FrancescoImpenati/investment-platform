@@ -1,26 +1,29 @@
 # Provider bake-off design
 
-> **Status: DESIGNED, NOT EXECUTED**
+> **Status: FROZEN DESIGN; EXECUTED WITH APPROVED BARS-FIRST AMENDMENT**
 >
-> This document preregisters a bounded Phase 1 experiment. At preregistration no provider had been
-> called, no credential had been used, and no market-data result in this document was observed
-> evidence. Later observations must be recorded in the provider quality report. Purchases,
-> paid-plan activation, and automatic fallback to a non-comparable feed are not authorized.
+> This document preregistered the bounded Phase 1 sample, windows, and quality methodology. At
+> preregistration no provider had been called, no credential had been used, and no market-data
+> result in this document was observed evidence. The results are recorded only in the
+> [provider quality report](provider_quality_report.md). Purchases, paid-plan activation, and
+> automatic fallback to a non-comparable feed were not authorized.
 
-> **Provider 1 redesign note (2026-08-23):** Massive is retained as a technically validated
+> **Approved execution amendment (2026-08-24):** Massive is retained as a technically validated
 > candidate whose full real bake-off is blocked by its standard Individual market-data licensing.
-> A user-approved documentary preflight considered Twelve Data as the operational replacement.
-> Twelve Data Basic passed the bars, history, request-budget, and internal non-display gates but
-> failed the mandatory no-purchase corporate-actions gate because `/splits` and `/dividends`
-> require Grow or above. No Twelve Data adapter or revised execution matrix was implemented. See
-> [Provider 1 redesign](provider-1-redesign.md). The frozen sample and time windows below remain
-> reusable after a new Provider 1 decision.
+> Twelve Data Basic replaced it for the full bars-first empirical comparison against Alpaca SIP.
+> Corporate actions became an asymmetric capability assessment: Alpaca was tested empirically;
+> Twelve Data Basic `/splits` and `/dividends` remained unavailable and no equivalent official
+> ticker-change-history endpoint was identified. No Grow purchase or upgrade occurred. See
+> [Provider 1 redesign](provider-1-redesign.md). The frozen 16-security sample, time windows, and
+> quality categories below were preserved; only the provider/request matrix and action parity
+> requirement changed.
 
 ## 1. Objective and evidence labels
 
-The experiment compares Massive Stocks Basic and Alpaca Trading API Basic for the first real
-market-data path through the Phase 0 foundation. It uses yfinance only as a later sanity check,
-never as a candidate canonical provider.
+The original preregistration compared Massive Stocks Basic and Alpaca Trading API Basic. The
+approved execution compared Alpaca historical SIP with Twelve Data Basic for bars, retained
+Massive as licensing-blocked technical evidence, and used yfinance only as a sanity check. None of
+the providers became canonical merely by participating.
 
 Every statement in the design and later report must use one of these labels:
 
@@ -37,6 +40,30 @@ Every statement in the design and later report must use one of these labels:
 
 The study must not treat agreement between providers as proof of correctness or disagreement as
 proof that either provider is wrong.
+
+### 1.1 Execution-amendment precedence
+
+Sections 2–12 below preserve the original Massive/Alpaca preregistration. Where they name Massive
+as the substantive Provider 1 or require symmetric action endpoints, the approved 2026-08-24
+amendment takes precedence:
+
+- the full bars comparison is Alpaca historical SIP versus Twelve Data Basic;
+- Twelve Data uses exact US-equity reference matches and `/time_series` with `1day`/`5min` plus
+  `none` and `splits`; KO `dividends`/`all` are provider-native adjustment evidence only;
+- Twelve Data Basic `/splits` and `/dividends` are not entitled and were not called; Alpaca actions
+  are evaluated empirically without claiming cross-provider parity;
+- Massive receives no further substantive processing and keeps the status **technically validated
+  candidate — full real bake-off blocked by standard Individual market-data licensing**;
+- all substantive live pages traverse immutable raw artifact, replay, normalization, validation,
+  Parquet, DuckDB, comparison, and verified cleanup in a private external temporary root; and
+- the actual successful Twelve Data plan was 48 calls/160 reserved credits. Including preflight,
+  an interrupted reference pass, and bounded corrections, estimated Phase 1 usage was about 210
+  credits, below the 800/day Basic allowance. The successful combined main raw bodies were about
+  2.96 MB before cleanup.
+
+The frozen 12,179-row expectation per provider, securities, intervals, finite calendar oracle, and
+comparison categories did not change. Observed counts and results are authoritative only in the
+[provider quality report](provider_quality_report.md).
 
 ## 2. Official documentation snapshot
 
@@ -222,6 +249,9 @@ across the two adjustment states.
 
 ## 6. Provider request mapping
 
+The Massive mapping in Section 6.1 is retained as the original design and implemented technical
+evidence; it was not used for the substantive run after the licensing stop.
+
 ### 6.1 Massive
 
 - Use custom aggregates with ascending sort.
@@ -242,6 +272,16 @@ across the two adjustment states.
 - Treat the corporate-action request's `process_date` bounds as provider query semantics, then
   retain the action-specific dates separately during comparison.
 
+### 6.3 Twelve Data execution amendment
+
+- Resolve every symbol through an exact US stock/ETF reference match before bar retrieval.
+- Use `/time_series` with `1day` or `5min`; batch within the eight-credit rolling-minute budget.
+- Request `adjust=none` and `adjust=splits` for the canonical comparison segments.
+- Treat the provider daily `end_date` as an exclusive exchange-date guard after the last
+  potentially admissible UTC day and retain strict canonical half-open filtering.
+- Preserve the documented standard intraday feed as a partial-volume feed, not SIP-equivalent.
+- Do not call Basic-ineligible action endpoints and do not infer action parity from bar adjustment.
+
 ## 7. Adjustment matrix
 
 | Provider/use | Wire option | Documented meaning | Canonical state | Canonical persistence |
@@ -252,6 +292,9 @@ across the two adjustment states.
 | Alpaca core | `adjustment=split` | Forward/reverse split adjustment | `split_adjusted` | Yes, subject to payload verification |
 | Alpaca evidence probe | `adjustment=dividend` | Cash-dividend price adjustment without necessarily applying splits | No exact Phase 0 enum | No; raw evidence only |
 | Alpaca evidence probe | `adjustment=all` | Split, dividend, spin-off, and other documented adjustments | Not exactly `split_and_dividend_adjusted` | No; raw evidence or `provider_adjusted_unknown` only after review |
+| Twelve Data core | `adjust=none` | No provider adjustment | `unadjusted` | Yes |
+| Twelve Data core | `adjust=splits` | Provider split adjustment | `split_adjusted` | Yes, subject to payload verification |
+| Twelve Data evidence probe | `adjust=dividends` / `all` | Provider-native dividend/all adjustment | No exact Phase 0 enum | Evidence only |
 | yfinance sanity check | Version/configuration TBD | Unofficial reference behavior | Never canonical | No |
 
 No normalizer may label a series more specifically than provider documentation and observed fields
@@ -307,6 +350,13 @@ yfinance is excluded from provider request-rate estimates because it has no prov
 this study and its internal HTTP-call count is not a stable experimental input. Its version,
 configuration, exact symbols, and bounded windows must be recorded before the sanity check. It
 must not broaden the live dataset.
+
+### 8.4 Twelve Data Basic execution amendment
+
+The successful bounded plan used 16 reference calls, 30 batched bar calls, and two adjustment
+probes: **48 HTTP calls / 160 reserved credits**. Conservative pacing limited each rolling minute
+to eight credits. No bar response paginated. Corrective diagnostics remained bounded and brought
+estimated total Twelve Data Phase 1 usage to about 210/800 daily credits without purchase.
 
 ## 9. Estimated data volume
 
@@ -463,5 +513,8 @@ The final provider quality report must link this design and record:
 - separate sections for **Observed evidence**, **Provider documentation**, **Interpretation**, and
   **Unresolved questions**.
 
-Aside from the explicitly transient entitlement observation, until those fields are backed by
-stored raw evidence no primary-provider recommendation is authorized.
+For an approved ephemeral run, those fields may be backed during execution by immutable temporary
+raw artifacts, checksum replay, canonical storage, and DuckDB comparison, then reduced to
+aggregate sanitized evidence before verified cleanup. Durable raw evidence is preferable for
+reproducibility but was not required by the approved temporary-processing policy. The final
+recommendation and its limitations are recorded in the provider quality report.

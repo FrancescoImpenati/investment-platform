@@ -1,13 +1,22 @@
-# Phase 1 Provider 1 redesign — Twelve Data documentary preflight
+# Phase 1 Provider 1 redesign — Twelve Data documentary preflight and amendment
 
-> **Status: DOCUMENTARY GATE FAILED — NO ADAPTER OR LIVE CALL AUTHORIZED**
+> **Status: ORIGINAL GATE SUPERSEDED; BARS-FIRST BASIC RUN APPROVED AND EXECUTED**
 >
 > On 2026-08-23 the Phase 1 Provider 1 redesign was approved after Massive's standard Individual
 > market-data license blocked the full non-display bake-off. Twelve Data was evaluated as the
 > proposed operational replacement. Its free Basic tier passes the licensing, US-bars, history,
 > and request-budget checks, but it cannot supply the required corporate-action dataset without a
-> paid Grow-or-higher entitlement. The mandatory no-purchase gate therefore stops the redesign
-> before implementation.
+> paid Grow-or-higher entitlement. That finding stopped implementation under the original
+> symmetric corporate-action gate.
+
+On 2026-08-24 the user approved a bars-first amendment without purchase or upgrade. The full
+empirical bar comparison became Alpaca SIP versus Twelve Data Basic, while corporate actions
+became a provider-capability assessment rather than a parity requirement. Twelve Data Basic
+`/splits` and `/dividends` remained unavailable and were not called; no equivalent official
+ticker-change-history endpoint was identified. The adapter, synthetic fixtures, offline tests,
+minimal preflight, and bounded 16-security run were then completed. Final evidence belongs in the
+[provider quality report](provider_quality_report.md); the gate analysis below is preserved as the
+chronological decision record.
 
 ## Decision context
 
@@ -20,9 +29,9 @@ Its adapter, normalizer, synthetic fixtures, offline tests, transient preflight 
 engineering findings, and licensing assessment remain part of Phase 1. No further Massive
 market-data processing is authorized without explicit additional rights.
 
-Alpaca SIP remains the approved comparison provider. Twelve Data was assessed only as a proposed
-Provider 1 for a future full empirical comparison; it did not become a participant because it
-failed this documentary gate.
+Alpaca SIP remained the approved comparison provider. At the original documentary gate, Twelve
+Data was only a proposal. The subsequent approved amendment made it the operational bars provider
+for Phase 1 without making it canonical or treating its partial-volume US feed as SIP-equivalent.
 
 ## Evidence method
 
@@ -33,8 +42,9 @@ Official Twelve Data sources were accessed on **2026-08-23**. The classification
 - **[INTERPRETATION]** project conclusions;
 - **[UNRESOLVED]** questions the documentation does not answer.
 
-No Twelve Data account, API key, endpoint, payload, or trial symbol was used. No provider code,
-fixture, dependency, or environment-variable contract was added.
+At this documentary-gate stage, no Twelve Data account, API key, endpoint, payload, or trial symbol
+was used, and no provider code, fixture, dependency, or environment-variable contract had yet been
+added. The later approved execution is documented separately in the final report.
 
 ## Twelve Data documentary gate
 
@@ -52,7 +62,7 @@ fixture, dependency, or environment-variable contract was added.
 | Ticker-change history | **NOT DOCUMENTED [UNRESOLVED]** | Current reference endpoints expose present symbols, but no official endpoint was found for reconstructing the SQ-to-XYZ change history. |
 | Adjustment semantics | **PASS WITH LIVE QUESTION [DOC]** | `/time_series` documents `none`, `splits`, `dividends`, and `all`, defaulting to splits. Separate guidance says daily data are split-adjusted and intraday data unadjusted; the interaction needs empirical verification. |
 | Basic request budget | **PASS FOR BARS [EST]** | Basic provides eight API credits per minute and 800 per day; the frozen bar/reference plan is estimated at 161 credits. |
-| Full no-purchase bake-off | **FAIL [INTERPRETATION]** | Corporate-action endpoint entitlement is paid, so Basic cannot support daily + 5-minute + corporate-action testing as approved. |
+| Original symmetric no-purchase bake-off | **FAIL [INTERPRETATION]** | Corporate-action endpoint entitlement is paid, so Basic could not support the then-required symmetric daily + 5-minute + action comparison. The later bars-first amendment superseded this parity requirement. |
 
 Official sources:
 
@@ -132,28 +142,29 @@ The unavailable full-sample action calls would add at least:
 - at least **640 paid-tier corporate-action credits**, excluding calendar pagination; and
 - no documented solution for ticker-change history.
 
-## Gate conclusion
+## Historical gate conclusion
 
-Twelve Data Basic is sufficient for a controlled bars-only experiment, but not for the approved
-full provider bake-off. Implementing an adapter now would cross the user's explicit gate and would
-create code for an experiment that cannot be completed without a new decision. Accordingly:
+At the time of this gate, Twelve Data Basic was sufficient for a controlled bars-only experiment,
+but not for the then-approved symmetric corporate-action bake-off. Implementing an adapter would
+have crossed the user's explicit gate. Accordingly, at that checkpoint:
 
 - no adapter, normalizer, fixture, or live runner was implemented;
 - no Twelve Data credential was requested or inspected;
 - no API call or purchase was made; and
 - Massive remains unchanged and preserved.
 
-If a future decision authorizes Twelve Data implementation, the proposed environment variable is
-`TWELVE_DATA_API_KEY`.
+The later bars-first decision did authorize Twelve Data implementation. It uses the environment
+variable `TWELVE_DATA_API_KEY`, read from the process environment without revealing or persisting
+its value.
 
-## Alternatives requiring approval
+## Alternatives considered at the historical gate
 
 1. **Authorize Twelve Data Grow or a provider-granted temporary research entitlement.** Confirm
    access for all sixteen symbols, not only trial symbols. This enables splits/dividends but still
    requires a decision for the undocumented SQ-to-XYZ ticker-history case.
-2. **Approve a bars-only Twelve Data vs Alpaca SIP experiment.** Corporate actions would be tested
-   only through Alpaca plus Twelve Data adjustment behavior. This is not the approved complete
-   head-to-head corporate-action bake-off.
+2. **Approve a bars-only Twelve Data vs Alpaca SIP experiment.** This was selected on 2026-08-24:
+   actions were assessed through Alpaca entitlement plus Twelve Data adjustment behavior and
+   documented Basic limitations, without claiming head-to-head parity.
 3. **Select another Provider 1.** A fresh official-source gate must prove no-purchase daily,
    five-minute, splits, dividends, suitable identifier/ticker history, and non-display processing.
    The already-reviewed shortlist currently has paid-access or licensing blockers.
@@ -161,5 +172,6 @@ If a future decision authorizes Twelve Data implementation, the proposed environ
    corporate-action sample can receive a temporary entitlement and whether a ticker-event/history
    endpoint exists.
 
-Phase 1 remains incomplete. No final Pull Request is appropriate until an approved path produces
-the full real-data pipeline and empirical comparison.
+That approved path produced the full real-data bars pipeline and empirical comparison without a
+Grow purchase. Completion evidence and the final recommendation are in the provider quality
+report.
