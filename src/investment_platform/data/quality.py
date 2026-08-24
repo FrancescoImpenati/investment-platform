@@ -30,6 +30,7 @@ class DiscrepancyClassification(StrEnum):
 
     DEFINITIONAL_DIFFERENCE = "definitional_difference"
     ADJUSTMENT_DIFFERENCE = "adjustment_difference"
+    VENUE_FEED_DIFFERENCE = "venue_feed_difference"
     TIMING_SESSION_DIFFERENCE = "timing_session_difference"
     MISSING_OBSERVATION = "missing_observation"
     LIKELY_PROVIDER_ISSUE = "likely_provider_issue"
@@ -57,6 +58,18 @@ class ComparisonMetric(StrEnum):
     DIVIDEND_AMOUNT = "dividend_amount"
     OLD_TICKER = "old_ticker"
     NEW_TICKER = "new_ticker"
+
+
+_NUMERIC_BAR_METRICS = frozenset(
+    {
+        ComparisonMetric.OPEN,
+        ComparisonMetric.HIGH,
+        ComparisonMetric.LOW,
+        ComparisonMetric.CLOSE,
+        ComparisonMetric.VOLUME,
+        ComparisonMetric.VWAP,
+    }
+)
 
 
 @dataclass(frozen=True, slots=True, order=True)
@@ -245,7 +258,12 @@ def _numeric_equal(
     return math.isclose(left, right, abs_tol=absolute, rel_tol=relative)
 
 
-def _value_classification(left: PriceBar, right: PriceBar) -> DiscrepancyClassification:
+def _value_classification(
+    left: PriceBar,
+    right: PriceBar,
+    metric: ComparisonMetric,
+    venue_feed_metrics: frozenset[ComparisonMetric],
+) -> DiscrepancyClassification:
     if left.adjustment_state is not right.adjustment_state:
         return DiscrepancyClassification.ADJUSTMENT_DIFFERENCE
     if (
@@ -254,6 +272,8 @@ def _value_classification(left: PriceBar, right: PriceBar) -> DiscrepancyClassif
         or left.timestamp_end != right.timestamp_end
     ):
         return DiscrepancyClassification.TIMING_SESSION_DIFFERENCE
+    if metric in venue_feed_metrics:
+        return DiscrepancyClassification.VENUE_FEED_DIFFERENCE
     return DiscrepancyClassification.UNRESOLVED_DISCREPANCY
 
 
@@ -329,8 +349,10 @@ def compare_provider_bars(
     *,
     expected_keys: Iterable[ObservationKey] | None = None,
     tolerance: ComparisonTolerance | None = None,
+    venue_feed_metrics: Iterable[ComparisonMetric] = (),
+    excluded_metrics: Iterable[ComparisonMetric] = (),
 ) -> BarComparisonReport:
-    """Compare two canonical datasets while retaining ambiguity and raw provenance."""
+    """Compare bars with opt-in classification or exclusion of numeric metrics."""
 
     left_provider = left_provider.strip()
     right_provider = right_provider.strip()
@@ -339,6 +361,20 @@ def compare_provider_bars(
     if left_provider.casefold() == right_provider.casefold():
         raise ValueError("provider names must identify two different datasets")
     tolerance = tolerance or ComparisonTolerance()
+    venue_feed_metric_set = frozenset(venue_feed_metrics)
+    invalid_venue_feed_metrics = venue_feed_metric_set - _NUMERIC_BAR_METRICS
+    if invalid_venue_feed_metrics:
+        rendered = ", ".join(sorted(str(metric) for metric in invalid_venue_feed_metrics))
+        raise ValueError(f"venue/feed classification requires numeric bar metrics: {rendered}")
+    excluded_metric_set = frozenset(excluded_metrics)
+    invalid_excluded_metrics = excluded_metric_set - _NUMERIC_BAR_METRICS
+    if invalid_excluded_metrics:
+        rendered = ", ".join(sorted(str(metric) for metric in invalid_excluded_metrics))
+        raise ValueError(f"metric exclusion requires numeric bar metrics: {rendered}")
+    conflicting_metrics = venue_feed_metric_set & excluded_metric_set
+    if conflicting_metrics:
+        rendered = ", ".join(sorted(str(metric) for metric in conflicting_metrics))
+        raise ValueError(f"metrics cannot be both classified and excluded: {rendered}")
     expected = frozenset(expected_keys) if expected_keys is not None else None
     left = _group_bars(left_bars)
     right = _group_bars(right_bars)
@@ -455,7 +491,6 @@ def compare_provider_bars(
                 right_values,
             )
 
-        value_classification = _value_classification(left_bar, right_bar)
         for metric, field_name in (
             (ComparisonMetric.OPEN, "open"),
             (ComparisonMetric.HIGH, "high"),
@@ -463,6 +498,8 @@ def compare_provider_bars(
             (ComparisonMetric.CLOSE, "close"),
             (ComparisonMetric.VWAP, "vwap"),
         ):
+            if metric in excluded_metric_set:
+                continue
             left_value = getattr(left_bar, field_name)
             right_value = getattr(right_bar, field_name)
             if not _numeric_equal(
@@ -474,13 +511,18 @@ def compare_provider_bars(
                 add(
                     key,
                     metric,
-                    value_classification,
+                    _value_classification(
+                        left_bar,
+                        right_bar,
+                        metric,
+                        venue_feed_metric_set,
+                    ),
                     left_value,
                     right_value,
                     left_values,
                     right_values,
                 )
-        if not _numeric_equal(
+        if ComparisonMetric.VOLUME not in excluded_metric_set and not _numeric_equal(
             left_bar.volume,
             right_bar.volume,
             absolute=tolerance.volume_absolute,
@@ -489,7 +531,12 @@ def compare_provider_bars(
             add(
                 key,
                 ComparisonMetric.VOLUME,
-                value_classification,
+                _value_classification(
+                    left_bar,
+                    right_bar,
+                    ComparisonMetric.VOLUME,
+                    venue_feed_metric_set,
+                ),
                 left_bar.volume,
                 right_bar.volume,
                 left_values,

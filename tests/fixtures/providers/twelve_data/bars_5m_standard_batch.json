@@ -1,0 +1,46 @@
+{
+  "XPH1": {
+    "meta": {
+      "symbol": "XPH1",
+      "interval": "5min",
+      "currency": "USD",
+      "exchange_timezone": "America/New_York",
+      "exchange": "SYNTHETIC",
+      "mic_code": "XPHL",
+      "type": "Common Stock"
+    },
+    "values": [
+      {
+        "datetime": "2025-07-02 13:30:00",
+        "open": "100.00000",
+        "high": "101.00000",
+        "low": "99.00000",
+        "close": "100.50000",
+        "volume": "1000"
+      }
+    ],
+    "status": "ok"
+  },
+  "XPH2": {
+    "meta": {
+      "symbol": "XPH2",
+      "interval": "5min",
+      "currency": "USD",
+      "exchange_timezone": "America/New_York",
+      "exchange": "SYNTHETIC",
+      "mic_code": "XPHL",
+      "type": "Common Stock"
+    },
+    "values": [
+      {
+        "datetime": "2025-07-02 13:30:00",
+        "open": "200.00000",
+        "high": "202.00000",
+        "low": "198.00000",
+        "close": "201.00000",
+        "volume": "2000"
+      }
+    ],
+    "status": "ok"
+  }
+}

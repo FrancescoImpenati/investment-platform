@@ -153,8 +153,13 @@ def raw_batch_from_response(
     }
     header_mappings = {
         "rate_limit_capacity": ("x-ratelimit-limit", "x-rate-limit-limit"),
-        "rate_limit_remaining": ("x-ratelimit-remaining", "x-rate-limit-remaining"),
+        "rate_limit_remaining": (
+            "x-ratelimit-remaining",
+            "x-rate-limit-remaining",
+            "api-credits-left",
+        ),
         "rate_limit_reset": ("x-ratelimit-reset", "x-rate-limit-reset"),
+        "api_credits_used": ("api-credits-used",),
     }
     for metadata_key, header_names in header_mappings.items():
         value = safe_numeric_header(response, *header_names)

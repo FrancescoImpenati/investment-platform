@@ -128,6 +128,133 @@ def test_pairwise_comparison_preserves_unresolved_values_and_raw_provenance() ->
     assert report.discrepancies[0].right_raw_batch_ids == (_RIGHT_BATCH_ID,)
 
 
+def test_feed_sensitive_metrics_are_classified_only_when_explicitly_selected() -> None:
+    left = _bar(side="left")
+    right = _bar(
+        side="right",
+        close=100.75,
+        volume=50.0,
+        vwap=100.75,
+    )
+
+    report = compare_provider_bars(
+        "twelve_data",
+        (left,),
+        "alpaca_sip",
+        (right,),
+        venue_feed_metrics=(ComparisonMetric.VOLUME, ComparisonMetric.VWAP),
+    )
+
+    classifications = {finding.metric: finding.classification for finding in report.discrepancies}
+    assert classifications == {
+        ComparisonMetric.CLOSE: DiscrepancyClassification.UNRESOLVED_DISCREPANCY,
+        ComparisonMetric.VWAP: DiscrepancyClassification.VENUE_FEED_DIFFERENCE,
+        ComparisonMetric.VOLUME: DiscrepancyClassification.VENUE_FEED_DIFFERENCE,
+    }
+    assert report.counts_by_classification[DiscrepancyClassification.VENUE_FEED_DIFFERENCE] == 2
+
+
+def test_feed_classification_never_overrides_adjustment_or_timing_evidence() -> None:
+    left = _bar(side="left")
+    adjusted = _bar(
+        side="right",
+        adjustment_state=AdjustmentState.SPLIT_ADJUSTED,
+        volume=50.0,
+        vwap=10.0,
+    )
+    adjusted_report = compare_provider_bars(
+        "twelve_data",
+        (left,),
+        "alpaca_sip",
+        (adjusted,),
+        venue_feed_metrics=(ComparisonMetric.VOLUME, ComparisonMetric.VWAP),
+    )
+    assert {
+        finding.classification
+        for finding in adjusted_report.discrepancies
+        if finding.metric in {ComparisonMetric.VOLUME, ComparisonMetric.VWAP}
+    } == {DiscrepancyClassification.ADJUSTMENT_DIFFERENCE}
+
+    shifted = _bar(
+        side="right",
+        timestamp_end=_START + timedelta(minutes=6),
+        volume=50.0,
+        vwap=100.75,
+    )
+    shifted_report = compare_provider_bars(
+        "twelve_data",
+        (left,),
+        "alpaca_sip",
+        (shifted,),
+        venue_feed_metrics=(ComparisonMetric.VOLUME, ComparisonMetric.VWAP),
+    )
+    assert {
+        finding.classification
+        for finding in shifted_report.discrepancies
+        if finding.metric in {ComparisonMetric.VOLUME, ComparisonMetric.VWAP}
+    } == {DiscrepancyClassification.TIMING_SESSION_DIFFERENCE}
+
+
+def test_feed_classification_rejects_non_numeric_bar_metrics() -> None:
+    with pytest.raises(ValueError, match="requires numeric bar metrics: availability"):
+        compare_provider_bars(
+            "twelve_data",
+            (_bar(side="left"),),
+            "alpaca_sip",
+            (_bar(side="right"),),
+            venue_feed_metrics=(ComparisonMetric.AVAILABILITY,),
+        )
+
+
+def test_non_comparable_numeric_metrics_can_be_explicitly_excluded() -> None:
+    left = _bar(side="left", vwap=None)
+    right = _bar(side="right", close=100.75, vwap=100.25)
+
+    default_report = compare_provider_bars(
+        "twelve_data",
+        (left,),
+        "alpaca_sip",
+        (right,),
+    )
+    assert [finding.metric for finding in default_report.discrepancies] == [
+        ComparisonMetric.CLOSE,
+        ComparisonMetric.VWAP,
+    ]
+
+    excluded_report = compare_provider_bars(
+        "twelve_data",
+        (left,),
+        "alpaca_sip",
+        (right,),
+        excluded_metrics=(ComparisonMetric.VWAP,),
+    )
+    assert [finding.metric for finding in excluded_report.discrepancies] == [ComparisonMetric.CLOSE]
+
+
+def test_metric_exclusion_rejects_structural_and_conflicting_configuration() -> None:
+    with pytest.raises(ValueError, match="metric exclusion requires numeric bar metrics: session"):
+        compare_provider_bars(
+            "twelve_data",
+            (_bar(side="left"),),
+            "alpaca_sip",
+            (_bar(side="right"),),
+            excluded_metrics=(ComparisonMetric.SESSION,),
+        )
+
+    with pytest.raises(
+        ValueError,
+        match="metrics cannot be both classified and excluded: vwap",
+    ):
+        compare_provider_bars(
+            "twelve_data",
+            (_bar(side="left"),),
+            "alpaca_sip",
+            (_bar(side="right"),),
+            venue_feed_metrics=(ComparisonMetric.VWAP,),
+            excluded_metrics=(ComparisonMetric.VWAP,),
+        )
+
+
 def test_adjustment_and_timing_differences_qualify_numeric_discrepancies() -> None:
     left = _bar(side="left")
     adjusted = _bar(

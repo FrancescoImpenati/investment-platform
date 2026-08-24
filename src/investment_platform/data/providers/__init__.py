@@ -27,6 +27,11 @@ from investment_platform.data.providers.errors import (
     ProviderTransportError,
 )
 from investment_platform.data.providers.massive import MassiveCredentials, MassiveProvider
+from investment_platform.data.providers.twelve_data import (
+    TwelveDataCredentials,
+    TwelveDataEvidenceAdjustment,
+    TwelveDataProvider,
+)
 
 __all__ = [
     "AlpacaCredentials",
@@ -51,4 +56,7 @@ __all__ = [
     "ProviderRateLimitError",
     "ProviderResponseError",
     "ProviderTransportError",
+    "TwelveDataCredentials",
+    "TwelveDataEvidenceAdjustment",
+    "TwelveDataProvider",
 ]

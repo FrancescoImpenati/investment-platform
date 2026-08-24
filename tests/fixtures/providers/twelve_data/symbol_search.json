@@ -1,0 +1,14 @@
+{
+  "data": [
+    {
+      "symbol": "XPH1",
+      "instrument_name": "Synthetic Phase One Corporation",
+      "exchange": "SYNTHETIC",
+      "mic_code": "XPHL",
+      "exchange_timezone": "America/New_York",
+      "instrument_type": "Common Stock",
+      "country": "United States"
+    }
+  ],
+  "status": "ok"
+}

@@ -36,6 +36,7 @@ class NormalizationIssueCode(StrEnum):
     INCOMPLETE_CORPORATE_ACTION = "incomplete_corporate_action"
     CORPORATE_ACTION_DATE_BASIS = "corporate_action_date_basis"
     PROVIDER_DEFINITION = "provider_definition"
+    PROVIDER_RESPONSE_ERROR = "provider_response_error"
 
 
 class NormalizationSeverity(StrEnum):
