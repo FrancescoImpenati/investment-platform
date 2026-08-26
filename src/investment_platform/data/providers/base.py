@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from collections.abc import Iterable
 from datetime import date, datetime
 from typing import Annotated, Protocol, Self, runtime_checkable
@@ -32,6 +34,33 @@ class ProviderInstrumentRef(_FrozenRequest):
     provider_identifier: NonEmptyStr
 
 
+def instrument_refs_fingerprint(instruments: Iterable[ProviderInstrumentRef]) -> str:
+    """Bind persisted request metadata to an order-independent UUID/provider-ID mapping."""
+
+    return hashlib.sha256(instrument_refs_manifest(instruments).encode()).hexdigest()
+
+
+def instrument_refs_manifest(instruments: Iterable[ProviderInstrumentRef]) -> str:
+    """Serialize the requested UUID/provider-ID mapping as sanitized versioned metadata."""
+
+    references = sorted(
+        (
+            {
+                "instrument_id": str(ref.instrument_id),
+                "provider_identifier": ref.provider_identifier,
+            }
+            for ref in instruments
+        ),
+        key=lambda value: (value["instrument_id"], value["provider_identifier"]),
+    )
+    return json.dumps(
+        {"version": 1, "references": references},
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
 class BarRequest(_FrozenRequest):
     """A bounded, mode-agnostic request for half-open UTC bar intervals."""
 
@@ -51,9 +80,12 @@ class BarRequest(_FrozenRequest):
     def validate_request(self) -> Self:
         if self.end <= self.start:
             raise ValueError("end must be later than start")
-        keys = {(ref.instrument_id, ref.provider_identifier) for ref in self.instruments}
-        if len(keys) != len(self.instruments):
-            raise ValueError("instruments must not contain duplicate provider references")
+        instrument_ids = {ref.instrument_id for ref in self.instruments}
+        provider_identifiers = {ref.provider_identifier for ref in self.instruments}
+        if len(instrument_ids) != len(self.instruments):
+            raise ValueError("instruments contain duplicate instrument IDs")
+        if len(provider_identifiers) != len(self.instruments):
+            raise ValueError("instruments contain duplicate provider identifiers")
         return self
 
 
@@ -68,9 +100,12 @@ class CorporateActionRequest(_FrozenRequest):
     def validate_request(self) -> Self:
         if self.end <= self.start:
             raise ValueError("end must be later than start")
-        keys = {(ref.instrument_id, ref.provider_identifier) for ref in self.instruments}
-        if len(keys) != len(self.instruments):
-            raise ValueError("instruments must not contain duplicate provider references")
+        instrument_ids = {ref.instrument_id for ref in self.instruments}
+        provider_identifiers = {ref.provider_identifier for ref in self.instruments}
+        if len(instrument_ids) != len(self.instruments):
+            raise ValueError("instruments contain duplicate instrument IDs")
+        if len(provider_identifiers) != len(self.instruments):
+            raise ValueError("instruments contain duplicate provider identifiers")
         return self
 
 

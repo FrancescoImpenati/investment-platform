@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
 from io import BytesIO
+from pathlib import Path
 from typing import Annotated, BinaryIO, Protocol, runtime_checkable
 from uuid import UUID
 
@@ -171,6 +172,12 @@ def _open_bytes(payload: bytes) -> Iterator[BinaryIO]:
         reader.close()
 
 
+@contextmanager
+def _open_path(path: Path) -> Iterator[BinaryIO]:
+    with path.open("rb") as reader:
+        yield reader
+
+
 @dataclass(frozen=True, slots=True)
 class BytesRawPayload:
     """Small in-memory payload adapter for fixtures and mock provider pages."""
@@ -179,6 +186,19 @@ class BytesRawPayload:
 
     def open_binary(self) -> AbstractContextManager[BinaryIO]:
         return _open_bytes(self.content)
+
+
+@dataclass(frozen=True, slots=True)
+class FileRawPayload:
+    """Reopen an already-persisted payload without materializing it in memory."""
+
+    path: Path
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "path", Path(self.path))
+
+    def open_binary(self) -> AbstractContextManager[BinaryIO]:
+        return _open_path(self.path)
 
 
 @dataclass(frozen=True, slots=True)

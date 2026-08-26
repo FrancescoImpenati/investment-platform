@@ -21,7 +21,12 @@ from investment_platform.data.provenance import (
     RawBatch,
     RawBatchMetadata,
 )
-from investment_platform.data.storage.raw import BatchCollisionError, RawBatchStore, RawStorageError
+from investment_platform.data.storage.raw import (
+    BatchCollisionError,
+    RawBatchStore,
+    RawStorageError,
+    replay_raw_artifact,
+)
 
 
 def _metadata() -> RawBatchMetadata:
@@ -99,6 +104,29 @@ def test_raw_store_streams_checksums_and_publishes_a_sanitized_manifest(tmp_path
     assert manifest["source"]["logical_endpoint"] == "aggregates/daily"
     assert "authorization" not in artifact.manifest_path.read_text(encoding="utf-8").lower()
     assert not list(artifact.directory.parent.glob(".batch_id=*-*"))
+
+
+@pytest.mark.integration
+def test_published_raw_artifact_can_be_integrity_checked_and_reopened(tmp_path: Path) -> None:
+    content = b'{"provider_native":true}'
+    metadata = _metadata()
+    store = RawBatchStore(tmp_path / "raw", chunk_size=4)
+    artifact = store.write(RawBatch(metadata=metadata, payload=BytesRawPayload(content)))
+
+    replayed = replay_raw_artifact(artifact, chunk_size=3)
+
+    assert replayed.metadata == metadata
+    with replayed.payload.open_binary() as reader:
+        assert reader.read() == content
+
+    artifact.payload_path.write_bytes(b"tampered")
+    with (
+        pytest.raises(RawStorageError, match="integrity check"),
+        replayed.payload.open_binary() as reader,
+    ):
+        reader.read()
+    with pytest.raises(RawStorageError, match="integrity check"):
+        replay_raw_artifact(artifact, chunk_size=3)
 
 
 @pytest.mark.integration

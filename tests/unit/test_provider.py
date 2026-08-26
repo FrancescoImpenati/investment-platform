@@ -114,6 +114,32 @@ def test_bar_request_rejects_empty_duplicate_naive_or_reversed_inputs() -> None:
             start=start,
             end=start + timedelta(minutes=5),
         )
+    with pytest.raises(ValidationError, match="duplicate provider identifiers"):
+        BarRequest(
+            instruments=(
+                ref,
+                ProviderInstrumentRef(
+                    instrument_id=uuid4(),
+                    provider_identifier=ref.provider_identifier,
+                ),
+            ),
+            timeframe=Timeframe.FIVE_MINUTES,
+            start=start,
+            end=start + timedelta(minutes=5),
+        )
+    with pytest.raises(ValidationError, match="duplicate instrument IDs"):
+        BarRequest(
+            instruments=(
+                ref,
+                ProviderInstrumentRef(
+                    instrument_id=ref.instrument_id,
+                    provider_identifier="MSFT",
+                ),
+            ),
+            timeframe=Timeframe.FIVE_MINUTES,
+            start=start,
+            end=start + timedelta(minutes=5),
+        )
     with pytest.raises(ValidationError, match="timezone-aware"):
         BarRequest(
             instruments=(ref,),

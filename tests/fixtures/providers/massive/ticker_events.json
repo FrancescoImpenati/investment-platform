@@ -1,0 +1,1 @@
+{"status":"OK","results":{"name":"Synthetic Phase One Corp","events":[{"date":"2025-01-21","type":"ticker_change","ticker_change":{"ticker":"XNEW"}},{"date":"2020-01-02","type":"ticker_change","ticker_change":{"ticker":"XOLD"}}]}}

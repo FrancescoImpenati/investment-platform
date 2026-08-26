@@ -14,6 +14,7 @@ from investment_platform.data.models import (
 from investment_platform.data.provenance import (
     BytesRawPayload,
     DataSource,
+    FileRawPayload,
     LicenseClassification,
     RawBatch,
     RawBatchMetadata,
@@ -27,6 +28,7 @@ __all__ = [
     "CorporateAction",
     "DataSource",
     "DividendAction",
+    "FileRawPayload",
     "LicenseClassification",
     "PriceBar",
     "RawBatch",
