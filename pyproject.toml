@@ -10,6 +10,7 @@ readme = "README.md"
 requires-python = ">=3.13,<3.14"
 dependencies = [
     "duckdb>=1.4,<2",
+    "exchange-calendars>=4.13.2,<5",
     "polars[pyarrow]>=1.35,<2",
     "pydantic>=2.12,<3",
     "tzdata>=2025.2",
