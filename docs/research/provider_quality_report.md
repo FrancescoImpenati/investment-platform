@@ -9,7 +9,8 @@
 > in Git.
 
 > **Post-report governance update — 2026-08-29:** Written Alpaca support ticket 342496 resolves the
-> durable-retention gate for the exact private historical-data scope recorded in
+> durable-retention gate only for historical SIP US stock bars older than 15 minutes in the private
+> use scope recorded in
 > [the redacted Alpaca rights record](../governance/data-rights/alpaca-historical-sip.md).
 > Historical statements below that call Alpaca retention ambiguous remain accurate as of the
 > 2026-08-24 bake-off and are intentionally not rewritten. The new evidence is an input to the

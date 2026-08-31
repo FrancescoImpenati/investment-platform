@@ -429,9 +429,9 @@ Local configuration may narrow behavior but cannot turn PENDING or denied rights
 | Provider / exact dataset scope | Initial mode/status | Phase 2 use |
 | --- | --- | --- |
 | Alpaca historical price_bars_sip | DURABLE_AUTHORIZED | Primary 1d/5m scope after the >15-minute age gate |
-| Alpaca historical options | DURABLE_AUTHORIZED / PENDING | Governance right recorded; no active entry until an exact dataset key and eligibility rule are approved |
-| Alpaca historical crypto | DURABLE_AUTHORIZED / PENDING | Governance right recorded; no active entry until an exact dataset key and eligibility rule are approved |
-| Alpaca real-time/streaming and unlisted datasets | No active catalog entry | Fail closed before request or persistence |
+| Alpaca historical options | UNVERIFIED / PENDING | Evidence does not cover this dataset; no active policy entry |
+| Alpaca crypto | UNVERIFIED / PENDING | Evidence does not cover historical or real-time crypto; no active policy entry |
+| Alpaca real-time/streaming, news, and other unlisted datasets | No active catalog entry | Fail closed before request or persistence |
 | Twelve Data price_bars_us_daily | SUBSCRIPTION_BOUND | Secondary/reference; not primary Phase 2 live stream |
 | Twelve Data price_bars_standard_us_intraday | SUBSCRIPTION_BOUND | Not a SIP-equivalent volume source |
 | Databento OPRA.PILLAR | EPHEMERAL | Future options candidate pending exact clarification |
@@ -440,14 +440,15 @@ Local configuration may narrow behavior but cannot turn PENDING or denied rights
 | Reserved synthetic/sample price-bar datasets | SYNTHETIC_UNRESTRICTED | Offline tests and demo |
 | yfinance | Denied by absence | Sanity/reference only; never canonical living ingestion |
 
-The Alpaca decision is backed by
+The Alpaca historical SIP stock-bar decision is backed by
 [the redacted rights record](../governance/data-rights/alpaca-historical-sip.md). It is specific to
 the described private use. It grants no public display, redistribution, resale, or real-time
 retention.
 
-Options and crypto retain the recorded governance classification, but PENDING prevents pipeline
-use. This avoids a generic “historical” wildcard accidentally covering near-real-time or another
-product. Activation requires an exact stable dataset/feed key and request-eligibility rule.
+Historical options and crypto are `UNVERIFIED / PENDING`: the evidence does not cover them, and no
+active software policy exists. Real-time data, news, and every other unlisted Alpaca dataset also
+have no active entry and fail closed. Activation requires new dataset-specific evidence, an exact
+stable dataset/feed key, and a request-eligibility rule.
 
 For this entry, `minimum_observation_age` is `PT15M` and eligibility is conservative: an
 observation is durable-request eligible only when its exclusive end is strictly earlier than the
@@ -842,9 +843,13 @@ CalendarSnapshot and stream session scope, not over every wall-clock instant. Fo
 - daily coverage advances by verified expected sessions;
 - 5m coverage advances by eligible slots between each session's actual open and close, including
   early closes;
-- a request-complete slot with no provider observation advances only after it is recorded as a
-  VERIFIED_EMPTY/no-eligible-trade fact under documented provider aggregation semantics;
+- a slot with no provider observation advances only after the bounded request completed
+  successfully, every page was acquired and verified, pagination reached its valid terminal state,
+  and sufficiently demonstrated provider aggregation/omission semantics justify a durable
+  VERIFIED_EMPTY/no-eligible-trade fact;
 - an unclassified missing eligible slot remains blocking.
+
+An empty provider response or an absent bar is not, by itself, sufficient for `VERIFIED_EMPTY`.
 
 The exclusive watermark may therefore cross Friday close to the next eligible Monday slot, or a
 holiday, only because the recorded calendar snapshot proves the intervening time is closed. It may
@@ -904,8 +909,9 @@ watermark become invalid before any query or update uses them.
 - **Integrity gap:** a referenced raw/canonical artifact is missing or fails checksum; blocks and
   invalidates coverage.
 - **Expected-observation finding:** an eligible calendar slot lacks a bar; initially unresolved.
-- **Verified sparse/no-trade slot:** provider semantics support omission when no eligible trade
-  exists; represented as a durable coverage fact, not a fabricated bar.
+- **Verified sparse/no-trade slot:** only after complete request and pagination plus sufficiently
+  demonstrated provider semantics support omission when no eligible trade exists; represented as a
+  durable coverage fact, not a fabricated bar. An absent bar alone remains unresolved.
 - **Correction/revision finding:** repeated provider evidence changes a canonical value; creates
   same-provider revision and reconciliation state.
 - **Calendar-stale coverage:** a calendar version changed expectations; requires verification.
@@ -1125,7 +1131,8 @@ Fault injection proves:
 
 - holidays, early close, and DST cases match frozen official expectations;
 - Friday-to-Monday, holiday, and daily multi-session coverage cross only calendar-closed time;
-- eligible empty 5m slots are not automatically provider errors;
+- eligible empty 5m slots are neither automatically provider errors nor `VERIFIED_EMPTY`; the
+  complete-request, complete-pagination, and provider-semantics prerequisites are enforced;
 - all normal tests remain offline and deterministic;
 - formatting, lint, typing, tests, build, diff, Git-ignore, tracked-data, and secret scans pass.
 
@@ -1211,7 +1218,8 @@ without expanding into later analytical or product phases.
 7. **A correction is not a duplicate.** Preserve immutable versions and same-provider provenance,
    then expose an explicit current view.
 8. **A calendar predicts eligible sessions, not trades.** An empty intraday slot may be legitimate
-   for a trade-aggregated feed and must be classified before it blocks coverage.
+   for a trade-aggregated feed, but absence alone proves nothing. `VERIFIED_EMPTY` additionally
+   requires a complete request, complete valid pagination, and demonstrated provider semantics.
 9. **Retention controls state truth.** A watermark pointing to expired or deleted data is worse
    than no watermark because it tells the updater to skip history it no longer owns.
 10. **External scheduling should invoke a reliable command.** Once update is manual, bounded,

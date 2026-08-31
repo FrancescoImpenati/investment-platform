@@ -153,11 +153,11 @@ Use focused tests while iterating. Run the complete required checks before every
 ### Initial entries
 
 - Alpaca historical price_bars_sip: DURABLE_AUTHORIZED only after its strict >15-minute age gate.
-- Alpaca historical options: governance mode DURABLE_AUTHORIZED, policy status PENDING/inactive
-  until its exact dataset key and eligibility rule are approved; not implemented.
-- Alpaca historical crypto: governance mode DURABLE_AUTHORIZED, policy status PENDING/inactive
-  until its exact dataset key and eligibility rule are approved; not implemented.
-- Alpaca real-time and unlisted datasets: no active entry, therefore fail closed.
+- Alpaca historical options: UNVERIFIED / PENDING; evidence does not cover the dataset and no active
+  policy entry exists.
+- Alpaca crypto: UNVERIFIED / PENDING; evidence does not cover historical or real-time crypto and
+  no active policy entry exists.
+- Alpaca real-time, news, and other unlisted datasets: no active entry, therefore fail closed.
 - Twelve Data price_bars_us_daily: SUBSCRIPTION_BOUND and inactive until status is recorded.
 - Twelve Data price_bars_standard_us_intraday: SUBSCRIPTION_BOUND and inactive until status is
   recorded.
@@ -420,7 +420,9 @@ policy-permitted quarantine.
 - Never infer progress from MAX(timestamp).
 - An acquisition or integrity gap blocks the frontier.
 - A sparse/no-trade slot requires explicit durable classification; no fabricated bar.
-- VERIFIED_EMPTY requires request completion and documented provider aggregation semantics.
+- VERIFIED_EMPTY requires successful bounded-request completion, complete verified pagination, and
+  sufficiently demonstrated provider aggregation/omission semantics; an absent bar or empty
+  response alone is insufficient.
 - Missing/corrupt/expired/unauthorized artifacts invalidate coverage before use.
 - EPHEMERAL cannot create a historical durable watermark.
 - TTL and SUBSCRIPTION_BOUND frontiers remain usable only while retained rights/data remain valid.
@@ -433,6 +435,8 @@ policy-permitted quarantine.
 - Out-of-order completed requests.
 - Multiple instruments from one provider request update independently.
 - No-trade finding versus acquisition gap.
+- Empty response with incomplete pagination cannot become VERIFIED_EMPTY.
+- Complete request/pagination without demonstrated omission semantics remains unresolved.
 - Deleted or corrupted raw/canonical file.
 - Policy expiry and calendar snapshot change.
 - Watermark reconstruction equals the materialized row.

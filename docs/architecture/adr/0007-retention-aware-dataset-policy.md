@@ -66,11 +66,11 @@ The initial catalog will encode these narrow decisions rather than provider-wide
 - **Synthetic and approved sample data — `SYNTHETIC_UNRESTRICTED`:** only declared synthetic or
   redistributable artifacts.
 
-Historical Alpaca options and crypto retain an explicit `DURABLE_AUTHORIZED` governance
-classification from the same recorded evidence, but their software-policy status remains `PENDING`
-and inactive until exact stable dataset/feed identifiers and request-eligibility rules are defined.
-Their permission is not inherited from historical SIP stock bars. Real-time Alpaca and every other
-unlisted dataset have no active entry and therefore fail closed.
+Historical Alpaca options and crypto are `UNVERIFIED / PENDING` because the recorded evidence does
+not cover them; neither has an active policy entry. `UNVERIFIED` describes the evidence state and
+`PENDING` the inactive policy state—neither is a retention mode or grant. Real-time data, news, and
+every other unlisted Alpaca dataset also have no active entry and therefore fail closed. Permission
+is never inherited from historical SIP stock bars.
 
 The pipeline will enforce policy before a provider request, raw or canonical write, replay,
 publication, query, export, and destructive lifecycle action. A run records the policy version it

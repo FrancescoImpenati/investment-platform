@@ -1,4 +1,4 @@
-# Alpaca historical market-data rights record
+# Alpaca historical SIP US stock-bar rights record
 
 ## Record status
 
@@ -15,7 +15,7 @@ terms.
 | Account scope | Individual, non-professional user |
 | Use scope | Private, educational, non-commercial, local research |
 | Primary dataset | Historical SIP US stock bars older than 15 minutes |
-| Governance classification | `DURABLE_AUTHORIZED` |
+| Primary dataset classification | `DURABLE_AUTHORIZED` |
 | Evidence reference | `alpaca-support-ticket-342496` |
 | Last verified | `2026-08-29` |
 
@@ -32,7 +32,8 @@ attachments, and other ticket data must not be copied into this repository.
 
 ## Rights recorded from the response
 
-Within the account and use scope above, the written response expressly permits:
+For historical SIP US stock bars older than 15 minutes, within the account and use scope above, the
+written response expressly permits:
 
 - permanent retention of historical API responses;
 - permanent retention of normalized copies, including OHLCV records and Parquet datasets;
@@ -42,10 +43,9 @@ Within the account and use scope above, the written response expressly permits:
 - continued retention after cancellation or termination of the account or market-data
   subscription.
 
-The same historical-data retention decision is recorded for Alpaca historical options data and
-Alpaca historical crypto data within the identical individual, private, educational,
-non-commercial scope. This extension does not expand the Phase 2 implementation scope: the first
-persistent live ingestion remains limited to historical SIP US stock bars at `1d` and `5m`.
+The evidence does not establish rights for historical options, crypto, real-time data, news, or any
+other Alpaca dataset. No permission for those datasets may be inferred from the provider name, the
+word “historical,” or the SIP stock-bar authorization.
 
 ## Restrictions
 
@@ -64,13 +64,16 @@ applies. Aggregated or derived outputs require their own policy decision before 
 | Provider dataset | Decision | Engineering consequence |
 | --- | --- | --- |
 | Historical SIP US stock bars older than 15 minutes | `DURABLE_AUTHORIZED` | Raw and normalized data may be retained permanently only in the external private data root and within the recorded use scope. |
-| Historical options data | `DURABLE_AUTHORIZED` | The right is recorded, but software policy remains inactive until an exact dataset key and eligibility rule are approved. |
-| Historical crypto data | `DURABLE_AUTHORIZED` | The right is recorded, but software policy remains inactive until an exact dataset key and eligibility rule are approved. |
-| Real-time or streaming data | Not authorized for durable retention | Fail closed: do not persist or create durable coverage state without dataset-specific evidence and a policy update. |
-| Any other Alpaca dataset | Not authorized for durable retention | Fail closed until its rights are classified from dataset-specific evidence. |
+| Historical options data | `UNVERIFIED / PENDING` | The evidence does not cover this dataset; no active policy entry. |
+| Crypto data | `UNVERIFIED / PENDING` | The evidence does not cover historical or real-time crypto; no active policy entry. |
+| Real-time or streaming data | No active entry | Fail closed before request or persistence until dataset-specific evidence is approved. |
+| News | No active entry | Fail closed before request or persistence until dataset-specific evidence is approved. |
+| Any other Alpaca dataset | No active entry | Fail closed until rights are classified from dataset-specific evidence. |
 
-`DURABLE_AUTHORIZED` is an input to the future retention-aware dataset policy. This record alone
-does not implement enforcement, storage, ingestion, watermarking, or purge behavior.
+`DURABLE_AUTHORIZED` applies only to the historical SIP US stock-bar row above and is an input to
+the future retention-aware dataset policy. `UNVERIFIED / PENDING` is an evidence/policy status, not
+a retention grant. This record alone does not implement enforcement, storage, ingestion,
+watermarking, or purge behavior.
 
 The future policy entry must encode the 15-minute restriction as a machine-enforced minimum
 observation age for backfill, incremental update, and repair. Real-time or unexpectedly younger

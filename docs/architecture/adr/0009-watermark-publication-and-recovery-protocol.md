@@ -114,9 +114,11 @@ gaps and verification state.
 Contiguity is measured over eligible sessions and bar slots in the referenced calendar snapshot,
 not every wall-clock instant. Exchange-closed overnight periods, weekends, and holidays are
 `NOT_APPLICABLE`, so an RTH frontier may cross them without inventing coverage. An eligible slot
-with no returned bar advances only when request completion and documented provider aggregation
-semantics support a durable `VERIFIED_EMPTY` fact. Unclassified missing eligible slots remain
-blocking, and calendar changes make affected proofs stale.
+with no returned bar advances only after successful bounded-request completion, acquisition and
+verification of every page, valid pagination termination, and sufficiently demonstrated provider
+aggregation/omission semantics support a durable `VERIFIED_EMPTY` fact. An empty response or absent
+bar alone is insufficient. Unclassified missing eligible slots remain blocking, and calendar
+changes make affected proofs stale.
 
 Retention modes constrain it as follows:
 

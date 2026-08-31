@@ -363,9 +363,10 @@ Coverage links exact streams and half-open intervals to:
 The watermark is derived from retained contiguous VERIFIED or VERIFIED_EMPTY coverage and stores
 an exclusive frontier. Contiguity follows eligible sessions/bar slots in the recorded calendar,
 not every wall-clock instant: overnight closures, weekends, and holidays are NOT_APPLICABLE.
-VERIFIED_EMPTY requires a complete bounded request plus provider semantics supporting a no-trade
-omission. An unclassified missing eligible slot blocks the frontier. The watermark is never
-inferred from a maximum Parquet timestamp.
+VERIFIED_EMPTY requires successful bounded-request completion, complete verified pagination, valid
+pagination termination, and sufficiently demonstrated provider aggregation/omission semantics. An
+empty response or absent bar alone is insufficient. An unclassified missing eligible slot blocks
+the frontier. The watermark is never inferred from a maximum Parquet timestamp.
 
 If a raw/canonical file is absent, corrupt, expired, quarantined, or no longer permitted, readers
 lose visibility and the supporting coverage/watermark is invalidated before use.
