@@ -806,12 +806,283 @@ _MIGRATION_2_STATEMENTS: Final[tuple[str, ...]] = (
 )
 
 
+_MIGRATION_3_STATEMENTS: Final[tuple[str, ...]] = (
+    """
+    CREATE TABLE attempt_request_authorizations (
+        attempt_id TEXT PRIMARY KEY
+            REFERENCES request_attempts(attempt_id) ON DELETE RESTRICT,
+        request_instance_id TEXT NOT NULL
+            REFERENCES request_instances(request_instance_id) ON DELETE RESTRICT,
+        request_spec_id TEXT NOT NULL REFERENCES request_specs(request_spec_id) ON DELETE RESTRICT,
+        policy_snapshot_id TEXT NOT NULL
+            REFERENCES policy_snapshots(policy_snapshot_id) ON DELETE RESTRICT,
+        authorization_hash TEXT NOT NULL CHECK (
+            length(authorization_hash) = 64
+            AND authorization_hash NOT GLOB '*[^0-9a-f]*'
+        ),
+        authorization_json TEXT NOT NULL,
+        eligible_before TEXT NOT NULL,
+        authorized_at TEXT NOT NULL,
+        recorded_at TEXT NOT NULL,
+        UNIQUE (attempt_id, authorization_hash),
+        UNIQUE (attempt_id, request_instance_id),
+        CHECK (authorized_at <= recorded_at)
+    ) WITHOUT ROWID
+    """,
+    """
+    CREATE TABLE attempt_acquisition_records (
+        attempt_id TEXT PRIMARY KEY
+            REFERENCES attempt_request_authorizations(attempt_id) ON DELETE RESTRICT,
+        request_instance_id TEXT NOT NULL
+            REFERENCES request_instances(request_instance_id) ON DELETE RESTRICT,
+        request_spec_id TEXT NOT NULL REFERENCES request_specs(request_spec_id) ON DELETE RESTRICT,
+        policy_snapshot_id TEXT NOT NULL
+            REFERENCES policy_snapshots(policy_snapshot_id) ON DELETE RESTRICT,
+        authorization_hash TEXT NOT NULL CHECK (
+            length(authorization_hash) = 64
+            AND authorization_hash NOT GLOB '*[^0-9a-f]*'
+        ),
+        authorization_json TEXT NOT NULL,
+        ordered_artifacts_hash TEXT NOT NULL CHECK (
+            length(ordered_artifacts_hash) = 64
+            AND ordered_artifacts_hash NOT GLOB '*[^0-9a-f]*'
+        ),
+        page_count INTEGER NOT NULL CHECK (page_count > 0),
+        pagination_complete INTEGER NOT NULL CHECK (pagination_complete = 1),
+        terminal_page_verified INTEGER NOT NULL CHECK (terminal_page_verified = 1),
+        eligible_before TEXT NOT NULL,
+        authorized_at TEXT NOT NULL,
+        completed_at TEXT NOT NULL,
+        UNIQUE (attempt_id, authorization_hash),
+        UNIQUE (attempt_id, request_instance_id),
+        FOREIGN KEY (attempt_id, request_instance_id)
+            REFERENCES attempt_request_authorizations(attempt_id, request_instance_id)
+            ON DELETE RESTRICT,
+        CHECK (authorized_at <= completed_at)
+    ) WITHOUT ROWID
+    """,
+    """
+    CREATE TABLE acquisition_artifacts (
+        attempt_id TEXT NOT NULL
+            REFERENCES attempt_acquisition_records(attempt_id) ON DELETE RESTRICT,
+        artifact_id TEXT NOT NULL REFERENCES raw_artifacts(artifact_id) ON DELETE RESTRICT,
+        ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+        descriptor_hash TEXT NOT NULL CHECK (
+            length(descriptor_hash) = 64
+            AND descriptor_hash NOT GLOB '*[^0-9a-f]*'
+        ),
+        PRIMARY KEY (attempt_id, ordinal),
+        UNIQUE (attempt_id, artifact_id)
+    ) WITHOUT ROWID
+    """,
+    """
+    CREATE TABLE raw_artifact_manifests (
+        artifact_id TEXT PRIMARY KEY REFERENCES raw_artifacts(artifact_id) ON DELETE RESTRICT,
+        manifest_content_sha256 TEXT NOT NULL CHECK (
+            length(manifest_content_sha256) = 64
+            AND manifest_content_sha256 NOT GLOB '*[^0-9a-f]*'
+        ),
+        manifest_byte_count INTEGER NOT NULL CHECK (manifest_byte_count > 0),
+        manifest_schema_version INTEGER NOT NULL CHECK (manifest_schema_version = 1),
+        verified_at TEXT NOT NULL
+    ) WITHOUT ROWID
+    """,
+    """
+    CREATE TABLE raw_replay_provenance (
+        attempt_id TEXT NOT NULL REFERENCES request_attempts(attempt_id) ON DELETE RESTRICT,
+        artifact_id TEXT NOT NULL REFERENCES raw_artifacts(artifact_id) ON DELETE RESTRICT,
+        raw_batch_id TEXT NOT NULL UNIQUE,
+        source_id TEXT NOT NULL,
+        source_provider TEXT NOT NULL,
+        source_dataset TEXT NOT NULL,
+        logical_endpoint TEXT NOT NULL,
+        license_classification TEXT NOT NULL CHECK (license_classification IN (
+            'private', 'redistributable', 'sample', 'synthetic'
+        )),
+        retrieved_at TEXT NOT NULL,
+        media_type TEXT NOT NULL,
+        file_extension TEXT NOT NULL,
+        safe_provider_request_id TEXT,
+        request_metadata_json TEXT NOT NULL,
+        metadata_hash TEXT NOT NULL CHECK (
+            length(metadata_hash) = 64
+            AND metadata_hash NOT GLOB '*[^0-9a-f]*'
+        ),
+        recorded_at TEXT NOT NULL,
+        PRIMARY KEY (attempt_id, artifact_id),
+        FOREIGN KEY (attempt_id, artifact_id)
+            REFERENCES attempt_artifact_observations(attempt_id, artifact_id)
+            ON DELETE RESTRICT,
+        UNIQUE (attempt_id, metadata_hash)
+    ) WITHOUT ROWID
+    """,
+    """
+    CREATE TABLE batch_context_processing_contracts (
+        batch_context_id TEXT PRIMARY KEY
+            REFERENCES batch_contexts(batch_context_id) ON DELETE RESTRICT,
+        processing_signature_hash TEXT NOT NULL CHECK (
+            length(processing_signature_hash) = 64
+            AND processing_signature_hash NOT GLOB '*[^0-9a-f]*'
+        ),
+        processing_signature_json TEXT NOT NULL,
+        source_id TEXT NOT NULL,
+        provenance_json TEXT NOT NULL,
+        provenance_hash TEXT NOT NULL CHECK (
+            length(provenance_hash) = 64
+            AND provenance_hash NOT GLOB '*[^0-9a-f]*'
+        ),
+        recorded_at TEXT NOT NULL
+    ) WITHOUT ROWID
+    """,
+    """
+    CREATE TABLE batch_publication_expectations (
+        batch_context_id TEXT PRIMARY KEY
+            REFERENCES batch_contexts(batch_context_id) ON DELETE RESTRICT,
+        canonical_batch_id TEXT NOT NULL UNIQUE,
+        expectation_hash TEXT NOT NULL CHECK (
+            length(expectation_hash) = 64
+            AND expectation_hash NOT GLOB '*[^0-9a-f]*'
+        ),
+        expectation_json TEXT NOT NULL,
+        first_prepared_at TEXT NOT NULL,
+        UNIQUE (batch_context_id, expectation_hash)
+    ) WITHOUT ROWID
+    """,
+    """
+    CREATE TABLE batch_publication_expectation_requests (
+        batch_context_id TEXT NOT NULL
+            REFERENCES batch_publication_expectations(batch_context_id) ON DELETE RESTRICT,
+        request_instance_id TEXT NOT NULL
+            REFERENCES request_instances(request_instance_id) ON DELETE RESTRICT,
+        state TEXT NOT NULL CHECK (state IN ('PREPARED', 'CATALOGED', 'ABANDONED')),
+        prepared_at TEXT NOT NULL,
+        cataloged_at TEXT,
+        abandoned_at TEXT,
+        PRIMARY KEY (batch_context_id, request_instance_id),
+        UNIQUE (request_instance_id),
+        FOREIGN KEY (batch_context_id, request_instance_id)
+            REFERENCES batch_context_requests(batch_context_id, request_instance_id)
+            ON DELETE RESTRICT,
+        CHECK (
+            (state = 'PREPARED' AND cataloged_at IS NULL AND abandoned_at IS NULL)
+            OR (state = 'CATALOGED' AND cataloged_at IS NOT NULL AND abandoned_at IS NULL)
+            OR (state = 'ABANDONED' AND cataloged_at IS NULL AND abandoned_at IS NOT NULL)
+        )
+    ) WITHOUT ROWID
+    """,
+    """
+    CREATE TABLE canonical_batch_manifests (
+        canonical_batch_id TEXT PRIMARY KEY
+            REFERENCES canonical_batches(canonical_batch_id) ON DELETE RESTRICT,
+        manifest_content_sha256 TEXT NOT NULL CHECK (
+            length(manifest_content_sha256) = 64
+            AND manifest_content_sha256 NOT GLOB '*[^0-9a-f]*'
+        ),
+        manifest_byte_count INTEGER NOT NULL CHECK (manifest_byte_count > 0),
+        manifest_schema_version INTEGER NOT NULL CHECK (manifest_schema_version = 1),
+        verified_at TEXT NOT NULL
+    ) WITHOUT ROWID
+    """,
+    """
+    CREATE TABLE coverage_request_proofs (
+        coverage_id TEXT PRIMARY KEY
+            REFERENCES coverage_segments(coverage_id) ON DELETE RESTRICT,
+        request_instance_id TEXT NOT NULL
+            REFERENCES request_instances(request_instance_id) ON DELETE RESTRICT,
+        attempt_id TEXT NOT NULL
+            REFERENCES attempt_acquisition_records(attempt_id) ON DELETE RESTRICT,
+        authorization_hash TEXT NOT NULL,
+        request_terminal_state TEXT NOT NULL
+            CHECK (request_terminal_state IN ('SUCCESS', 'PARTIAL')),
+        stream_outcome TEXT NOT NULL CHECK (stream_outcome = 'PUBLISHABLE'),
+        terminal_page_verified INTEGER NOT NULL CHECK (terminal_page_verified = 1),
+        canonical_batch_verified INTEGER NOT NULL CHECK (canonical_batch_verified = 1),
+        canonical_file_count INTEGER NOT NULL CHECK (canonical_file_count > 0),
+        raw_artifact_count INTEGER NOT NULL CHECK (raw_artifact_count > 0),
+        relational_provenance_verified INTEGER NOT NULL
+            CHECK (relational_provenance_verified = 1),
+        provider_semantics_version TEXT,
+        proof_hash TEXT NOT NULL CHECK (
+            length(proof_hash) = 64
+            AND proof_hash NOT GLOB '*[^0-9a-f]*'
+        ),
+        FOREIGN KEY (attempt_id, authorization_hash)
+            REFERENCES attempt_acquisition_records(attempt_id, authorization_hash)
+            ON DELETE RESTRICT
+    ) WITHOUT ROWID
+    """,
+    """
+    CREATE TABLE publication_commits (
+        canonical_batch_id TEXT NOT NULL
+            REFERENCES canonical_batches(canonical_batch_id) ON DELETE RESTRICT,
+        request_instance_id TEXT NOT NULL
+            REFERENCES request_instances(request_instance_id) ON DELETE RESTRICT,
+        attempt_id TEXT NOT NULL
+            REFERENCES attempt_acquisition_records(attempt_id) ON DELETE RESTRICT,
+        coverage_commit_hash TEXT NOT NULL CHECK (
+            length(coverage_commit_hash) = 64
+            AND coverage_commit_hash NOT GLOB '*[^0-9a-f]*'
+        ),
+        commit_source TEXT NOT NULL CHECK (commit_source IN ('NORMAL', 'RECOVERY_ADOPTION')),
+        lease_owner_id TEXT NOT NULL,
+        lease_generation INTEGER NOT NULL CHECK (lease_generation > 0),
+        committed_at TEXT NOT NULL,
+        PRIMARY KEY (canonical_batch_id, request_instance_id),
+        UNIQUE (request_instance_id, canonical_batch_id, coverage_commit_hash),
+        UNIQUE (request_instance_id, canonical_batch_id, coverage_commit_hash, attempt_id)
+    ) WITHOUT ROWID
+    """,
+    """
+    CREATE TABLE request_terminal_proofs (
+        request_instance_id TEXT PRIMARY KEY
+            REFERENCES request_instances(request_instance_id) ON DELETE RESTRICT,
+        attempt_id TEXT NOT NULL
+            REFERENCES attempt_acquisition_records(attempt_id) ON DELETE RESTRICT,
+        canonical_batch_id TEXT NOT NULL
+            REFERENCES canonical_batches(canonical_batch_id) ON DELETE RESTRICT,
+        coverage_commit_hash TEXT NOT NULL,
+        terminal_status TEXT NOT NULL CHECK (terminal_status IN ('SUCCESS', 'PARTIAL')),
+        completed_at TEXT NOT NULL,
+        FOREIGN KEY (canonical_batch_id, request_instance_id)
+            REFERENCES publication_commits(canonical_batch_id, request_instance_id)
+            ON DELETE RESTRICT,
+        FOREIGN KEY (request_instance_id, canonical_batch_id, coverage_commit_hash)
+            REFERENCES publication_commits(
+                request_instance_id, canonical_batch_id, coverage_commit_hash
+            ) ON DELETE RESTRICT,
+        FOREIGN KEY (
+            request_instance_id, canonical_batch_id, coverage_commit_hash, attempt_id
+        ) REFERENCES publication_commits(
+                request_instance_id, canonical_batch_id, coverage_commit_hash, attempt_id
+            ) ON DELETE RESTRICT
+    ) WITHOUT ROWID
+    """,
+    """
+    CREATE INDEX raw_replay_artifact_idx
+        ON raw_replay_provenance(artifact_id, retrieved_at)
+    """,
+    """
+    CREATE INDEX publication_expectation_state_idx
+        ON batch_publication_expectation_requests(state, prepared_at)
+    """,
+    """
+    CREATE INDEX publication_commit_attempt_idx
+        ON publication_commits(attempt_id, committed_at)
+    """,
+)
+
+
 MIGRATIONS: Final[tuple[Migration, ...]] = (
     Migration(version=1, name="initial_operational_state", statements=_MIGRATION_1_STATEMENTS),
     Migration(
         version=2,
         name="durable_ingestion_plan_provenance",
         statements=_MIGRATION_2_STATEMENTS,
+    ),
+    Migration(
+        version=3,
+        name="transactional_publication_commit",
+        statements=_MIGRATION_3_STATEMENTS,
     ),
 )
 LATEST_SCHEMA_VERSION: Final = MIGRATIONS[-1].version

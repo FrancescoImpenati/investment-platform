@@ -223,6 +223,12 @@ class OperationalStateStore:
         return self._path
 
     @property
+    def root_id(self) -> str:
+        """Return the sentinel identity to bind verified filesystem publication results."""
+
+        return str(self._root_id)
+
+    @property
     def schema_version(self) -> int:
         self._data_root.validate(expected_root_id=self._root_id)
         row = self._connection.execute("PRAGMA user_version").fetchone()
@@ -273,24 +279,68 @@ class OperationalStateStore:
 
         if not re.fullmatch(r"[0-9a-f]{64}", expected_sha256) or expected_bytes < 0:
             return False
-        if not self._managed_regular_file_is_present(relative_path):
+        try:
+            digest, byte_count = self._managed_file_integrity(relative_path)
+        except OperationalStateError:
             return False
+        # A matching digest proves the bytes are unchanged since the catalog's
+        # publication-time Parquet reopen/schema verification.
+        return digest == expected_sha256 and byte_count == expected_bytes
+
+    def _managed_file_integrity(self, relative_path: str) -> tuple[str, int]:
+        """Return a safe managed file's streamed digest and size.
+
+        Typed repositories use this only after storage-layer semantic verification.  It binds the
+        current immutable file bytes into SQLite without trusting caller-supplied manifest hashes.
+        """
+
+        if not self._managed_regular_file_is_present(relative_path):
+            raise OperationalStateError("managed catalog file is absent or unsafe")
+        path = self._data_root.managed_path(
+            Path(relative_path),
+            expected_root_id=self._root_id,
+        )
+        digest = hashlib.sha256()
+        byte_count = 0
+        try:
+            with path.open("rb") as source:
+                for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                    digest.update(chunk)
+                    byte_count += len(chunk)
+        except OSError as error:
+            raise OperationalStateError("managed catalog file cannot be read safely") from error
+        self._data_root.validate(expected_root_id=self._root_id)
+        if not self._managed_regular_file_is_present(relative_path):
+            raise OperationalStateError("managed catalog file changed during verification")
+        return digest.hexdigest(), byte_count
+
+    def _read_managed_file_bounded(
+        self,
+        relative_path: str,
+        *,
+        max_bytes: int,
+    ) -> bytes:
+        """Read one small verified metadata file without offering a payload-loading API."""
+
+        if not 1 <= max_bytes <= 16 * 1024 * 1024:
+            raise ValueError("managed metadata read limit must be between 1 byte and 16 MiB")
+        if not self._managed_regular_file_is_present(relative_path):
+            raise OperationalStateError("managed metadata file is absent or unsafe")
         path = self._data_root.managed_path(
             Path(relative_path),
             expected_root_id=self._root_id,
         )
         try:
-            if path.stat().st_size != expected_bytes:
-                return False
-            digest = hashlib.sha256()
-            with path.open("rb") as source:
-                for chunk in iter(lambda: source.read(1024 * 1024), b""):
-                    digest.update(chunk)
-        except OSError:
-            return False
-        # A matching digest proves the bytes are unchanged since the catalog's
-        # publication-time Parquet reopen/schema verification.
-        return digest.hexdigest() == expected_sha256
+            size = path.stat().st_size
+            if size > max_bytes:
+                raise OperationalStateError("managed metadata file exceeds its bounded limit")
+            content = path.read_bytes()
+        except OSError as error:
+            raise OperationalStateError("managed metadata file cannot be read safely") from error
+        self._data_root.validate(expected_root_id=self._root_id)
+        if len(content) != size or not self._managed_regular_file_is_present(relative_path):
+            raise OperationalStateError("managed metadata file changed during bounded read")
+        return content
 
     def _connect(self, path: Path) -> sqlite3.Connection:
         connection = sqlite3.connect(
