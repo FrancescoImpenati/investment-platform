@@ -1,5 +1,33 @@
 """Immutable raw artifacts and canonical analytical storage."""
 
+from investment_platform.data.storage._publication import (
+    FaultInjector,
+    PublicationCollisionError,
+    PublicationError,
+    PublicationFaultPoint,
+    PublicationIntegrityError,
+)
+from investment_platform.data.storage.canonical_batches import (
+    CanonicalBatchExpectation,
+    CanonicalBatchManifest,
+    CanonicalBatchPublisher,
+    CanonicalFileManifest,
+    CanonicalParquetPart,
+    CanonicalPublicationProvenance,
+    CanonicalStreamOutcome,
+    PublishedCanonicalBatch,
+    RawProvenanceBinding,
+    StreamPublicationOutcome,
+    verify_canonical_batch_directory,
+)
+from investment_platform.data.storage.living_raw import (
+    PublishedRawArtifact,
+    RawArtifactManifest,
+    RawArtifactPublisher,
+    RawPayloadManifest,
+    raw_artifact_relative_directory,
+    verify_raw_artifact_directory,
+)
 from investment_platform.data.storage.market_bars import (
     PRICE_BAR_SCHEMA,
     BarBatchAlreadyExistsError,
@@ -16,6 +44,12 @@ from investment_platform.data.storage.raw import (
     RawStorageError,
     replay_raw_artifact,
 )
+from investment_platform.data.storage.recovery import (
+    PublicationRecoveryInspector,
+    RecoveryArtifactKind,
+    RecoveryInspection,
+    RecoveryInspectionState,
+)
 
 __all__ = [
     "PRICE_BAR_SCHEMA",
@@ -23,11 +57,37 @@ __all__ = [
     "BarQuery",
     "BarSchemaError",
     "BatchCollisionError",
+    "CanonicalBatchExpectation",
+    "CanonicalBatchManifest",
+    "CanonicalBatchPublisher",
+    "CanonicalFileManifest",
+    "CanonicalParquetPart",
+    "CanonicalPublicationProvenance",
+    "CanonicalStreamOutcome",
+    "FaultInjector",
     "ParquetBarStore",
+    "PublicationCollisionError",
+    "PublicationError",
+    "PublicationFaultPoint",
+    "PublicationIntegrityError",
+    "PublicationRecoveryInspector",
+    "PublishedCanonicalBatch",
+    "PublishedRawArtifact",
     "RawArtifact",
+    "RawArtifactManifest",
+    "RawArtifactPublisher",
     "RawBatchStore",
+    "RawPayloadManifest",
+    "RawProvenanceBinding",
     "RawStorageError",
+    "RecoveryArtifactKind",
+    "RecoveryInspection",
+    "RecoveryInspectionState",
+    "StreamPublicationOutcome",
     "empty_price_bar_frame",
     "price_bars_to_frame",
+    "raw_artifact_relative_directory",
     "replay_raw_artifact",
+    "verify_canonical_batch_directory",
+    "verify_raw_artifact_directory",
 ]
