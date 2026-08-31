@@ -34,6 +34,9 @@ site/
 *.duckdb
 *.duckdb.wal
 *.duckdb.tmp
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
 *.log
 .codex-log/
 
@@ -42,6 +45,17 @@ data/raw/
 data/normalized/
 data/curated/
 data/features/
+
+# Secondary defense for accidental repository-local private-runtime roots
+/raw/
+/normalized/
+/curated/
+/features/
+/staging/
+/operational/
+/logs/
+/quarantine/
+/governance/evidence/
 
 # Editors and operating systems
 .idea/

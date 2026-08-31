@@ -1,0 +1,309 @@
+{
+  "catalog_id": "investment-platform-dataset-retention",
+  "pending_reviews": [
+    {
+      "dataset": "historical_options",
+      "notes": "Ticket 342496 does not cover historical options; no active software policy exists.",
+      "provider": "alpaca",
+      "status": "UNVERIFIED_PENDING"
+    },
+    {
+      "dataset": "crypto",
+      "notes": "Ticket 342496 does not cover historical or real-time crypto; no active software policy exists.",
+      "provider": "alpaca",
+      "status": "UNVERIFIED_PENDING"
+    }
+  ],
+  "policies": [
+    {
+      "dataset": "price_bars_sip",
+      "delete_on_termination": false,
+      "derived": {
+        "mode": "PROHIBITED",
+        "quarantine_allowed": false
+      },
+      "evidence_reference": "docs/governance/data-rights/alpaca-historical-sip.md#ticket-342496",
+      "external_export_allowed": false,
+      "finalization_buffer_seconds": 60,
+      "minimum_observation_age_seconds": 900,
+      "mode": "DURABLE_AUTHORIZED",
+      "normalized": {
+        "mode": "DURABLE_AUTHORIZED",
+        "quarantine_allowed": true
+      },
+      "notes": "Historical SIP US stock bars only, strictly older than 15 minutes plus the conservative finalization buffer; no real-time, options, crypto, news, or other Alpaca dataset rights are inferred.",
+      "permitted_environments": [
+        "private_research"
+      ],
+      "policy_id": "alpaca-historical-sip-us-stock-bars",
+      "processing_allowed": true,
+      "provider": "alpaca",
+      "public_display_allowed": false,
+      "raw": {
+        "mode": "DURABLE_AUTHORIZED",
+        "quarantine_allowed": true
+      },
+      "redistribution_allowed": false,
+      "revision": 1,
+      "review_on": null,
+      "status": "ACTIVE",
+      "use_scope": "Individual non-professional private educational non-commercial research, backtesting, and reproducibility.",
+      "verified_on": "2026-08-29"
+    },
+    {
+      "dataset": "price_bars_us_daily",
+      "delete_on_termination": true,
+      "derived": {
+        "mode": "SUBSCRIPTION_BOUND",
+        "quarantine_allowed": false
+      },
+      "evidence_reference": "docs/research/provider_quality_report.md#licensing-and-data-governance",
+      "external_export_allowed": false,
+      "finalization_buffer_seconds": 0,
+      "minimum_observation_age_seconds": 0,
+      "mode": "SUBSCRIPTION_BOUND",
+      "normalized": {
+        "mode": "SUBSCRIPTION_BOUND",
+        "quarantine_allowed": true
+      },
+      "notes": "Inactive until exact entitlement status and operational retention terms are recorded.",
+      "permitted_environments": [
+        "private_research"
+      ],
+      "policy_id": "twelve-data-us-daily-bars",
+      "processing_allowed": true,
+      "provider": "twelve_data",
+      "public_display_allowed": false,
+      "raw": {
+        "mode": "SUBSCRIPTION_BOUND",
+        "quarantine_allowed": true
+      },
+      "redistribution_allowed": false,
+      "revision": 1,
+      "review_on": null,
+      "status": "PENDING",
+      "use_scope": "Entitled internal use only.",
+      "verified_on": "2026-08-24"
+    },
+    {
+      "dataset": "price_bars_standard_us_intraday",
+      "delete_on_termination": true,
+      "derived": {
+        "mode": "SUBSCRIPTION_BOUND",
+        "quarantine_allowed": false
+      },
+      "evidence_reference": "docs/research/provider_quality_report.md#licensing-and-data-governance",
+      "external_export_allowed": false,
+      "finalization_buffer_seconds": 0,
+      "minimum_observation_age_seconds": 0,
+      "mode": "SUBSCRIPTION_BOUND",
+      "normalized": {
+        "mode": "SUBSCRIPTION_BOUND",
+        "quarantine_allowed": true
+      },
+      "notes": "Inactive until exact entitlement status and operational retention terms are recorded; not a SIP-equivalent volume source.",
+      "permitted_environments": [
+        "private_research"
+      ],
+      "policy_id": "twelve-data-standard-us-intraday-bars",
+      "processing_allowed": true,
+      "provider": "twelve_data",
+      "public_display_allowed": false,
+      "raw": {
+        "mode": "SUBSCRIPTION_BOUND",
+        "quarantine_allowed": true
+      },
+      "redistribution_allowed": false,
+      "revision": 1,
+      "review_on": null,
+      "status": "PENDING",
+      "use_scope": "Entitled internal use only.",
+      "verified_on": "2026-08-24"
+    },
+    {
+      "dataset": "opra.pillar",
+      "delete_on_termination": true,
+      "derived": {
+        "mode": "PROHIBITED",
+        "quarantine_allowed": false
+      },
+      "evidence_reference": "docs/research/databento-evaluation.md#licensing-and-retention-assessment",
+      "external_export_allowed": false,
+      "finalization_buffer_seconds": 0,
+      "minimum_observation_age_seconds": 0,
+      "mode": "EPHEMERAL",
+      "normalized": {
+        "mode": "EPHEMERAL",
+        "quarantine_allowed": false
+      },
+      "notes": "Inactive Phase 2 options candidate pending dataset-specific retention clarification.",
+      "permitted_environments": [
+        "private_research"
+      ],
+      "policy_id": "databento-opra-pillar-ephemeral",
+      "processing_allowed": true,
+      "provider": "databento",
+      "public_display_allowed": false,
+      "raw": {
+        "mode": "EPHEMERAL",
+        "quarantine_allowed": false
+      },
+      "redistribution_allowed": false,
+      "revision": 1,
+      "review_on": null,
+      "status": "SUSPENDED",
+      "use_scope": "Bounded private evaluation only after separate authorization.",
+      "verified_on": "2026-08-26"
+    },
+    {
+      "dataset": "price_bars",
+      "delete_on_termination": true,
+      "derived": {
+        "mode": "PROHIBITED",
+        "quarantine_allowed": false
+      },
+      "evidence_reference": "docs/research/provider_quality_report.md#licensing-and-data-governance",
+      "external_export_allowed": false,
+      "finalization_buffer_seconds": 0,
+      "minimum_observation_age_seconds": 0,
+      "mode": "PROHIBITED",
+      "normalized": {
+        "mode": "PROHIBITED",
+        "quarantine_allowed": false
+      },
+      "notes": "Massive Individual market data is prohibited for the intended non-display workflow.",
+      "permitted_environments": [
+        "private_research"
+      ],
+      "policy_id": "massive-individual-price-bars-prohibited",
+      "processing_allowed": false,
+      "provider": "massive",
+      "public_display_allowed": false,
+      "raw": {
+        "mode": "PROHIBITED",
+        "quarantine_allowed": false
+      },
+      "redistribution_allowed": false,
+      "revision": 1,
+      "review_on": null,
+      "status": "ACTIVE",
+      "use_scope": "No living-ingestion use.",
+      "verified_on": "2026-08-24"
+    },
+    {
+      "dataset": "corporate_actions",
+      "delete_on_termination": true,
+      "derived": {
+        "mode": "PROHIBITED",
+        "quarantine_allowed": false
+      },
+      "evidence_reference": "docs/research/provider_quality_report.md#licensing-and-data-governance",
+      "external_export_allowed": false,
+      "finalization_buffer_seconds": 0,
+      "minimum_observation_age_seconds": 0,
+      "mode": "PROHIBITED",
+      "normalized": {
+        "mode": "PROHIBITED",
+        "quarantine_allowed": false
+      },
+      "notes": "Massive Individual corporate actions are prohibited for the intended non-display workflow.",
+      "permitted_environments": [
+        "private_research"
+      ],
+      "policy_id": "massive-individual-corporate-actions-prohibited",
+      "processing_allowed": false,
+      "provider": "massive",
+      "public_display_allowed": false,
+      "raw": {
+        "mode": "PROHIBITED",
+        "quarantine_allowed": false
+      },
+      "redistribution_allowed": false,
+      "revision": 1,
+      "review_on": null,
+      "status": "ACTIVE",
+      "use_scope": "No living-ingestion use.",
+      "verified_on": "2026-08-24"
+    },
+    {
+      "dataset": "price_bars",
+      "delete_on_termination": false,
+      "derived": {
+        "mode": "SYNTHETIC_UNRESTRICTED",
+        "quarantine_allowed": true
+      },
+      "evidence_reference": "tests/fixtures/providers/README.md",
+      "external_export_allowed": true,
+      "finalization_buffer_seconds": 0,
+      "minimum_observation_age_seconds": 0,
+      "mode": "SYNTHETIC_UNRESTRICTED",
+      "normalized": {
+        "mode": "SYNTHETIC_UNRESTRICTED",
+        "quarantine_allowed": true
+      },
+      "notes": "Hand-authored synthetic provider-shaped fixtures only.",
+      "permitted_environments": [
+        "test",
+        "ci",
+        "development",
+        "private_research",
+        "demo"
+      ],
+      "policy_id": "synthetic-price-bars",
+      "processing_allowed": true,
+      "provider": "synthetic",
+      "public_display_allowed": true,
+      "raw": {
+        "mode": "SYNTHETIC_UNRESTRICTED",
+        "quarantine_allowed": true
+      },
+      "redistribution_allowed": true,
+      "revision": 1,
+      "review_on": null,
+      "status": "ACTIVE",
+      "use_scope": "Offline deterministic testing and public demo.",
+      "verified_on": "2026-08-31"
+    },
+    {
+      "dataset": "price_bars",
+      "delete_on_termination": false,
+      "derived": {
+        "mode": "SYNTHETIC_UNRESTRICTED",
+        "quarantine_allowed": true
+      },
+      "evidence_reference": "data/sample/README.md",
+      "external_export_allowed": true,
+      "finalization_buffer_seconds": 0,
+      "minimum_observation_age_seconds": 0,
+      "mode": "SYNTHETIC_UNRESTRICTED",
+      "normalized": {
+        "mode": "SYNTHETIC_UNRESTRICTED",
+        "quarantine_allowed": true
+      },
+      "notes": "Only synthetic or explicitly redistributable sample data with provenance.",
+      "permitted_environments": [
+        "test",
+        "ci",
+        "development",
+        "private_research",
+        "demo"
+      ],
+      "policy_id": "sample-price-bars",
+      "processing_allowed": true,
+      "provider": "sample",
+      "public_display_allowed": true,
+      "raw": {
+        "mode": "SYNTHETIC_UNRESTRICTED",
+        "quarantine_allowed": true
+      },
+      "redistribution_allowed": true,
+      "revision": 1,
+      "review_on": null,
+      "status": "ACTIVE",
+      "use_scope": "Public sample and demo data under recorded provenance terms.",
+      "verified_on": "2026-08-31"
+    }
+  ],
+  "revision": 1,
+  "schema_version": 1
+}
