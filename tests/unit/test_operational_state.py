@@ -132,7 +132,7 @@ def test_fresh_database_uses_exact_managed_location_and_complete_schema(
     with OperationalStateStore.open(private_root, clock=clock) as opened:
         assert opened.path == private_root.root / DATABASE_RELATIVE_PATH
         assert opened.path.is_file()
-        assert opened.schema_version == LATEST_SCHEMA_VERSION == 1
+        assert opened.schema_version == LATEST_SCHEMA_VERSION
         with opened.read_only_connection() as connection:
             tables = _table_names(connection)
 
@@ -164,6 +164,11 @@ def test_fresh_database_uses_exact_managed_location_and_complete_schema(
         "purge_targets",
         "writer_leases",
         "writer_lease_events",
+        "policy_snapshot_provenance",
+        "policy_catalog_snapshots",
+        "ingestion_plan_records",
+        "ingestion_plan_streams",
+        "request_plan_estimates",
     } <= tables
 
 
@@ -189,7 +194,7 @@ def test_reopen_is_idempotent_and_preserves_committed_state(
 
     clock.advance(timedelta(hours=1))
     with OperationalStateStore.open(private_root, clock=clock) as second:
-        assert second.schema_version == 1
+        assert second.schema_version == LATEST_SCHEMA_VERSION
         count = second._connection.execute(
             "SELECT count(*) FROM stream_keys WHERE stream_id = 'stream-1'"
         ).fetchone()
@@ -199,6 +204,33 @@ def test_reopen_is_idempotent_and_preserves_committed_state(
 
     assert count is not None and int(count[0]) == 1
     assert [tuple(row) for row in reopened_migrations] == [tuple(row) for row in migration_rows]
+
+
+def test_committed_migration_one_upgrades_forward_without_identity_change(
+    monkeypatch: pytest.MonkeyPatch,
+    private_root: PrivateDataRoot,
+    clock: MutableClock,
+) -> None:
+    first_migration = MIGRATIONS[0]
+    monkeypatch.setattr(store_module, "MIGRATIONS", (first_migration,))
+    monkeypatch.setattr(store_module, "LATEST_SCHEMA_VERSION", 1)
+    with OperationalStateStore.open(private_root, clock=clock) as first:
+        assert first.schema_version == 1
+
+    monkeypatch.setattr(store_module, "MIGRATIONS", MIGRATIONS)
+    monkeypatch.setattr(store_module, "LATEST_SCHEMA_VERSION", LATEST_SCHEMA_VERSION)
+    with OperationalStateStore.open(private_root, clock=clock) as upgraded:
+        assert upgraded.schema_version == LATEST_SCHEMA_VERSION
+        rows = upgraded._connection.execute(
+            "SELECT version, name, checksum_sha256 FROM schema_migrations ORDER BY version"
+        ).fetchall()
+
+    assert tuple(rows[0]) == (
+        1,
+        first_migration.name,
+        first_migration.checksum_sha256,
+    )
+    assert [int(row[0]) for row in rows] == [migration.version for migration in MIGRATIONS]
 
 
 def test_two_first_openers_serialize_authoritative_migration_reads(
@@ -219,7 +251,10 @@ def test_two_first_openers_serialize_authoritative_migration_reads(
     with ThreadPoolExecutor(max_workers=2) as executor:
         results = tuple(executor.map(lambda _: open_once(), range(2)))
 
-    assert results == ((1, 1), (1, 1))
+    assert results == (
+        (LATEST_SCHEMA_VERSION, len(MIGRATIONS)),
+        (LATEST_SCHEMA_VERSION, len(MIGRATIONS)),
+    )
 
 
 def test_connection_contract_and_integrity_diagnostics(store: OperationalStateStore) -> None:
@@ -227,7 +262,7 @@ def test_connection_contract_and_integrity_diagnostics(store: OperationalStateSt
 
     assert diagnostics.healthy
     assert diagnostics.database_path == store.path
-    assert diagnostics.schema_version == 1
+    assert diagnostics.schema_version == LATEST_SCHEMA_VERSION
     assert diagnostics.journal_mode == "wal"
     assert diagnostics.synchronous == 2
     assert diagnostics.busy_timeout_ms == 5_000
@@ -262,7 +297,9 @@ def test_future_schema_is_refused_without_mutation(
         OperationalStateStore.open(private_root, clock=clock)
 
     with sqlite3.connect(database_path) as connection:
-        assert int(connection.execute("PRAGMA user_version").fetchone()[0]) == 2
+        assert int(connection.execute("PRAGMA user_version").fetchone()[0]) == (
+            LATEST_SCHEMA_VERSION + 1
+        )
 
 
 def test_migration_identity_tampering_is_refused(
@@ -289,24 +326,26 @@ def test_failed_forward_migration_rolls_back_ddl_and_version(
     with OperationalStateStore.open(private_root, clock=clock) as opened:
         database_path = opened.path
     failing = Migration(
-        version=2,
+        version=LATEST_SCHEMA_VERSION + 1,
         name="synthetic_failing_migration",
         statements=(
             "CREATE TABLE must_rollback(value TEXT)",
             "THIS IS NOT VALID SQL",
         ),
     )
-    monkeypatch.setattr(store_module, "LATEST_SCHEMA_VERSION", 2)
+    monkeypatch.setattr(store_module, "LATEST_SCHEMA_VERSION", LATEST_SCHEMA_VERSION + 1)
     monkeypatch.setattr(store_module, "MIGRATIONS", (*MIGRATIONS, failing))
 
     with pytest.raises(OperationalSchemaError, match="failed atomically"):
         OperationalStateStore.open(private_root, clock=clock)
 
     with sqlite3.connect(database_path) as connection:
-        assert int(connection.execute("PRAGMA user_version").fetchone()[0]) == 1
+        assert int(connection.execute("PRAGMA user_version").fetchone()[0]) == LATEST_SCHEMA_VERSION
         assert "must_rollback" not in _table_names(connection)
-        rows = connection.execute("SELECT version FROM schema_migrations").fetchall()
-        assert rows == [(1,)]
+        rows = connection.execute(
+            "SELECT version FROM schema_migrations ORDER BY version"
+        ).fetchall()
+        assert rows == [(migration.version,) for migration in MIGRATIONS]
 
 
 def test_database_cannot_be_redirected_outside_the_validated_root(

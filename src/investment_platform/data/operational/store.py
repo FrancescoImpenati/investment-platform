@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
 import sqlite3
 import stat
@@ -239,6 +240,58 @@ class OperationalStateStore:
     def _now(self) -> datetime:
         return _as_utc(self._clock(), label="clock value")
 
+    def _managed_regular_file_is_present(self, relative_path: str) -> bool:
+        """Fail closed when cataloged private-root content is absent or link-like."""
+
+        path = self._data_root.managed_path(
+            Path(relative_path),
+            expected_root_id=self._root_id,
+        )
+        try:
+            details = path.lstat()
+        except FileNotFoundError:
+            return False
+        except OSError:
+            return False
+        reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+        attributes = getattr(details, "st_file_attributes", 0)
+        return (
+            stat.S_ISREG(details.st_mode)
+            and not path.is_symlink()
+            and not bool(reparse_flag and attributes & reparse_flag)
+            and details.st_nlink == 1
+        )
+
+    def _managed_file_matches_catalog(
+        self,
+        relative_path: str,
+        *,
+        expected_sha256: str,
+        expected_bytes: int,
+    ) -> bool:
+        """Stream-check current bytes against their already verified catalog entry."""
+
+        if not re.fullmatch(r"[0-9a-f]{64}", expected_sha256) or expected_bytes < 0:
+            return False
+        if not self._managed_regular_file_is_present(relative_path):
+            return False
+        path = self._data_root.managed_path(
+            Path(relative_path),
+            expected_root_id=self._root_id,
+        )
+        try:
+            if path.stat().st_size != expected_bytes:
+                return False
+            digest = hashlib.sha256()
+            with path.open("rb") as source:
+                for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                    digest.update(chunk)
+        except OSError:
+            return False
+        # A matching digest proves the bytes are unchanged since the catalog's
+        # publication-time Parquet reopen/schema verification.
+        return digest.hexdigest() == expected_sha256
+
     def _connect(self, path: Path) -> sqlite3.Connection:
         connection = sqlite3.connect(
             path,
@@ -419,7 +472,7 @@ class OperationalStateStore:
             now = self._now()
             row = connection.execute(
                 """
-                SELECT owner_id, generation, state, expires_at
+                SELECT owner_id, generation, state, heartbeat_at, expires_at
                 FROM writer_leases
                 WHERE lease_name = ?
                 """,
@@ -431,11 +484,35 @@ class OperationalStateStore:
                 or str(row["owner_id"]) != lease.owner_id
                 or int(row["generation"]) != lease.generation
                 or _parse_utc(str(row["expires_at"])) <= now
+                or now < _parse_utc(str(row["heartbeat_at"]))
             ):
                 raise WriterLeaseLostError(
                     "writer lease does not authorize this operational mutation"
                 )
             yield connection
+            # Re-fence immediately before the enclosing transaction commits. A
+            # mutation that outlives its generation or TTL must roll back in full.
+            final_now = self._now()
+            final_row = connection.execute(
+                """
+                SELECT owner_id, generation, state, heartbeat_at, expires_at
+                FROM writer_leases
+                WHERE lease_name = ?
+                """,
+                (lease.lease_name,),
+            ).fetchone()
+            if (
+                final_row is None
+                or str(final_row["state"]) != "ACTIVE"
+                or str(final_row["owner_id"]) != lease.owner_id
+                or int(final_row["generation"]) != lease.generation
+                or _parse_utc(str(final_row["expires_at"])) <= final_now
+                or final_now < _parse_utc(str(final_row["heartbeat_at"]))
+                or final_now < now
+            ):
+                raise WriterLeaseLostError(
+                    "writer lease expired or changed before operational commit"
+                )
 
     @contextmanager
     def read_only_connection(self) -> Iterator[sqlite3.Connection]:

@@ -690,8 +690,129 @@ _MIGRATION_1_STATEMENTS: Final[tuple[str, ...]] = (
 )
 
 
+_MIGRATION_2_STATEMENTS: Final[tuple[str, ...]] = (
+    """
+    CREATE TABLE policy_snapshot_provenance (
+        policy_snapshot_id TEXT PRIMARY KEY
+            REFERENCES policy_snapshots(policy_snapshot_id) ON DELETE RESTRICT,
+        policy_status TEXT NOT NULL CHECK (policy_status = 'ACTIVE'),
+        verified_on TEXT NOT NULL,
+        recorded_at TEXT NOT NULL
+    ) WITHOUT ROWID
+    """,
+    """
+    CREATE TABLE policy_catalog_snapshots (
+        catalog_snapshot_id TEXT PRIMARY KEY,
+        catalog_id TEXT NOT NULL,
+        catalog_revision INTEGER NOT NULL CHECK (catalog_revision > 0),
+        catalog_hash TEXT NOT NULL CHECK (
+            length(catalog_hash) = 64
+            AND catalog_hash NOT GLOB '*[^0-9a-f]*'
+        ),
+        captured_at TEXT NOT NULL,
+        UNIQUE (catalog_id, catalog_revision, catalog_hash)
+    ) WITHOUT ROWID
+    """,
+    """
+    CREATE TABLE ingestion_plan_records (
+        run_id TEXT PRIMARY KEY REFERENCES ingestion_runs(run_id) ON DELETE RESTRICT,
+        plan_hash TEXT NOT NULL CHECK (
+            length(plan_hash) = 64
+            AND plan_hash NOT GLOB '*[^0-9a-f]*'
+        ),
+        planner_contract_version INTEGER NOT NULL CHECK (planner_contract_version = 1),
+        calendar_snapshot_id TEXT NOT NULL
+            REFERENCES calendar_snapshots(calendar_snapshot_id) ON DELETE RESTRICT,
+        calendar_snapshot_checksum TEXT NOT NULL CHECK (
+            length(calendar_snapshot_checksum) = 71
+            AND substr(calendar_snapshot_checksum, 1, 7) = 'sha256:'
+            AND substr(calendar_snapshot_checksum, 8) NOT GLOB '*[^0-9a-f]*'
+        ),
+        policy_snapshot_id TEXT NOT NULL
+            REFERENCES policy_snapshots(policy_snapshot_id) ON DELETE RESTRICT,
+        catalog_snapshot_id TEXT NOT NULL
+            REFERENCES policy_catalog_snapshots(catalog_snapshot_id) ON DELETE RESTRICT,
+        acquisition_strategy TEXT NOT NULL CHECK (acquisition_strategy = 'NETWORK'),
+        repair_strategy TEXT CHECK (repair_strategy IN ('MISSING_ONLY', 'PROVIDER_REFRESH')),
+        repair_reason TEXT,
+        reason TEXT NOT NULL CHECK (length(reason) BETWEEN 1 AND 256),
+        max_attempts INTEGER NOT NULL CHECK (max_attempts > 0),
+        desired_start TEXT NOT NULL,
+        desired_end TEXT NOT NULL,
+        safe_end TEXT NOT NULL,
+        authorized_at TEXT NOT NULL,
+        eligible_slot_count INTEGER NOT NULL CHECK (eligible_slot_count >= 0),
+        eligible_observation_count INTEGER NOT NULL CHECK (eligible_observation_count >= 0),
+        missing_observation_count INTEGER NOT NULL CHECK (missing_observation_count >= 0),
+        pending_observation_count INTEGER NOT NULL CHECK (pending_observation_count >= 0),
+        estimated_pages INTEGER NOT NULL CHECK (estimated_pages >= 0),
+        estimated_calls INTEGER NOT NULL CHECK (estimated_calls >= 0),
+        estimated_bytes INTEGER NOT NULL CHECK (estimated_bytes >= 0),
+        estimated_cost TEXT NOT NULL CHECK (length(estimated_cost) BETWEEN 1 AND 128),
+        lease_owner_id TEXT NOT NULL,
+        lease_generation INTEGER NOT NULL CHECK (lease_generation > 0),
+        recorded_at TEXT NOT NULL,
+        CHECK (desired_start < desired_end),
+        CHECK (missing_observation_count = pending_observation_count),
+        CHECK (missing_observation_count <= eligible_observation_count),
+        CHECK (
+            (repair_strategy IS NULL AND repair_reason IS NULL)
+            OR (repair_strategy IS NOT NULL AND length(repair_reason) BETWEEN 1 AND 256)
+        ),
+        UNIQUE (run_id, plan_hash)
+    ) WITHOUT ROWID
+    """,
+    """
+    CREATE TABLE ingestion_plan_streams (
+        run_id TEXT NOT NULL REFERENCES ingestion_plan_records(run_id) ON DELETE RESTRICT,
+        stream_id TEXT NOT NULL REFERENCES stream_keys(stream_id) ON DELETE RESTRICT,
+        ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+        PRIMARY KEY (run_id, stream_id),
+        UNIQUE (run_id, ordinal)
+    ) WITHOUT ROWID
+    """,
+    """
+    CREATE TABLE request_plan_estimates (
+        request_instance_id TEXT PRIMARY KEY
+            REFERENCES request_instances(request_instance_id) ON DELETE RESTRICT,
+        policy_snapshot_id TEXT NOT NULL
+            REFERENCES policy_snapshots(policy_snapshot_id) ON DELETE RESTRICT,
+        calendar_snapshot_id TEXT NOT NULL
+            REFERENCES calendar_snapshots(calendar_snapshot_id) ON DELETE RESTRICT,
+        expected_slot_count INTEGER NOT NULL CHECK (expected_slot_count > 0),
+        expected_observation_count INTEGER NOT NULL CHECK (expected_observation_count > 0),
+        estimated_pages INTEGER NOT NULL CHECK (estimated_pages > 0),
+        estimated_calls INTEGER NOT NULL CHECK (estimated_calls > 0),
+        estimated_bytes INTEGER NOT NULL CHECK (estimated_bytes > 0),
+        estimated_cost TEXT NOT NULL CHECK (length(estimated_cost) BETWEEN 1 AND 128),
+        first_slot_start TEXT NOT NULL,
+        last_slot_end TEXT NOT NULL,
+        authorization_eligible_before TEXT NOT NULL,
+        authorized_at TEXT NOT NULL,
+        CHECK (first_slot_start < last_slot_end),
+        CHECK (last_slot_end < authorization_eligible_before)
+    ) WITHOUT ROWID
+    """,
+    """
+    CREATE INDEX ingestion_plan_calendar_policy_idx
+        ON ingestion_plan_records(
+            calendar_snapshot_id, policy_snapshot_id, catalog_snapshot_id, recorded_at
+        )
+    """,
+    """
+    CREATE UNIQUE INDEX request_spec_provider_identifier_unique_idx
+        ON request_spec_streams(request_spec_id, provider_identifier)
+    """,
+)
+
+
 MIGRATIONS: Final[tuple[Migration, ...]] = (
     Migration(version=1, name="initial_operational_state", statements=_MIGRATION_1_STATEMENTS),
+    Migration(
+        version=2,
+        name="durable_ingestion_plan_provenance",
+        statements=_MIGRATION_2_STATEMENTS,
+    ),
 )
 LATEST_SCHEMA_VERSION: Final = MIGRATIONS[-1].version
 

@@ -109,15 +109,18 @@ def _complete_authorization(
         environment=RuntimeEnvironment.PRIVATE_RESEARCH,
         start=_NOW - timedelta(hours=2),
         end=_NOW - timedelta(hours=1),
+        request_spec_hash="a" * 64,
         runtime_status=runtime_status,
     )
     payload = b'{"bars":[]}'
     page = enforcer.authorize_response_page(
         request,
-        page_ordinal=1,
+        page_ordinal=0,
+        page_relation="root",
         payload_sha256=hashlib.sha256(payload).hexdigest(),
         payload_size_bytes=len(payload),
         canonical_media_type="application/json",
+        content_encoding="identity",
         observed_start=request.request_start,
         observed_end=request.request_end,
         runtime_status=runtime_status,
@@ -220,6 +223,7 @@ def test_alpaca_request_gate_is_strictly_older_than_age_plus_buffer() -> None:
             environment=RuntimeEnvironment.PRIVATE_RESEARCH,
             start=safe_end - timedelta(hours=1),
             end=safe_end,
+            request_spec_hash="b" * 64,
         )
 
     authorized = enforcer.authorize_request(
@@ -227,6 +231,7 @@ def test_alpaca_request_gate_is_strictly_older_than_age_plus_buffer() -> None:
         environment=RuntimeEnvironment.PRIVATE_RESEARCH,
         start=safe_end - timedelta(hours=1),
         end=safe_end - timedelta(microseconds=1),
+        request_spec_hash="b" * 64,
     )
     assert authorized.policy_id == "alpaca-historical-sip-us-stock-bars"
 
@@ -263,12 +268,17 @@ def test_alpaca_layer_permissions_allow_raw_and_normalized_but_not_derived() -> 
         payload_sha256=page_authorization.payload_sha256,
         payload_size_bytes=page_authorization.payload_size_bytes,
         canonical_media_type=page_authorization.canonical_media_type,
+        content_encoding=page_authorization.content_encoding,
+        request_spec_hash=page_authorization.request.request_spec_hash,
+        page_ordinal=page_authorization.page_ordinal,
+        page_relation=page_authorization.page_relation,
     )
     persisted_normalized = enforcer.authorize_persistence(
         *_ALPACA_KEY,
         environment=RuntimeEnvironment.PRIVATE_RESEARCH,
         layer=RetentionLayer.NORMALIZED,
         acquisition_authorization=acquisition_authorization,
+        input_artifacts=acquisition_authorization.ordered_artifacts,
         input_page_sha256=acquisition_authorization.ordered_page_sha256,
     )
     assert persisted_raw.raw.mode is RetentionMode.DURABLE_AUTHORIZED
@@ -324,10 +334,12 @@ def test_provider_overfetch_cannot_obtain_page_persistence_or_quarantine_authori
         with pytest.raises(DatasetPolicyDenied, match="outside authorized bounds"):
             enforcer.authorize_response_page(
                 request,
-                page_ordinal=1,
+                page_ordinal=0,
+                page_relation="root",
                 payload_sha256=payload_hash,
                 payload_size_bytes=16,
                 canonical_media_type="application/json",
+                content_encoding="identity",
                 observed_start=observed_start,
                 observed_end=observed_end,
             )
@@ -395,14 +407,55 @@ def test_materialization_identity_must_match_the_authorized_bytes_and_pages() ->
             payload_sha256="0" * 64,
             payload_size_bytes=page.payload_size_bytes,
             canonical_media_type=page.canonical_media_type,
+            content_encoding=page.content_encoding,
+            request_spec_hash=page.request.request_spec_hash,
+            page_ordinal=page.page_ordinal,
+            page_relation=page.page_relation,
         )
-    with pytest.raises(DatasetPolicyDenied, match="authorized response pages"):
+    wrong_artifact = acquisition.ordered_artifacts[0].model_copy(
+        update={"content_sha256": "0" * 64}
+    )
+    with pytest.raises(DatasetPolicyDenied, match="authorized raw artifact sequence"):
         enforcer.authorize_persistence(
             *_ALPACA_KEY,
             environment=RuntimeEnvironment.PRIVATE_RESEARCH,
             layer=RetentionLayer.NORMALIZED,
             acquisition_authorization=acquisition,
-            input_page_sha256=("0" * 64,),
+            input_artifacts=(wrong_artifact,),
+        )
+
+
+def test_authorization_is_bound_to_request_spec_and_zero_based_page_relation() -> None:
+    catalog = RetentionPolicyCatalog.load_default()
+    enforcer = RetentionPolicyEnforcer(catalog, clock=_clock)
+    policy = catalog.lookup(*_ALPACA_KEY)
+    request, page, _ = _complete_authorization(enforcer, policy)
+
+    with pytest.raises(DatasetPolicyDenied, match="inspected response bytes"):
+        enforcer.authorize_persistence(
+            *_ALPACA_KEY,
+            environment=RuntimeEnvironment.PRIVATE_RESEARCH,
+            layer=RetentionLayer.RAW,
+            response_authorization=page,
+            payload_sha256=page.payload_sha256,
+            payload_size_bytes=page.payload_size_bytes,
+            canonical_media_type=page.canonical_media_type,
+            content_encoding=page.content_encoding,
+            request_spec_hash="f" * 64,
+            page_ordinal=page.page_ordinal,
+            page_relation=page.page_relation,
+        )
+    with pytest.raises(ValueError, match="relation"):
+        enforcer.authorize_response_page(
+            request,
+            page_ordinal=1,
+            page_relation="root",
+            payload_sha256=page.payload_sha256,
+            payload_size_bytes=page.payload_size_bytes,
+            canonical_media_type=page.canonical_media_type,
+            content_encoding=page.content_encoding,
+            observed_start=request.request_start,
+            observed_end=request.request_end,
         )
 
 
@@ -430,6 +483,10 @@ def test_authorization_tokens_cannot_cross_provider_or_dataset_policy_identity()
             payload_sha256=page.payload_sha256,
             payload_size_bytes=page.payload_size_bytes,
             canonical_media_type=page.canonical_media_type,
+            content_encoding=page.content_encoding,
+            request_spec_hash=page.request.request_spec_hash,
+            page_ordinal=page.page_ordinal,
+            page_relation=page.page_relation,
         )
     with pytest.raises(DatasetPolicyDenied, match="current exact dataset policy"):
         enforcer.authorize_persistence(
@@ -438,6 +495,7 @@ def test_authorization_tokens_cannot_cross_provider_or_dataset_policy_identity()
             environment=RuntimeEnvironment.PRIVATE_RESEARCH,
             layer=RetentionLayer.NORMALIZED,
             acquisition_authorization=acquisition,
+            input_artifacts=acquisition.ordered_artifacts,
             input_page_sha256=acquisition.ordered_page_sha256,
         )
 
@@ -471,6 +529,10 @@ def test_authorization_tokens_are_invalidated_by_a_policy_revision() -> None:
             payload_sha256=page.payload_sha256,
             payload_size_bytes=page.payload_size_bytes,
             canonical_media_type=page.canonical_media_type,
+            content_encoding=page.content_encoding,
+            request_spec_hash=page.request.request_spec_hash,
+            page_ordinal=page.page_ordinal,
+            page_relation=page.page_relation,
         )
     with pytest.raises(DatasetPolicyDenied, match="current exact dataset policy"):
         revised_enforcer.authorize_watermark(
@@ -589,6 +651,7 @@ def test_ttl_without_exact_expiry_or_status_denies_query_persistence_and_waterma
                 layer=RetentionLayer.NORMALIZED,
                 runtime_status=runtime_status,
                 acquisition_authorization=acquisition_authorization,
+                input_artifacts=acquisition_authorization.ordered_artifacts,
                 input_page_sha256=acquisition_authorization.ordered_page_sha256,
             )
         with pytest.raises(DatasetPolicyDenied, match="TTL dataset requires"):
@@ -625,6 +688,7 @@ def test_ttl_policy_requires_ttl_metadata_and_expires_at_the_runtime_boundary() 
             layer=RetentionLayer.NORMALIZED,
             runtime_status=future_status,
             acquisition_authorization=acquisition_authorization,
+            input_artifacts=acquisition_authorization.ordered_artifacts,
             input_page_sha256=acquisition_authorization.ordered_page_sha256,
         )
         == policy
@@ -643,6 +707,7 @@ def test_ttl_policy_requires_ttl_metadata_and_expires_at_the_runtime_boundary() 
                     expires_at=expires_at,
                 ),
                 acquisition_authorization=acquisition_authorization,
+                input_artifacts=acquisition_authorization.ordered_artifacts,
                 input_page_sha256=acquisition_authorization.ordered_page_sha256,
             )
 
@@ -678,6 +743,10 @@ def test_quarantine_export_and_purge_are_exact_policy_gates() -> None:
             payload_sha256=page_authorization.payload_sha256,
             payload_size_bytes=page_authorization.payload_size_bytes,
             canonical_media_type=page_authorization.canonical_media_type,
+            content_encoding=page_authorization.content_encoding,
+            request_spec_hash=page_authorization.request.request_spec_hash,
+            page_ordinal=page_authorization.page_ordinal,
+            page_relation=page_authorization.page_relation,
         )
         == policy
     )
@@ -687,6 +756,7 @@ def test_quarantine_export_and_purge_are_exact_policy_gates() -> None:
             environment=RuntimeEnvironment.PRIVATE_RESEARCH,
             layer=RetentionLayer.NORMALIZED,
             acquisition_authorization=acquisition_authorization,
+            input_artifacts=acquisition_authorization.ordered_artifacts,
             input_page_sha256=acquisition_authorization.ordered_page_sha256,
         )
         == policy

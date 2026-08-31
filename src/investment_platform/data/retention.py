@@ -16,7 +16,17 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from investment_platform.runtime import RuntimeEnvironment
 
 _DEFAULT_CATALOG_RESOURCE: Final = "retention_catalog.v1.json"
+_SHA256_HEX = r"^[0-9a-f]{64}$"
+_PAGE_RELATION = r"^(?:root|after:[0-9]+)$"
+_MEDIA_TYPE = r"^[a-z0-9][a-z0-9!#$&^_.+-]*/[a-z0-9][a-z0-9!#$&^_.+-]*$"
+_CONTENT_ENCODING = r"^[a-z0-9][a-z0-9._+-]{0,63}$"
 NonEmptyStr = Annotated[str, Field(min_length=1)]
+
+
+def _canonical_page_relation(page_ordinal: int) -> str:
+    if page_ordinal < 0:
+        raise ValueError("page ordinal must be non-negative")
+    return "root" if page_ordinal == 0 else f"after:{page_ordinal - 1}"
 
 
 class RetentionPolicyError(RuntimeError):
@@ -263,10 +273,33 @@ class DatasetRuntimeStatus(_FrozenPolicyModel):
         )
 
 
+class PlanningPolicyAuthorization(_FrozenPolicyModel):
+    """One frozen policy and age frontier shared by every request in a plan."""
+
+    policy_snapshot: DatasetPolicySnapshot
+    environment: RuntimeEnvironment
+    eligible_before: datetime
+    authorized_at: datetime
+
+    @field_validator("eligible_before", "authorized_at", mode="after")
+    @classmethod
+    def normalize_times(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("planning authorization timestamps must be timezone-aware")
+        return value.astimezone(UTC)
+
+    @model_validator(mode="after")
+    def validate_snapshot_time(self) -> Self:
+        if self.policy_snapshot.captured_at != self.authorized_at:
+            raise ValueError("policy snapshot capture must equal planning authorization time")
+        return self
+
+
 class RequestPolicyAuthorization(_FrozenPolicyModel):
     """Immutable authorization for one exact bounded request."""
 
     policy_snapshot: DatasetPolicySnapshot
+    request_spec_hash: Annotated[str, Field(pattern=_SHA256_HEX)]
     environment: RuntimeEnvironment
     request_start: datetime
     request_end: datetime
@@ -303,10 +336,12 @@ class ResponsePageAuthorization(_FrozenPolicyModel):
     """Authorization bound to one inspected transient provider response page."""
 
     request: RequestPolicyAuthorization
-    page_ordinal: Annotated[int, Field(gt=0)]
-    payload_sha256: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
+    page_ordinal: Annotated[int, Field(ge=0)]
+    page_relation: Annotated[str, Field(pattern=_PAGE_RELATION)]
+    payload_sha256: Annotated[str, Field(pattern=_SHA256_HEX)]
     payload_size_bytes: Annotated[int, Field(ge=0)]
-    canonical_media_type: NonEmptyStr
+    canonical_media_type: Annotated[str, Field(pattern=_MEDIA_TYPE)]
+    content_encoding: Annotated[str, Field(pattern=_CONTENT_ENCODING)]
     observed_start: datetime | None = None
     observed_end: datetime | None = None
     authorized_at: datetime
@@ -320,8 +355,15 @@ class ResponsePageAuthorization(_FrozenPolicyModel):
             raise ValueError("response authorization timestamps must be timezone-aware")
         return value.astimezone(UTC)
 
+    @field_validator("canonical_media_type", "content_encoding", mode="before")
+    @classmethod
+    def canonicalize_content_metadata(cls, value: object) -> object:
+        return value.strip().lower() if isinstance(value, str) else value
+
     @model_validator(mode="after")
     def validate_observed_bounds(self) -> Self:
+        if self.page_relation != _canonical_page_relation(self.page_ordinal):
+            raise ValueError("response page relation does not match its deterministic ordinal")
         if (self.observed_start is None) != (self.observed_end is None):
             raise ValueError("observed response bounds must both be present or both be absent")
         if self.observed_start is not None and self.observed_end is not None:
@@ -335,12 +377,47 @@ class ResponsePageAuthorization(_FrozenPolicyModel):
                 raise ValueError("observed response lies outside authorized bounds")
         return self
 
+    @property
+    def artifact_descriptor(self) -> AuthorizedRawArtifactDescriptor:
+        return AuthorizedRawArtifactDescriptor(
+            request_spec_hash=self.request.request_spec_hash,
+            page_ordinal=self.page_ordinal,
+            page_relation=self.page_relation,
+            content_sha256=self.payload_sha256,
+            byte_count=self.payload_size_bytes,
+            media_type=self.canonical_media_type,
+            content_encoding=self.content_encoding,
+        )
+
+
+class AuthorizedRawArtifactDescriptor(_FrozenPolicyModel):
+    """Exact immutable raw-page identity fields authorized for downstream use."""
+
+    request_spec_hash: Annotated[str, Field(pattern=_SHA256_HEX)]
+    page_ordinal: Annotated[int, Field(ge=0)]
+    page_relation: Annotated[str, Field(pattern=_PAGE_RELATION)]
+    content_sha256: Annotated[str, Field(pattern=_SHA256_HEX)]
+    byte_count: Annotated[int, Field(ge=0)]
+    media_type: Annotated[str, Field(pattern=_MEDIA_TYPE)]
+    content_encoding: Annotated[str, Field(pattern=_CONTENT_ENCODING)]
+
+    @field_validator("media_type", "content_encoding", mode="before")
+    @classmethod
+    def canonicalize_content_metadata(cls, value: object) -> object:
+        return value.strip().lower() if isinstance(value, str) else value
+
+    @model_validator(mode="after")
+    def validate_page_chain(self) -> Self:
+        if self.page_relation != _canonical_page_relation(self.page_ordinal):
+            raise ValueError("raw artifact page relation does not match its ordinal")
+        return self
+
 
 class AcquisitionPolicyAuthorization(_FrozenPolicyModel):
     """Proof that every authorized page reached verified pagination termination."""
 
     request: RequestPolicyAuthorization
-    ordered_page_sha256: Annotated[tuple[str, ...], Field(min_length=1)]
+    ordered_artifacts: Annotated[tuple[AuthorizedRawArtifactDescriptor, ...], Field(min_length=1)]
     pagination_complete: bool
     terminal_page_verified: bool
     authorized_at: datetime
@@ -356,12 +433,22 @@ class AcquisitionPolicyAuthorization(_FrozenPolicyModel):
     def require_complete_pagination(self) -> Self:
         if not self.pagination_complete or not self.terminal_page_verified:
             raise ValueError("acquisition authorization requires verified pagination completion")
-        if any(
-            len(value) != 64 or any(character not in "0123456789abcdef" for character in value)
-            for value in self.ordered_page_sha256
+        if tuple(value.page_ordinal for value in self.ordered_artifacts) != tuple(
+            range(len(self.ordered_artifacts))
         ):
-            raise ValueError("acquisition page hashes must be SHA-256 values")
+            raise ValueError("acquisition artifacts must be a complete 0-based page sequence")
+        if any(
+            value.request_spec_hash != self.request.request_spec_hash
+            for value in self.ordered_artifacts
+        ):
+            raise ValueError("acquisition artifacts belong to a different request specification")
         return self
+
+    @property
+    def ordered_page_sha256(self) -> tuple[str, ...]:
+        """Compatibility view; full descriptors remain the authorization boundary."""
+
+        return tuple(value.content_sha256 for value in self.ordered_artifacts)
 
 
 def _hash_json(value: object) -> str:
@@ -589,6 +676,11 @@ class RetentionPolicyEnforcer:
         payload_sha256: str | None,
         payload_size_bytes: int | None,
         canonical_media_type: str | None,
+        content_encoding: str | None,
+        request_spec_hash: str | None,
+        page_ordinal: int | None,
+        page_relation: str | None,
+        input_artifacts: tuple[AuthorizedRawArtifactDescriptor, ...] | None,
         input_page_sha256: tuple[str, ...] | None,
     ) -> None:
         if policy.mode is RetentionMode.SYNTHETIC_UNRESTRICTED:
@@ -603,11 +695,19 @@ class RetentionPolicyEnforcer:
                 payload_sha256.casefold() if payload_sha256 is not None else None,
                 payload_size_bytes,
                 canonical_media_type,
+                content_encoding,
+                request_spec_hash,
+                page_ordinal,
+                page_relation,
             )
             authorized_identity = (
                 response_authorization.payload_sha256,
                 response_authorization.payload_size_bytes,
                 response_authorization.canonical_media_type,
+                response_authorization.content_encoding,
+                response_authorization.request.request_spec_hash,
+                response_authorization.page_ordinal,
+                response_authorization.page_relation,
             )
             if candidate_identity != authorized_identity:
                 raise DatasetPolicyDenied(
@@ -623,10 +723,14 @@ class RetentionPolicyEnforcer:
             policy,
             environment,
         )
-        if input_page_sha256 != acquisition_authorization.ordered_page_sha256:
+        if input_artifacts != acquisition_authorization.ordered_artifacts:
             raise DatasetPolicyDenied(
-                "materialization inputs do not match the authorized response pages"
+                "materialization inputs do not match the authorized raw artifact sequence"
             )
+        if input_page_sha256 is not None and (
+            input_page_sha256 != acquisition_authorization.ordered_page_sha256
+        ):
+            raise DatasetPolicyDenied("materialization page hash view is inconsistent")
 
     def authorize_request(
         self,
@@ -636,7 +740,9 @@ class RetentionPolicyEnforcer:
         environment: RuntimeEnvironment,
         start: datetime,
         end: datetime,
+        request_spec_hash: str,
         runtime_status: DatasetRuntimeStatus | None = None,
+        planning_authorization: PlanningPolicyAuthorization | None = None,
     ) -> RequestPolicyAuthorization:
         policy = self._active_policy(
             provider,
@@ -652,8 +758,23 @@ class RetentionPolicyEnforcer:
         end = end.astimezone(UTC)
         if end <= start:
             raise ValueError("request end must be later than start")
-        authorized_at = self._now()
-        safe_end = self.request_safe_end(policy, evaluation_time=authorized_at)
+        if planning_authorization is None:
+            authorized_at = self._now()
+            safe_end = self.request_safe_end(policy, evaluation_time=authorized_at)
+            policy_snapshot = self._catalog.snapshot(
+                provider,
+                dataset,
+                captured_at=authorized_at,
+            )
+        else:
+            self._assert_planning_authorization(
+                planning_authorization,
+                policy,
+                environment,
+            )
+            authorized_at = planning_authorization.authorized_at
+            safe_end = planning_authorization.eligible_before
+            policy_snapshot = planning_authorization.policy_snapshot
         # Alpaca's grant is strictly older than the age boundary; equality is denied.
         if end >= safe_end:
             raise DatasetPolicyDenied(
@@ -661,17 +782,81 @@ class RetentionPolicyEnforcer:
                 "age/finalization gate"
             )
         return RequestPolicyAuthorization(
-            policy_snapshot=self._catalog.snapshot(
-                provider,
-                dataset,
-                captured_at=authorized_at,
-            ),
+            policy_snapshot=policy_snapshot,
+            request_spec_hash=request_spec_hash.casefold(),
             environment=environment,
             request_start=start,
             request_end=end,
             eligible_before=safe_end,
             authorized_at=authorized_at,
         )
+
+    def authorize_planning(
+        self,
+        provider: str,
+        dataset: str,
+        *,
+        environment: RuntimeEnvironment,
+        runtime_status: DatasetRuntimeStatus | None = None,
+    ) -> PlanningPolicyAuthorization:
+        """Freeze one exact policy snapshot and strict safe end for a whole plan."""
+
+        policy = self._active_policy(
+            provider,
+            dataset,
+            environment=environment,
+            runtime_status=runtime_status,
+        )
+        authorized_at = self._now()
+        return PlanningPolicyAuthorization(
+            policy_snapshot=self._catalog.snapshot(
+                provider,
+                dataset,
+                captured_at=authorized_at,
+            ),
+            environment=environment,
+            eligible_before=self.request_safe_end(
+                policy,
+                evaluation_time=authorized_at,
+            ),
+            authorized_at=authorized_at,
+        )
+
+    def _assert_planning_authorization(
+        self,
+        authorization: PlanningPolicyAuthorization,
+        policy: DatasetRetentionPolicy,
+        environment: RuntimeEnvironment,
+    ) -> None:
+        snapshot = authorization.policy_snapshot
+        expected = (
+            self._catalog.document.catalog_id,
+            self._catalog.document.revision,
+            self._catalog.content_hash,
+            policy.policy_id,
+            policy.revision,
+            policy.content_hash,
+            policy.provider,
+            policy.dataset,
+            policy.mode,
+            policy.status,
+            policy.verified_on,
+        )
+        actual = (
+            snapshot.catalog_id,
+            snapshot.catalog_revision,
+            snapshot.catalog_hash,
+            snapshot.policy_id,
+            snapshot.policy_revision,
+            snapshot.policy_hash,
+            snapshot.provider,
+            snapshot.dataset,
+            snapshot.mode,
+            snapshot.status,
+            snapshot.verified_on,
+        )
+        if actual != expected or authorization.environment is not environment:
+            raise DatasetPolicyDenied("planning authorization is stale or for a different policy")
 
     def request_safe_end(
         self,
@@ -692,9 +877,11 @@ class RetentionPolicyEnforcer:
         request_authorization: RequestPolicyAuthorization,
         *,
         page_ordinal: int,
+        page_relation: str,
         payload_sha256: str,
         payload_size_bytes: int,
         canonical_media_type: str,
+        content_encoding: str,
         observed_start: datetime | None,
         observed_end: datetime | None,
         runtime_status: DatasetRuntimeStatus | None = None,
@@ -734,9 +921,11 @@ class RetentionPolicyEnforcer:
         return ResponsePageAuthorization(
             request=request_authorization,
             page_ordinal=page_ordinal,
+            page_relation=page_relation,
             payload_sha256=payload_sha256.casefold(),
             payload_size_bytes=payload_size_bytes,
             canonical_media_type=canonical_media_type,
+            content_encoding=content_encoding,
             observed_start=observed_start,
             observed_end=observed_end,
             authorized_at=self._now(),
@@ -767,7 +956,7 @@ class RetentionPolicyEnforcer:
             raise DatasetPolicyDenied("a completed acquisition requires at least one response page")
         if not pagination_complete or not terminal_page_verified:
             raise DatasetPolicyDenied("provider pagination is not completely verified")
-        for expected_ordinal, page in enumerate(pages, start=1):
+        for expected_ordinal, page in enumerate(pages):
             self._assert_page_authorization(
                 page,
                 policy,
@@ -779,7 +968,7 @@ class RetentionPolicyEnforcer:
                 )
         return AcquisitionPolicyAuthorization(
             request=request_authorization,
-            ordered_page_sha256=tuple(page.payload_sha256 for page in pages),
+            ordered_artifacts=tuple(page.artifact_descriptor for page in pages),
             pagination_complete=True,
             terminal_page_verified=True,
             authorized_at=self._now(),
@@ -813,6 +1002,11 @@ class RetentionPolicyEnforcer:
         payload_sha256: str | None = None,
         payload_size_bytes: int | None = None,
         canonical_media_type: str | None = None,
+        content_encoding: str | None = None,
+        request_spec_hash: str | None = None,
+        page_ordinal: int | None = None,
+        page_relation: str | None = None,
+        input_artifacts: tuple[AuthorizedRawArtifactDescriptor, ...] | None = None,
         input_page_sha256: tuple[str, ...] | None = None,
     ) -> DatasetRetentionPolicy:
         policy = self._active_policy(
@@ -840,6 +1034,11 @@ class RetentionPolicyEnforcer:
             payload_sha256=payload_sha256,
             payload_size_bytes=payload_size_bytes,
             canonical_media_type=canonical_media_type,
+            content_encoding=content_encoding,
+            request_spec_hash=request_spec_hash,
+            page_ordinal=page_ordinal,
+            page_relation=page_relation,
+            input_artifacts=input_artifacts,
             input_page_sha256=input_page_sha256,
         )
         return policy
@@ -905,6 +1104,11 @@ class RetentionPolicyEnforcer:
         payload_sha256: str | None = None,
         payload_size_bytes: int | None = None,
         canonical_media_type: str | None = None,
+        content_encoding: str | None = None,
+        request_spec_hash: str | None = None,
+        page_ordinal: int | None = None,
+        page_relation: str | None = None,
+        input_artifacts: tuple[AuthorizedRawArtifactDescriptor, ...] | None = None,
         input_page_sha256: tuple[str, ...] | None = None,
     ) -> DatasetRetentionPolicy:
         policy = self._active_policy(
@@ -924,6 +1128,11 @@ class RetentionPolicyEnforcer:
             payload_sha256=payload_sha256,
             payload_size_bytes=payload_size_bytes,
             canonical_media_type=canonical_media_type,
+            content_encoding=content_encoding,
+            request_spec_hash=request_spec_hash,
+            page_ordinal=page_ordinal,
+            page_relation=page_relation,
+            input_artifacts=input_artifacts,
             input_page_sha256=input_page_sha256,
         )
         return policy
@@ -954,6 +1163,7 @@ class RetentionPolicyEnforcer:
 
 __all__ = [
     "AcquisitionPolicyAuthorization",
+    "AuthorizedRawArtifactDescriptor",
     "DatasetPolicyDenied",
     "DatasetPolicySnapshot",
     "DatasetPolicyStatus",
@@ -961,6 +1171,7 @@ __all__ = [
     "DatasetRuntimeStatus",
     "LayerRetentionPolicy",
     "PendingDatasetReview",
+    "PlanningPolicyAuthorization",
     "RequestPolicyAuthorization",
     "ResponsePageAuthorization",
     "RetentionCatalogDocument",
