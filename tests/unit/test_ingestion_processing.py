@@ -11,6 +11,7 @@ import pytest
 
 from investment_platform.data.calendar import CalendarSession, CalendarSnapshot
 from investment_platform.data.ingestion.acquisition import (
+    InspectedRawPage,
     inspect_alpaca_sip_bar_page,
     specification_to_bar_request,
 )
@@ -120,6 +121,8 @@ def _bar(timestamp: str, *, close: float = 100.5) -> dict[str, object]:
 def _processing_input(
     specification: RequestSpecification,
     bars: dict[str, list[dict[str, object]]],
+    *,
+    inspected_bounds: tuple[datetime, datetime] | None = None,
 ) -> tuple[tuple[RawProcessingPage, ...], AcquisitionPolicyAuthorization]:
     payload = json.dumps(
         {"bars": bars, "next_page_token": None},
@@ -146,7 +149,19 @@ def _processing_input(
         end=specification.end,
         request_spec_hash=specification.request_spec_hash,
     )
-    inspected = inspect_alpaca_sip_bar_page(batch, specification, _calendar())
+    inspected = (
+        inspect_alpaca_sip_bar_page(batch, specification, _calendar())
+        if inspected_bounds is None
+        else InspectedRawPage(
+            payload_sha256=hashlib.sha256(payload).hexdigest(),
+            payload_size_bytes=len(payload),
+            canonical_media_type="application/json",
+            content_encoding="identity",
+            observed_start=inspected_bounds[0],
+            observed_end=inspected_bounds[1],
+            pagination_terminal=True,
+        )
+    )
     page_authorization = enforcer.authorize_response_page(
         request,
         page_ordinal=0,
@@ -178,8 +193,14 @@ def _processing_input(
 def _prepare(
     specification: RequestSpecification,
     bars: dict[str, list[dict[str, object]]],
+    *,
+    inspected_bounds: tuple[datetime, datetime] | None = None,
 ) -> PreparedCanonicalBatch:
-    pages, authorization = _processing_input(specification, bars)
+    pages, authorization = _processing_input(
+        specification,
+        bars,
+        inspected_bounds=inspected_bounds,
+    )
     return prepare_alpaca_sip_canonical_batch(
         specification=specification,
         pages=pages,
@@ -383,6 +404,10 @@ def test_off_grid_five_minute_observation_blocks_affected_stream() -> None:
     prepared = _prepare(
         specification,
         {"XPH1": [_bar("2025-07-02T13:31:00Z")]},
+        inspected_bounds=(
+            datetime(2025, 7, 2, 13, 31, tzinfo=UTC),
+            datetime(2025, 7, 2, 13, 36, tzinfo=UTC),
+        ),
     )
 
     assert prepared.all_blocked is True

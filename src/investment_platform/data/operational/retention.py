@@ -674,6 +674,14 @@ class RetentionLifecycleRepository:
         provider: str,
         dataset: str,
     ) -> DatasetRetentionPolicy:
+        if (
+            provider != provider.casefold()
+            or dataset != dataset.casefold()
+            or any(character.isspace() for character in provider + dataset)
+        ):
+            raise RetentionLifecycleStateError(
+                "retention lifecycle requires the exact canonical provider/dataset key"
+            )
         policy = self._enforcer.authorize_purge(provider, dataset)
         if (provider, dataset) != (policy.provider, policy.dataset):
             raise RetentionLifecycleStateError(

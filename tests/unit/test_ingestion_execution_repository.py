@@ -72,6 +72,9 @@ from investment_platform.data.operational import (
     deterministic_calendar_snapshot_id,
     deterministic_policy_snapshot_id,
 )
+from investment_platform.data.operational.execution import (
+    ProviderDispatchLimitExceededError,
+)
 from investment_platform.data.operational.store import (
     OperationalStateStore,
     WriterLease,
@@ -1201,6 +1204,126 @@ def test_retry_dispatch_enforces_eligibility_and_durable_max_attempts(
                 connection.execute("SELECT status FROM request_instances").fetchone()[0] == "FAILED"
             )
         store.release_writer_lease(lease)
+
+
+def test_global_dispatch_ceiling_blocks_retry_after_other_request_consumes_budget(
+    tmp_path: Path,
+) -> None:
+    root = _private_root(tmp_path)
+    clock = MutableClock(_NOW)
+    enforcer = RetentionPolicyEnforcer(RetentionPolicyCatalog.load_default(), clock=clock)
+    plan = _planner(enforcer).plan(
+        intent=IngestionIntent.BACKFILL,
+        streams=(_stream(),),
+        instrument_mappings=(
+            ProviderInstrumentMapping(
+                instrument_id=_INSTRUMENT_ID,
+                provider_identifier="SYNTHETIC-A",
+            ),
+        ),
+        desired_start=_START,
+        desired_end=_END,
+        calendar_snapshot=_calendar(),
+        coverage=(),
+        limits=PlannerLimits(
+            max_instruments_per_request=1,
+            max_expected_observations_per_request=1,
+            max_observations_per_page=1,
+            max_pages_per_request=2,
+            max_calls_per_request=2,
+            max_estimated_bytes_per_request=10_000,
+            estimated_bytes_per_observation=100,
+            estimated_bytes_per_page=10,
+            estimated_cost_per_call=Decimal("0.01"),
+            max_estimated_cost_per_request=Decimal("0.02"),
+        ),
+        budget=PlannerBudget(
+            max_calls=2,
+            max_expected_observations=2,
+            max_pages=2,
+            max_estimated_bytes=10_000,
+            max_estimated_cost=Decimal("0.02"),
+        ),
+        environment=RuntimeEnvironment.TEST,
+        mapping_semantic_version="synthetic-bars-request-v1",
+    )
+    assert len(plan.requests) == 2
+    persistence = PlanPersistenceRequest(
+        run_id=_RUN_ID,
+        calendar_snapshot_id=deterministic_calendar_snapshot_id(_calendar()),
+        reason="global dispatch ceiling retry acceptance",
+        max_attempts=2,
+        max_pages=2,
+        max_calls=2,
+        max_pages_per_request=2,
+        max_calls_per_request=2,
+        plan=plan,
+    )
+
+    with OperationalStateStore.open(root, clock=clock) as store:
+        lease = store.acquire_writer_lease("dispatch-ceiling-test", timedelta(minutes=30))
+        CalendarSnapshotRepository(store).persist(lease, _calendar())
+        plan_repository = IngestionPlanRepository(store)
+        plan_repository.persist(lease, persistence)
+        requests = plan_repository.load_progress(_RUN_ID).requests
+        execution = IngestionExecutionRepository(store)
+
+        first = AttemptIdentity(
+            attempt_id=_ATTEMPT_ID,
+            request_instance_id=requests[0].request_instance_id,
+            attempt_number=1,
+        )
+        execution.begin_attempt(lease, first, plan.requests[0].authorization)
+        execution.claim_provider_dispatch(lease, first, page_ordinal=0)
+        execution.record_attempt_failure(
+            lease,
+            first,
+            retryable=False,
+            category="PROVIDER_FATAL",
+            code="SYNTHETIC_FATAL",
+            sanitized_message="Synthetic first request failed terminally.",
+            failed_at=clock.value,
+        )
+
+        second = AttemptIdentity(
+            attempt_id=_SECOND_ATTEMPT_ID,
+            request_instance_id=requests[1].request_instance_id,
+            attempt_number=1,
+        )
+        execution.begin_attempt(lease, second, plan.requests[1].authorization)
+        execution.claim_provider_dispatch(lease, second, page_ordinal=0)
+        execution.record_attempt_failure(
+            lease,
+            second,
+            retryable=True,
+            category="PROVIDER_TRANSIENT",
+            code="SYNTHETIC_RETRY",
+            sanitized_message="Synthetic second request is retryable.",
+            failed_at=clock.value,
+            next_eligible_at=clock.value,
+        )
+        retry = AttemptIdentity(
+            attempt_id=UUID("20000000-0000-4000-8000-000000000003"),
+            request_instance_id=requests[1].request_instance_id,
+            attempt_number=2,
+        )
+        execution.begin_attempt(lease, retry, plan.requests[1].authorization)
+
+        with pytest.raises(
+            ProviderDispatchLimitExceededError,
+            match="durable run provider-dispatch ceiling is exhausted",
+        ):
+            execution.claim_provider_dispatch(lease, retry, page_ordinal=0)
+
+        with store.read_only_connection() as connection:
+            claim_count = int(
+                connection.execute("SELECT count(*) FROM ingestion_dispatch_claims").fetchone()[0]
+            )
+            allocated = connection.execute(
+                "SELECT sum(max_pages), sum(max_calls) FROM request_execution_limits"
+            ).fetchone()
+        assert claim_count == 2
+        assert allocated is not None and tuple(allocated) == (2, 2)
 
 
 def _blocked_outcome(scenario: Scenario) -> CanonicalStreamOutcome:

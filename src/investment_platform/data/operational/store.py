@@ -11,7 +11,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Final, Self
+from time import monotonic, sleep
+from typing import Final, Self, cast
 
 from investment_platform.data.operational.schema import LATEST_SCHEMA_VERSION, MIGRATIONS
 from investment_platform.data_root import PrivateDataRoot
@@ -352,7 +353,7 @@ class OperationalStateStore:
         try:
             connection.execute("PRAGMA foreign_keys = ON")
             connection.execute(f"PRAGMA busy_timeout = {self._busy_timeout_ms}")
-            journal_row = connection.execute("PRAGMA journal_mode = WAL").fetchone()
+            journal_row = self._enable_wal_mode(connection)
             if journal_row is None or str(journal_row[0]).casefold() != "wal":
                 raise OperationalStateError("SQLite WAL mode could not be enabled")
             connection.execute("PRAGMA synchronous = FULL")
@@ -361,6 +362,24 @@ class OperationalStateStore:
             connection.close()
             raise
         return connection
+
+    def _enable_wal_mode(self, connection: sqlite3.Connection) -> sqlite3.Row | None:
+        deadline = monotonic() + (self._busy_timeout_ms / 1_000)
+        while True:
+            try:
+                return cast(
+                    sqlite3.Row | None,
+                    connection.execute("PRAGMA journal_mode = WAL").fetchone(),
+                )
+            except sqlite3.OperationalError as error:
+                error_code = getattr(error, "sqlite_errorcode", None)
+                primary_code = error_code & 0xFF if isinstance(error_code, int) else None
+                if primary_code not in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}:
+                    raise
+                remaining = deadline - monotonic()
+                if remaining <= 0:
+                    raise
+                sleep(min(0.01, remaining))
 
     def _verify_connection_contract(self, connection: sqlite3.Connection) -> None:
         foreign_keys = connection.execute("PRAGMA foreign_keys").fetchone()
