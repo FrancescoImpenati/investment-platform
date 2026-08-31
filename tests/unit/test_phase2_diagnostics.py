@@ -6,7 +6,7 @@ import hashlib
 import io
 import sqlite3
 from collections.abc import Iterator
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import UUID, uuid4
 
@@ -25,15 +25,38 @@ from investment_platform.data.ingestion.identity import (
     RequestSpecification,
 )
 from investment_platform.data.models import AdjustmentState, Timeframe, TradingSession
-from investment_platform.data.operational import OperationalStateStore
+from investment_platform.data.operational import (
+    LATEST_SCHEMA_VERSION,
+    IngestionExecutionRepository,
+    OperationalStateStore,
+)
 from investment_platform.data.retention import (
     RetentionPolicyCatalog,
     RetentionPolicyEnforcer,
 )
 from investment_platform.data.storage import RawArtifactPublisher
 from investment_platform.data.storage._publication import file_integrity
+from investment_platform.data.storage.transport_spool import (
+    TransportSpoolFaultPoint,
+    TransportSpoolStore,
+)
 from investment_platform.data_root import PrivateDataRoot
 from investment_platform.runtime import RuntimeEnvironment
+from tests.unit.test_ingestion_execution_repository import (
+    _NOW as _EXECUTION_NOW,
+)
+from tests.unit.test_ingestion_execution_repository import (
+    _START as _EXECUTION_START,
+)
+from tests.unit.test_ingestion_execution_repository import (
+    MutableClock as ExecutionClock,
+)
+from tests.unit.test_ingestion_execution_repository import (
+    _prepare_scenario,
+)
+from tests.unit.test_ingestion_execution_repository import (
+    _private_root as _execution_private_root,
+)
 
 pytestmark = pytest.mark.unit
 
@@ -42,6 +65,10 @@ _START = datetime(2026, 8, 28, 13, 30, tzinfo=UTC)
 _END = datetime(2026, 8, 28, 13, 35, tzinfo=UTC)
 _PAYLOAD = b'{"bars":[],"origin":"synthetic"}'
 _HEX = "a" * 64
+
+
+class _InjectedTransportCrash(BaseException):
+    pass
 
 
 @pytest.fixture
@@ -256,9 +283,10 @@ def test_empty_store_status_and_verify_are_sanitized_and_healthy(
 
     assert status.root_valid
     assert status.sqlite_healthy
-    assert status.schema_version == 3
+    assert status.schema_version == LATEST_SCHEMA_VERSION
     assert status.run_count == status.request_count == status.stream_count == 0
     assert status.canonical_row_count == status.stored_raw_artifact_count == 0
+    assert status.quarantine_artifact_count == 0
     assert status.latest_run is None
     assert status.latest_error is None
     assert report.healthy
@@ -267,6 +295,7 @@ def test_empty_store_status_and_verify_are_sanitized_and_healthy(
         "SQLITE_INTEGRITY",
         "RAW_CATALOG_CONTENT",
         "CANONICAL_CATALOG_CONTENT",
+        "QUARANTINE_CATALOG_CONTENT",
         "STAGING_STATE",
         "PUBLISHED_ORPHANS",
         "WATERMARK_COVERAGE",
@@ -312,6 +341,45 @@ def test_status_omits_stored_error_message_and_private_identifiers(
     assert "CHECK_FAILED" in serialized
 
 
+def test_status_reports_stream_dimensions_and_open_gap_without_observations(
+    diagnostic_runtime: tuple[PrivateDataRoot, OperationalStateStore, Phase2OperationalDiagnostics],
+) -> None:
+    _, store, diagnostics = diagnostic_runtime
+    instrument_id = UUID("00000000-0000-4000-8000-000000000001")
+    with sqlite3.connect(store.path) as connection:
+        connection.execute("PRAGMA foreign_keys = ON")
+        connection.execute(
+            """
+            INSERT INTO stream_keys(
+                stream_id, stream_hash, provider, dataset, instrument_id,
+                timeframe, session, adjustment, dimensions_json, created_at
+            ) VALUES ('stream-safe', ?, 'synthetic', 'price_bars', ?,
+                      '5m', 'regular', 'unadjusted', '{}', ?)
+            """,
+            (_HEX, str(instrument_id), _NOW.isoformat()),
+        )
+        connection.execute(
+            """
+            INSERT INTO gaps(
+                gap_id, stream_id, interval_start, interval_end, gap_type,
+                status, blocking, detected_at
+            ) VALUES ('gap-safe', 'stream-safe', ?, ?, 'ACQUISITION',
+                      'OPEN', 1, ?)
+            """,
+            (_START.isoformat(), _END.isoformat(), _NOW.isoformat()),
+        )
+
+    status = diagnostics.status()
+
+    assert len(status.streams) == 1
+    stream = status.streams[0]
+    assert stream.instrument_id == instrument_id
+    assert stream.timeframe == "5m"
+    assert stream.coverage_start is None
+    assert stream.watermark_frontier is None
+    assert stream.open_gap_count == 1
+
+
 def test_verify_reports_recoverable_staging_without_modifying_it(
     diagnostic_runtime: tuple[PrivateDataRoot, OperationalStateStore, Phase2OperationalDiagnostics],
 ) -> None:
@@ -328,6 +396,66 @@ def test_verify_reports_recoverable_staging_without_modifying_it(
     assert staging.issue_codes == ("STAGING_RECOVERY_REQUIRED",)
     assert partial.read_bytes() == before
     assert candidate.exists()
+
+
+def test_verify_reports_residual_transport_attempt_without_mutating_it(
+    diagnostic_runtime: tuple[PrivateDataRoot, OperationalStateStore, Phase2OperationalDiagnostics],
+) -> None:
+    root, _, diagnostics = diagnostic_runtime
+    attempt_id = UUID("60000000-0000-4000-8000-000000000001")
+    spool = TransportSpoolStore(root)
+
+    def crash(point: TransportSpoolFaultPoint) -> None:
+        if point is TransportSpoolFaultPoint.ATTEMPT_READY:
+            raise _InjectedTransportCrash
+
+    with pytest.raises(_InjectedTransportCrash), spool.attempt(attempt_id, fault_injector=crash):
+        pass
+    attempt = root.root / "staging" / "transport-attempts" / str(attempt_id)
+    before = (attempt / ".attempt-owner.json").read_bytes()
+
+    staging = _check(diagnostics.verify(), "STAGING_STATE")
+
+    assert staging.status is DiagnosticStatus.WARN
+    assert "TRANSPORT_STAGING_RECOVERY_REQUIRED" in staging.issue_codes
+    assert (attempt / ".attempt-owner.json").read_bytes() == before
+
+
+def test_verify_fails_for_invalid_transport_attempt_name_without_deleting_it(
+    diagnostic_runtime: tuple[PrivateDataRoot, OperationalStateStore, Phase2OperationalDiagnostics],
+) -> None:
+    root, _, diagnostics = diagnostic_runtime
+    invalid = root.ensure_directory("staging/transport-attempts/not-an-attempt")
+
+    staging = _check(diagnostics.verify(), "STAGING_STATE")
+
+    assert staging.status is DiagnosticStatus.FAIL
+    assert "INVALID_TRANSPORT_STAGING_ENTRY" in staging.issue_codes
+    assert invalid.is_dir()
+
+
+def test_verify_fails_for_malformed_transport_owner_without_modifying_it(
+    diagnostic_runtime: tuple[PrivateDataRoot, OperationalStateStore, Phase2OperationalDiagnostics],
+) -> None:
+    root, _, diagnostics = diagnostic_runtime
+    attempt_id = UUID("60000000-0000-4000-8000-000000000002")
+    spool = TransportSpoolStore(root)
+
+    def crash(point: TransportSpoolFaultPoint) -> None:
+        if point is TransportSpoolFaultPoint.ATTEMPT_READY:
+            raise _InjectedTransportCrash
+
+    with pytest.raises(_InjectedTransportCrash), spool.attempt(attempt_id, fault_injector=crash):
+        pass
+    owner = root.root / "staging" / "transport-attempts" / str(attempt_id) / ".attempt-owner.json"
+    malformed = b"{}\n"
+    owner.write_bytes(malformed)
+
+    staging = _check(diagnostics.verify(), "STAGING_STATE")
+
+    assert staging.status is DiagnosticStatus.FAIL
+    assert "INVALID_TRANSPORT_STAGING_ENTRY" in staging.issue_codes
+    assert owner.read_bytes() == malformed
 
 
 def test_verify_fails_closed_for_invalid_uncataloged_publication(
@@ -554,3 +682,51 @@ def test_watermark_requires_exact_contiguous_coverage_proof(
     watermark = _check(report, "WATERMARK_COVERAGE")
     assert watermark.status is DiagnosticStatus.FAIL
     assert "WATERMARK_FRONTIER_NOT_CONTIGUOUS" in watermark.issue_codes
+
+
+@pytest.mark.parametrize(
+    ("column", "value", "issue_code"),
+    [
+        (
+            "coverage_start",
+            (_EXECUTION_START + timedelta(minutes=5)).isoformat(),
+            "WATERMARK_COVERAGE_START_MISMATCH",
+        ),
+        (
+            "exclusive_frontier",
+            (_EXECUTION_START + timedelta(minutes=5)).isoformat(),
+            "WATERMARK_FRONTIER_MISMATCH",
+        ),
+        ("blocking_gap_count", 1, "BLOCKING_GAP_COUNT_MISMATCH"),
+    ],
+)
+def test_watermark_verification_reconstructs_authoritative_projection(
+    tmp_path: Path,
+    column: str,
+    value: object,
+    issue_code: str,
+) -> None:
+    root = _execution_private_root(tmp_path)
+    clock = ExecutionClock(_EXECUTION_NOW)
+    with OperationalStateStore.open(root, clock=clock) as store:
+        scenario = _prepare_scenario(root, store, clock)
+        lease = store.get_writer_lease()
+        assert lease is not None
+        IngestionExecutionRepository(store).commit_published_batch(
+            lease,
+            scenario.commit_request(),
+        )
+        diagnostics = Phase2OperationalDiagnostics(root, store, clock=clock)
+        assert _check(diagnostics.verify(), "WATERMARK_COVERAGE").status is DiagnosticStatus.PASS
+
+        with store._transaction(write=True) as connection:
+            connection.execute(
+                f"UPDATE watermarks SET {column} = ? WHERE stream_id = ?",
+                (value, scenario.coverage.watermarks[0].stream_id),
+            )
+
+        watermark = _check(diagnostics.verify(), "WATERMARK_COVERAGE")
+
+        assert watermark.status is DiagnosticStatus.FAIL
+        assert issue_code in watermark.issue_codes
+        store.release_writer_lease(lease)

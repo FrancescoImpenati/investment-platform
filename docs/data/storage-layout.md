@@ -1,7 +1,7 @@
 # Data storage layout
 
-- **Status:** Phase 0–1 layout implemented; Phase 2 private-runtime layout designed
-- **Last review:** 2026-08-31
+- **Status:** Phase 0–1 primitives and Phase 2 offline private-runtime layout implemented; live acceptance pending
+- **Last review:** 2026-09-01
 
 This document owns the physical and logical storage contract. It distinguishes existing storage
 primitives from the Phase 2 design so a path shown here is never mistaken for implemented runtime
@@ -14,18 +14,20 @@ behavior or permission to retain a dataset.
 | Provider-native raw evidence | Payload plus JSON manifest | Implemented primitive |
 | Canonical price bars | Parquet | Implemented primitive |
 | Analytical queries | In-memory DuckDB over Parquet | Implemented |
-| Durable live workflow using those stores | Raw plus verified canonical batches | Designed for Phase 2 |
-| Operational state | SQLite | Designed for Phase 2 |
-| Retention catalog/enforcement | Exact provider-by-dataset policy | Designed for Phase 2 |
+| Durable ingestion workflow using those stores | Raw plus verified canonical batches | Implemented offline; live acceptance pending |
+| Operational state | SQLite | Implemented offline |
+| Retention catalog/enforcement | Exact provider-by-dataset policy | Implemented offline |
 | Curated/adjusted datasets | Parquet | Future |
 | Deterministic feature history | Parquet | Future |
 
-The current RawBatchStore and ParquetBarStore accept caller-supplied roots. The Phase 1 live runner
-used them only under an external temporary directory that was deleted. No persistent live-data
-root, SQLite database, canonical batch catalog, or watermark exists in the current implementation.
+The original RawBatchStore and ParquetBarStore still support bounded foundation use. The Phase 1
+live runner used them only under an external temporary directory that was deleted. The Phase 2
+control plane now owns a validated external root, SQLite operational database, immutable canonical
+batch catalog, coverage, and derived watermarks; those components have only synthetic/offline
+acceptance so far.
 
-Parquet is authoritative for analytical observations. SQLite will coordinate mutable ingestion
-state without copying OHLCV values. DuckDB will continue to query Parquet in-process.
+Parquet is authoritative for analytical observations. SQLite coordinates mutable ingestion state
+without copying OHLCV values. DuckDB queries cataloged, verified Parquet in-process.
 
 ## 2. Public/private boundary
 
@@ -65,7 +67,7 @@ Repository ignore rules remain a secondary accident barrier. They are not the pr
 The Phase 2 private_research profile requires INVESTMENT_PLATFORM_DATA_ROOT to identify a
 dedicated absolute local path outside the repository.
 
-Before any write or deletion, the implementation will:
+Before any write or deletion, the implementation:
 
 - resolve root and repository paths;
 - reject the repository, its ancestors and descendants, filesystem/drive root, home/profile,
@@ -87,7 +89,8 @@ See [ADR 0006](../architecture/adr/0006-external-private-data-root.md).
 
 ## 4. Phase 2 logical root
 
-Namespaces are created lazily:
+The initializer creates the fixed top-level namespaces and private evidence locator. Artifacts and
+deeper storage partitions are created only as needed:
 
 ~~~text
 <PRIVATE_DATA_ROOT>/
@@ -100,8 +103,7 @@ Namespaces are created lazily:
 ├── operational/
 │   ├── ingestion.sqlite3
 │   ├── ingestion.sqlite3-wal
-│   ├── ingestion.sqlite3-shm
-│   └── locks/
+│   └── ingestion.sqlite3-shm
 ├── logs/
 ├── quarantine/
 └── governance/
@@ -156,10 +158,10 @@ The implemented writer:
 5. treats the same batch ID with different data as a collision;
 6. never overwrites raw evidence.
 
-### 5.2 Phase 2 refinement
+### 5.2 Implemented Phase 2 refinement
 
-Provider adapters currently generate new UUIDs for ordinary attempts. Phase 2 will add a durable
-raw artifact identity binding:
+The Phase 2 living path adds a durable raw artifact identity binding independent of the
+attempt-scoped provider request:
 
 - deterministic request specification;
 - stable page ordinal/normalized relation;
@@ -176,8 +178,8 @@ and payload, reuses the directory, and records its own attempt/retrieval/provide
 in SQLite artifact-observation links. It neither rewrites the manifest nor requires volatile
 attempt metadata to match.
 
-Large durable responses will use file-backed/spooled payloads where needed so the raw boundary's
-bounded-memory contract is exercised by live transport.
+The living transport uses bounded file-backed attempt spools so HTTP pages need not remain wholly
+in memory. Spools are transient, inspected during recovery, and are not raw evidence.
 
 Before immutable raw publication, bounded transient transport verifies that response observations
 fit the active policy age and request bounds. Unauthorized overfetch is erased from transient
@@ -210,7 +212,7 @@ This provides in-process rollback if one append call raises, but publication of 
 not a single crash-atomic filesystem event. Direct glob discovery can also see an orphan after an
 abrupt process crash.
 
-### 6.2 Designed Phase 2 batch layout
+### 6.2 Implemented Phase 2 batch layout
 
 Living ingestion changes publication, not the authority of Parquet:
 
@@ -306,7 +308,7 @@ revisions; no winner is chosen across providers.
 
 ## 8. Catalog-driven visibility
 
-Phase 2 DuckDB queries must not glob all filesystem files. Query planning asks SQLite for explicit
+Phase 2 DuckDB queries do not glob all filesystem files. Query planning asks SQLite for explicit
 paths satisfying:
 
 - canonical batch status VERIFIED;
@@ -323,13 +325,13 @@ it or quarantines it.
 
 ## 9. Operational state
 
-Designed location:
+Implemented location:
 
 ~~~text
 operational/ingestion.sqlite3
 ~~~
 
-The SQLite schema will own:
+The SQLite schema owns:
 
 - migrations and writer lease;
 - ingestion runs, bounded requests, attempts, retries, errors, and progress;
@@ -433,5 +435,6 @@ Only small synthetic or explicitly redistributable content may be committed unde
 with origin and rights documentation. Provider-shaped test fixtures must remain hand-authored
 synthetic data.
 
-No current document or directory creates permission to persist real data. Permission comes from an
-active exact dataset policy enforced by future Phase 2 code.
+No document or directory alone creates permission to persist real data. Permission comes from an
+active exact dataset policy enforced by the Phase 2 control plane in an eligible environment. Live
+use additionally requires the initialized private root and provider/dataset acceptance gates.

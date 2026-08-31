@@ -5,7 +5,10 @@ from __future__ import annotations
 import json
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
+from email.message import Message
 from pathlib import Path
+from typing import Self, cast
+from urllib.request import OpenerDirector, Request
 from uuid import UUID, uuid4
 
 import pytest
@@ -34,13 +37,14 @@ from investment_platform.data.provenance import RawBatch
 from investment_platform.data.providers import AlpacaCredentials, AlpacaFeed, AlpacaProvider
 from investment_platform.data.providers.base import BarRequest
 from investment_platform.data.providers.errors import ProviderResponseError
-from investment_platform.data.providers.http import HttpResponse
+from investment_platform.data.providers.http import HttpResponse, SpoolingUrllibHttpTransport
 from investment_platform.data.retention import (
     RequestPolicyAuthorization,
     RetentionPolicyCatalog,
     RetentionPolicyEnforcer,
 )
 from investment_platform.data.storage import RawArtifactPublisher
+from investment_platform.data.storage.transport_spool import TransportSpoolFaultPoint
 from investment_platform.data_root import PrivateDataRoot
 from investment_platform.runtime import RuntimeEnvironment
 from tests.provider_fakes import QueueHttpTransport
@@ -62,6 +66,42 @@ class _StaticPageProvider:
     def get_bars(self, request: BarRequest) -> Iterator[RawBatch]:
         del request
         yield from self._batches
+
+
+class _StreamingResponse:
+    status = 200
+
+    def __init__(self, content: bytes) -> None:
+        self._content = content
+        self._offset = 0
+        self.headers = Message()
+
+    def read(self, size: int = -1, /) -> bytes:
+        if size <= 0:
+            raise AssertionError("spooling transport must use bounded reads")
+        start = self._offset
+        self._offset += size
+        return self._content[start : self._offset]
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        del args
+
+
+class _StreamingOpener:
+    def __init__(self, content: bytes) -> None:
+        self.content = content
+
+    def open(self, request: Request, *, timeout: float) -> _StreamingResponse:
+        del request
+        assert timeout > 0
+        return _StreamingResponse(self.content)
+
+
+class _InjectedTransportCrash(BaseException):
+    pass
 
 
 def _payload(timestamp: datetime, *, next_token: str | None) -> bytes:
@@ -282,6 +322,45 @@ def test_iterator_failure_never_claims_complete_pagination(tmp_path: Path) -> No
     assert len(tuple((root.root / "raw").rglob("payload.bin"))) == 2
 
 
+def test_planned_page_call_bound_stops_before_an_extra_provider_dispatch(
+    tmp_path: Path,
+) -> None:
+    root = _root(tmp_path)
+    first = _payload(_START, next_token="SECOND")
+    second = _payload(_START + timedelta(minutes=5), next_token=None)
+    transport = QueueHttpTransport([HttpResponse(200, first), HttpResponse(200, second)])
+    provider = AlpacaProvider(
+        AlpacaCredentials("synthetic-id", "synthetic-secret"),
+        feed=AlpacaFeed.SIP,
+        transport=transport,
+        clock=lambda: _NOW,
+        batch_id_factory=uuid4,
+    )
+    enforcer = RetentionPolicyEnforcer(
+        RetentionPolicyCatalog.load_default(),
+        clock=lambda: _NOW,
+    )
+    service = RawAcquisitionService(
+        provider,
+        RawArtifactPublisher(root, enforcer),
+        enforcer,
+        clock=lambda: _NOW,
+    )
+    specification = _specification()
+
+    with pytest.raises(RawAcquisitionError, match="request page/call bound"):
+        service.acquire(
+            specification,
+            _authorization(enforcer, specification),
+            _calendar(),
+            max_pages=1,
+            max_calls=1,
+        )
+
+    assert len(transport.requests) == 1
+    assert len(tuple((root.root / "raw").rglob("payload.bin"))) == 1
+
+
 def test_out_of_bounds_response_is_rejected_before_raw_persistence(tmp_path: Path) -> None:
     root = _root(tmp_path)
     outside = _payload(_END, next_token=None)
@@ -289,6 +368,41 @@ def test_out_of_bounds_response_is_rejected_before_raw_persistence(tmp_path: Pat
     specification = _specification()
 
     with pytest.raises(RawPageInspectionError, match="outside the bounded request"):
+        service.acquire(
+            specification,
+            _authorization(enforcer, specification),
+            _calendar(),
+        )
+
+    assert not tuple((root.root / "raw").rglob("payload.bin"))
+
+
+@pytest.mark.parametrize(
+    "timestamp",
+    (
+        datetime(2025, 7, 2, 12, 30, tzinfo=UTC),
+        datetime(2025, 7, 2, 13, 31, tzinfo=UTC),
+    ),
+)
+def test_non_rth_or_misaligned_five_minute_bar_is_rejected_before_persistence(
+    tmp_path: Path,
+    timestamp: datetime,
+) -> None:
+    root = _root(tmp_path)
+    service, enforcer = _service(
+        root,
+        [HttpResponse(200, _payload(timestamp, next_token=None))],
+    )
+    base = _specification()
+    specification = RequestSpecification.model_validate(
+        {
+            **base.model_dump(mode="python"),
+            "start": datetime(2025, 7, 2, 12, 0, tzinfo=UTC),
+            "end": datetime(2025, 7, 2, 20, 0, tzinfo=UTC),
+        }
+    )
+
+    with pytest.raises(RawPageInspectionError, match="exact XNYS regular-session slot"):
         service.acquire(
             specification,
             _authorization(enforcer, specification),
@@ -315,6 +429,64 @@ def test_transient_page_size_is_hard_bounded(tmp_path: Path) -> None:
             _calendar(),
         )
     assert not tuple((root.root / "raw").rglob("payload.bin"))
+
+
+def test_file_backed_attempt_recovers_spool_crash_then_adopts_raw(tmp_path: Path) -> None:
+    root = _root(tmp_path)
+    payload = _payload(_START, next_token=None)
+    transport = SpoolingUrllibHttpTransport(root, maximum_response_bytes=1024 * 1024)
+    transport._opener = cast(OpenerDirector, _StreamingOpener(payload))
+    provider = AlpacaProvider(
+        AlpacaCredentials("synthetic-id", "synthetic-secret"),
+        feed=AlpacaFeed.SIP,
+        transport=transport,
+        clock=lambda: _NOW,
+        batch_id_factory=lambda: UUID("30000000-0000-4000-8000-000000000010"),
+    )
+    enforcer = RetentionPolicyEnforcer(
+        RetentionPolicyCatalog.load_default(),
+        clock=lambda: _NOW,
+    )
+    service = RawAcquisitionService(
+        provider,
+        RawArtifactPublisher(root, enforcer),
+        enforcer,
+        clock=lambda: _NOW,
+    )
+    specification = _specification()
+    crashed_attempt = UUID("60000000-0000-4000-8000-000000000010")
+    retry_attempt = UUID("60000000-0000-4000-8000-000000000011")
+
+    def crash(point: TransportSpoolFaultPoint) -> None:
+        if point is TransportSpoolFaultPoint.DURING_WRITE:
+            raise _InjectedTransportCrash
+
+    with pytest.raises(_InjectedTransportCrash):
+        service.acquire(
+            specification,
+            _authorization(enforcer, specification),
+            _calendar(),
+            attempt_id=crashed_attempt,
+            transport_fault_injector=crash,
+        )
+
+    orphan = root.root / "staging" / "transport-attempts" / str(crashed_attempt)
+    assert tuple(orphan.glob("response-*.part"))
+    assert not tuple((root.root / "raw").rglob("payload.bin"))
+
+    completed = service.acquire(
+        specification,
+        _authorization(enforcer, specification),
+        _calendar(),
+        attempt_id=retry_attempt,
+    )
+
+    assert completed.pages[0].published.created is True
+    assert not orphan.exists()
+    assert not tuple((root.root / "staging" / "transport-attempts").iterdir())
+    raw_payloads = tuple((root.root / "raw").rglob("payload.bin"))
+    assert len(raw_payloads) == 1
+    assert raw_payloads[0].read_bytes() == payload
 
 
 def test_empty_page_is_inspectable_but_does_not_assert_verified_empty() -> None:

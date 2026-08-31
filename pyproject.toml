@@ -16,6 +16,9 @@ dependencies = [
     "tzdata>=2025.2",
 ]
 
+[project.scripts]
+investment-platform = "investment_platform.cli:main"
+
 [dependency-groups]
 dev = [
     "mypy>=1.18,<2",

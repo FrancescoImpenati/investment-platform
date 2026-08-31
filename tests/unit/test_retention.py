@@ -206,6 +206,27 @@ def test_unlisted_or_different_dataset_keys_fail_closed(provider: str, dataset: 
         RetentionPolicyCatalog.load_default().lookup(provider, dataset)
 
 
+@pytest.mark.parametrize(
+    ("provider", "dataset"),
+    [
+        ("Alpaca", "price_bars_sip"),
+        ("alpaca", "PRICE_BARS_SIP"),
+        (" alpaca", "price_bars_sip"),
+        ("alpaca ", "price_bars_sip"),
+        ("alpaca", " price_bars_sip"),
+        ("alpaca", "price_bars_sip "),
+    ],
+)
+def test_catalog_lookup_rejects_noncanonical_near_match_keys(
+    provider: str,
+    dataset: str,
+) -> None:
+    catalog = RetentionPolicyCatalog.load_default()
+
+    with pytest.raises(DatasetPolicyDenied, match="exact provider/dataset key"):
+        catalog.lookup(provider, dataset)
+
+
 def test_alpaca_request_gate_is_strictly_older_than_age_plus_buffer() -> None:
     enforcer = RetentionPolicyEnforcer(RetentionPolicyCatalog.load_default(), clock=_clock)
     policy = enforcer.authorize_processing(

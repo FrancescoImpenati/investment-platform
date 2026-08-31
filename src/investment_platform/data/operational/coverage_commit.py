@@ -31,6 +31,7 @@ from investment_platform.data.ingestion.coverage import (
     reconstruct_frontier,
     transition_gap,
 )
+from investment_platform.data.ingestion.identity import StreamKey
 from investment_platform.data.ingestion.planner import (
     CoverageClassification,
     CoverageVerificationState,
@@ -41,6 +42,7 @@ from investment_platform.data.retention import DatasetRetentionPolicy, DatasetRu
 from investment_platform.data.storage import (
     CanonicalBatchManifest,
     CanonicalParquetPart,
+    CanonicalStreamOutcome,
     StreamPublicationOutcome,
 )
 
@@ -81,16 +83,105 @@ def _coverage_id(
     return f"{_COVERAGE_ID_VERSION}_{digest}"
 
 
-def _gap_id(*, stream_id: str, start: datetime, end: datetime, gap_type: GapType) -> str:
+def _gap_id(
+    *,
+    stream_id: str,
+    start: datetime,
+    end: datetime,
+    gap_type: GapType,
+    episode_id: str,
+) -> str:
     digest = _canonical_hash(
         {
             "stream": stream_id,
             "start": start.isoformat(),
             "end": end.isoformat(),
             "type": gap_type.value,
+            "episode": episode_id,
         }
     )
     return f"{_GAP_ID_VERSION}_{digest}"
+
+
+def build_blocking_integrity_gaps(
+    *,
+    stream_outcomes: Sequence[CanonicalStreamOutcome],
+    request_instance_id: UUID,
+    detected_at: datetime,
+) -> tuple[GapFinding, ...]:
+    """Create deterministic durable findings for streams blocked before publication.
+
+    This is the no-publication companion to :func:`build_publication_coverage_commit`.
+    It deliberately creates neither coverage nor watermarks: the only durable fact
+    available after deterministic processing blocks a stream is an open integrity
+    gap over that stream's exact bounded request interval.
+    """
+
+    now = to_utc(detected_at)
+    gaps = tuple(
+        GapFinding(
+            gap_id=_gap_id(
+                stream_id=outcome.stream_id,
+                start=outcome.request_start,
+                end=outcome.request_end,
+                gap_type=GapType.INTEGRITY,
+                episode_id=str(request_instance_id),
+            ),
+            stream_id=outcome.stream_id,
+            start=outcome.request_start,
+            end=outcome.request_end,
+            gap_type=GapType.INTEGRITY,
+            status=GapStatus.OPEN,
+            blocking=True,
+            detected_at=now,
+            request_instance_id=str(request_instance_id),
+        )
+        for outcome in stream_outcomes
+        if outcome.outcome is StreamPublicationOutcome.BLOCKED
+    )
+    if len({gap.gap_id for gap in gaps}) != len(gaps):
+        raise CoverageCommitBuildError("blocked stream outcomes contain duplicate identities")
+    return tuple(sorted(gaps, key=lambda gap: gap.gap_id))
+
+
+def build_blocking_acquisition_gaps(
+    *,
+    streams: Sequence[StreamKey],
+    start: datetime,
+    end: datetime,
+    request_instance_id: UUID,
+    detected_at: datetime,
+) -> tuple[GapFinding, ...]:
+    """Create one exact terminal acquisition gap for every bounded request stream."""
+
+    if end <= start:
+        raise CoverageCommitBuildError("acquisition gap bounds must be half-open and non-empty")
+    now = to_utc(detected_at)
+    gaps = tuple(
+        GapFinding(
+            gap_id=_gap_id(
+                stream_id=stream.stream_id,
+                start=start,
+                end=end,
+                gap_type=GapType.ACQUISITION,
+                episode_id=str(request_instance_id),
+            ),
+            stream_id=stream.stream_id,
+            start=start,
+            end=end,
+            gap_type=GapType.ACQUISITION,
+            status=GapStatus.OPEN,
+            blocking=True,
+            detected_at=now,
+            request_instance_id=str(request_instance_id),
+        )
+        for stream in streams
+    )
+    if not gaps or len({gap.gap_id for gap in gaps}) != len(gaps):
+        raise CoverageCommitBuildError(
+            "terminal acquisition gaps require unique exact request streams"
+        )
+    return tuple(sorted(gaps, key=lambda gap: gap.gap_id))
 
 
 def _frame(parts: Sequence[CanonicalParquetPart]) -> pl.DataFrame:
@@ -137,11 +228,18 @@ def _existing_coverage_start(
         *(segment.coverage_start for segment in existing_segments),
         *(watermark.coverage_start for watermark in existing_watermarks),
     }
-    if starts and starts != {candidate}:
+    if len(starts) > 1:
         raise CoverageCommitBuildError(
-            "coverage_start is an authoritative stream origin and cannot be rebased"
+            "durable coverage contains conflicting authoritative stream origins"
         )
-    return candidate
+    if not starts:
+        return candidate
+    durable = next(iter(starts))
+    if candidate > durable:
+        raise CoverageCommitBuildError(
+            "coverage_start cannot move forward and discard verified history"
+        )
+    return min(candidate, durable)
 
 
 def _snapshot_covers_interval(
@@ -231,10 +329,50 @@ def _gap_is_fully_observed(
     )
 
 
-def _terminal_state(manifest: CanonicalBatchManifest) -> CoverageRequestTerminalState:
-    if any(stream.outcome is StreamPublicationOutcome.BLOCKED for stream in manifest.streams):
+def _terminal_state(
+    manifest: CanonicalBatchManifest,
+    changed_gaps: Sequence[GapFinding],
+) -> CoverageRequestTerminalState:
+    blocked_stream = any(
+        stream.outcome is StreamPublicationOutcome.BLOCKED for stream in manifest.streams
+    )
+    if blocked_stream or any(gap.actively_blocks for gap in changed_gaps):
         return CoverageRequestTerminalState.PARTIAL
     return CoverageRequestTerminalState.SUCCESS
+
+
+def _existing_segment_supports_slot(
+    segment: CoverageSegment,
+    *,
+    stream_id: str,
+    start: datetime,
+    end: datetime,
+    calendar_snapshot_id: str,
+    calendar_snapshot_checksum: str,
+    policy_snapshot_id: str,
+) -> bool:
+    """Recognize a retained exact-snapshot proof behind a semantic duplicate."""
+
+    return (
+        segment.stream_id == stream_id
+        and segment.start <= start
+        and segment.end >= end
+        and segment.calendar_snapshot_id == calendar_snapshot_id
+        and segment.calendar_snapshot_checksum == calendar_snapshot_checksum
+        and segment.policy_snapshot_id == policy_snapshot_id
+        and segment.classification is CoverageClassification.OBSERVED
+        and segment.verification_state is CoverageVerificationState.VERIFIED
+        and segment.retained
+        and segment.invalidated_at is None
+        and segment.artifacts_present
+        and segment.artifact_integrity_verified
+        and segment.interval_verified
+        and segment.request_completed
+        and segment.pagination_verified
+        and segment.terminal_page_verified
+        and segment.canonical_batch_verified
+        and segment.relational_provenance_verified
+    )
 
 
 def build_publication_coverage_commit(
@@ -253,6 +391,7 @@ def build_publication_coverage_commit(
     existing_segments: Sequence[CoverageSegment] = (),
     existing_gaps: Sequence[GapFinding] = (),
     existing_watermarks: Sequence[MaterializedWatermark] = (),
+    semantic_duplicate_slots: Sequence[tuple[str, datetime, datetime]] = (),
 ) -> CoverageCommit:
     """Derive segments, gaps, and changing watermarks from verified canonical rows.
 
@@ -268,6 +407,19 @@ def build_publication_coverage_commit(
         existing_segments,
         existing_watermarks,
     )
+    durable_existing_watermarks = tuple(existing_watermarks)
+    existing_segments = tuple(
+        segment
+        if segment.coverage_start == origin
+        else segment.model_copy(update={"coverage_start": origin})
+        for segment in existing_segments
+    )
+    existing_watermarks = tuple(
+        watermark
+        if watermark.coverage_start == origin
+        else watermark.model_copy(update={"coverage_start": origin})
+        for watermark in existing_watermarks
+    )
     if domain_end <= origin:
         raise CoverageCommitBuildError("frontier domain must extend beyond coverage_start")
     if (manifest.provider, manifest.dataset) != (policy.provider, policy.dataset):
@@ -282,18 +434,30 @@ def build_publication_coverage_commit(
     slot_index = {(slot.start_utc, slot.end_utc): index for index, slot in enumerate(slots)}
     if len(slot_index) != len(slots):
         raise CoverageCommitBuildError("manifest calendar contains duplicate eligible slots")
+    stream_ids = {outcome.stream_id for outcome in manifest.streams}
+    duplicate_slots = {
+        (stream_id, to_utc(start), to_utc(end))
+        for stream_id, start, end in semantic_duplicate_slots
+    }
+    if len(duplicate_slots) != len(semantic_duplicate_slots):
+        raise CoverageCommitBuildError("semantic duplicate slot proofs contain duplicates")
+    if any(
+        stream_id not in stream_ids or (start, end) not in slot_index
+        for stream_id, start, end in duplicate_slots
+    ):
+        raise CoverageCommitBuildError(
+            "semantic duplicate proof is outside the exact manifest stream/slot domain"
+        )
 
     existing_by_id = {segment.coverage_id: segment for segment in existing_segments}
     existing_watermark_by_stream = {
-        watermark.stream_id: watermark for watermark in existing_watermarks
+        watermark.stream_id: watermark for watermark in durable_existing_watermarks
     }
-    if len(existing_watermark_by_stream) != len(existing_watermarks):
+    if len(existing_watermark_by_stream) != len(durable_existing_watermarks):
         raise CoverageCommitBuildError("existing watermark projection contains duplicates")
 
     segments: list[CoverageSegment] = []
     changed_gaps: list[GapFinding] = []
-    terminal_state = _terminal_state(manifest)
-
     for outcome in manifest.streams:
         stream = outcome.stream
         stream_id = stream.stream_id
@@ -303,6 +467,7 @@ def build_publication_coverage_commit(
                 start=outcome.request_start,
                 end=outcome.request_end,
                 gap_type=GapType.INTEGRITY,
+                episode_id=str(request_instance_id),
             )
             existing_gap = next(
                 (gap for gap in existing_gaps if gap.gap_id == identifier),
@@ -382,7 +547,9 @@ def build_publication_coverage_commit(
                 artifact_integrity_verified=True,
                 interval_verified=True,
                 request_completed=True,
-                request_terminal_state=terminal_state,
+                # Finalized after all request gaps are known.  SUCCESS is only
+                # a construction placeholder and never escapes this builder.
+                request_terminal_state=CoverageRequestTerminalState.SUCCESS,
                 stream_outcome=CoverageStreamOutcome.PUBLISHABLE,
                 pagination_verified=True,
                 terminal_page_verified=True,
@@ -400,7 +567,26 @@ def build_publication_coverage_commit(
             segments.append(segment_candidate)
 
         observed = set(observed_indexes)
-        missing = [index for index in range(len(slots)) if index not in observed]
+        missing = [
+            index
+            for index, slot in enumerate(slots)
+            if index not in observed
+            and not (
+                (stream_id, slot.start_utc, slot.end_utc) in duplicate_slots
+                and any(
+                    _existing_segment_supports_slot(
+                        segment,
+                        stream_id=stream_id,
+                        start=slot.start_utc,
+                        end=slot.end_utc,
+                        calendar_snapshot_id=calendar_snapshot_id,
+                        calendar_snapshot_checksum=manifest.calendar_snapshot.checksum,
+                        policy_snapshot_id=policy_snapshot_id,
+                    )
+                    for segment in stream_existing
+                )
+            )
+        ]
         for first, last in _contiguous_runs(missing):
             start = slots[first].start_utc
             end = slots[last].end_utc
@@ -409,6 +595,7 @@ def build_publication_coverage_commit(
                 start=start,
                 end=end,
                 gap_type=GapType.EXPECTED_OBSERVATION,
+                episode_id=str(request_instance_id),
             )
             existing_gap = next(
                 (gap for gap in existing_gaps if gap.gap_id == identifier),
@@ -456,7 +643,16 @@ def build_publication_coverage_commit(
         raise CoverageCommitBuildError(
             "a filesystem publication must contribute at least one observed coverage segment"
         )
-    ordered_segments = tuple(sorted(segments, key=lambda value: value.coverage_id))
+    terminal_state = _terminal_state(manifest, changed_gaps)
+    ordered_segments = tuple(
+        sorted(
+            (
+                segment.model_copy(update={"request_terminal_state": terminal_state})
+                for segment in segments
+            ),
+            key=lambda value: value.coverage_id,
+        )
+    )
     all_segments = tuple(existing_segments) + tuple(
         segment for segment in ordered_segments if segment.coverage_id not in existing_by_id
     )
@@ -504,6 +700,7 @@ def build_publication_coverage_commit(
             existing is not None
             and existing.verification_state is CoverageVerificationState.VERIFIED
             and existing.exclusive_frontier == watermark_candidate.exclusive_frontier
+            and existing.coverage_start == watermark_candidate.coverage_start
             and existing.calendar_snapshot_id == calendar_snapshot_id
             and existing.policy_snapshot_id == policy_snapshot_id
         ):
@@ -536,5 +733,7 @@ def build_publication_coverage_commit(
 
 __all__ = [
     "CoverageCommitBuildError",
+    "build_blocking_acquisition_gaps",
+    "build_blocking_integrity_gaps",
     "build_publication_coverage_commit",
 ]

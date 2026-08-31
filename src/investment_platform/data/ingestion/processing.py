@@ -71,6 +71,16 @@ class RawProcessingPage:
 
 
 @dataclass(frozen=True, slots=True)
+class PreparedBatchContext:
+    """Raw-verified identity/provenance that must be durable before normalization."""
+
+    specification: RequestSpecification
+    acquisition_authorization: AcquisitionPolicyAuthorization
+    batch_context: BatchContext
+    provenance: CanonicalPublicationProvenance
+
+
+@dataclass(frozen=True, slots=True)
 class PreparedCanonicalBatch:
     """Complete deterministic input for ``CanonicalBatchPublisher``."""
 
@@ -236,6 +246,112 @@ def _processing_signature(calendar_snapshot: CalendarSnapshot) -> ProcessingSign
     )
 
 
+def _validate_processing_scope(
+    specification: RequestSpecification,
+    calendar_snapshot: CalendarSnapshot,
+) -> None:
+    if (specification.provider, specification.dataset) != ("alpaca", "price_bars_sip"):
+        raise CanonicalProcessingError("processing requires exact historical Alpaca SIP bars")
+    if (
+        calendar_snapshot.calendar_name != "XNYS"
+        or calendar_snapshot.timezone_name != "America/New_York"
+    ):
+        raise CanonicalProcessingError("Alpaca SIP RTH processing requires the XNYS calendar")
+
+
+def prepare_alpaca_sip_batch_context(
+    *,
+    specification: RequestSpecification,
+    pages: tuple[RawProcessingPage, ...],
+    acquisition_authorization: AcquisitionPolicyAuthorization,
+    calendar_snapshot: CalendarSnapshot,
+    fixed_ingested_at: datetime,
+    manifest_created_at: datetime,
+) -> PreparedBatchContext:
+    """Verify raw evidence and freeze identity/provenance before normalization starts."""
+
+    _validate_processing_scope(specification, calendar_snapshot)
+    specification_to_bar_request(specification)
+    _validate_page_chain(specification, pages, acquisition_authorization)
+    if acquisition_authorization.request.request_spec_hash != specification.request_spec_hash:
+        raise CanonicalProcessingError("acquisition authorization belongs to another request")
+    if fixed_ingested_at.tzinfo is None or fixed_ingested_at.utcoffset() is None:
+        raise CanonicalProcessingError("fixed_ingested_at must be timezone-aware")
+    if manifest_created_at.tzinfo is None or manifest_created_at.utcoffset() is None:
+        raise CanonicalProcessingError("manifest_created_at must be timezone-aware")
+    if manifest_created_at < fixed_ingested_at:
+        raise CanonicalProcessingError("manifest creation time precedes fixed ingestion time")
+    latest_retrieval = max(page.batch.metadata.retrieved_at for page in pages)
+    if fixed_ingested_at < latest_retrieval:
+        raise CanonicalProcessingError("fixed ingestion time precedes raw retrieval")
+
+    context = BatchContext(
+        batch_identity=CanonicalBatchIdentity(
+            request_spec_hash=specification.request_spec_hash,
+            ordered_artifacts=tuple(page.identity for page in pages),
+            processing_signature=_processing_signature(calendar_snapshot),
+        ),
+        fixed_ingested_at=fixed_ingested_at,
+        manifest_created_at=manifest_created_at,
+    )
+    provenance = CanonicalPublicationProvenance(
+        source_id=pages[0].batch.metadata.source.source_id,
+        raw_bindings=tuple(
+            RawProvenanceBinding(
+                artifact_id=page.identity.artifact_id,
+                raw_batch_id=page.batch.metadata.batch_id,
+            )
+            for page in pages
+        ),
+    )
+    if any(page.batch.metadata.source.source_id != provenance.source_id for page in pages):
+        raise CanonicalProcessingError("raw page chain contains different source identities")
+    return PreparedBatchContext(
+        specification=specification,
+        acquisition_authorization=acquisition_authorization,
+        batch_context=context,
+        provenance=provenance,
+    )
+
+
+def _validate_durable_batch_context(
+    *,
+    specification: RequestSpecification,
+    pages: tuple[RawProcessingPage, ...],
+    acquisition_authorization: AcquisitionPolicyAuthorization,
+    calendar_snapshot: CalendarSnapshot,
+    batch_context: BatchContext,
+    provenance: CanonicalPublicationProvenance,
+) -> None:
+    _validate_processing_scope(specification, calendar_snapshot)
+    _validate_page_chain(specification, pages, acquisition_authorization)
+    expected_identity = CanonicalBatchIdentity(
+        request_spec_hash=specification.request_spec_hash,
+        ordered_artifacts=tuple(page.identity for page in pages),
+        processing_signature=_processing_signature(calendar_snapshot),
+    )
+    if batch_context.batch_identity != expected_identity:
+        raise CanonicalProcessingError(
+            "durable batch context differs from exact raw/processing identity"
+        )
+    if batch_context.manifest_created_at < batch_context.fixed_ingested_at:
+        raise CanonicalProcessingError("durable manifest time precedes fixed ingestion time")
+    if batch_context.fixed_ingested_at < max(page.batch.metadata.retrieved_at for page in pages):
+        raise CanonicalProcessingError("durable ingestion time precedes raw retrieval")
+    expected_provenance = CanonicalPublicationProvenance(
+        source_id=pages[0].batch.metadata.source.source_id,
+        raw_bindings=tuple(
+            RawProvenanceBinding(
+                artifact_id=page.identity.artifact_id,
+                raw_batch_id=page.batch.metadata.batch_id,
+            )
+            for page in pages
+        ),
+    )
+    if provenance != expected_provenance:
+        raise CanonicalProcessingError("durable provenance differs from exact raw chain")
+
+
 def _canonical_partitions(frame: pl.DataFrame) -> tuple[CanonicalParquetPart, ...]:
     if frame.is_empty():
         return ()
@@ -273,47 +389,27 @@ def _canonical_partitions(frame: pl.DataFrame) -> tuple[CanonicalParquetPart, ..
     return tuple(parts)
 
 
-def prepare_alpaca_sip_canonical_batch(
+def prepare_alpaca_sip_canonical_batch_from_context(
     *,
     specification: RequestSpecification,
     pages: tuple[RawProcessingPage, ...],
     acquisition_authorization: AcquisitionPolicyAuthorization,
     calendar_snapshot: CalendarSnapshot,
-    fixed_ingested_at: datetime,
-    manifest_created_at: datetime,
+    batch_context: BatchContext,
+    provenance: CanonicalPublicationProvenance,
 ) -> PreparedCanonicalBatch:
-    """Normalize, flag, block fatal streams, and freeze one replayable batch context."""
+    """Normalize using the exact context/provenance already committed to SQLite."""
 
-    if (specification.provider, specification.dataset) != ("alpaca", "price_bars_sip"):
-        raise CanonicalProcessingError("processing requires exact historical Alpaca SIP bars")
-    if (
-        calendar_snapshot.calendar_name != "XNYS"
-        or calendar_snapshot.timezone_name != "America/New_York"
-    ):
-        raise CanonicalProcessingError("Alpaca SIP RTH processing requires the XNYS calendar")
     request = specification_to_bar_request(specification)
-    _validate_page_chain(specification, pages, acquisition_authorization)
-    if acquisition_authorization.request.request_spec_hash != specification.request_spec_hash:
-        raise CanonicalProcessingError("acquisition authorization belongs to another request")
-    if fixed_ingested_at.tzinfo is None or fixed_ingested_at.utcoffset() is None:
-        raise CanonicalProcessingError("fixed_ingested_at must be timezone-aware")
-    if manifest_created_at.tzinfo is None or manifest_created_at.utcoffset() is None:
-        raise CanonicalProcessingError("manifest_created_at must be timezone-aware")
-    if manifest_created_at < fixed_ingested_at:
-        raise CanonicalProcessingError("manifest creation time precedes fixed ingestion time")
-    latest_retrieval = max(page.batch.metadata.retrieved_at for page in pages)
-    if fixed_ingested_at < latest_retrieval:
-        raise CanonicalProcessingError("fixed ingestion time precedes raw retrieval")
-
-    context = BatchContext(
-        batch_identity=CanonicalBatchIdentity(
-            request_spec_hash=specification.request_spec_hash,
-            ordered_artifacts=tuple(page.identity for page in pages),
-            processing_signature=_processing_signature(calendar_snapshot),
-        ),
-        fixed_ingested_at=fixed_ingested_at,
-        manifest_created_at=manifest_created_at,
+    _validate_durable_batch_context(
+        specification=specification,
+        pages=pages,
+        acquisition_authorization=acquisition_authorization,
+        calendar_snapshot=calendar_snapshot,
+        batch_context=batch_context,
+        provenance=provenance,
     )
+    context = batch_context
     schedule = session_schedule_from_snapshot(calendar_snapshot)
     bars: list[PriceBar] = []
     normalization_issues: list[NormalizationIssue] = []
@@ -419,18 +515,6 @@ def prepare_alpaca_sip_canonical_batch(
         else validated_frame.clear()
     )
     parts = _canonical_partitions(publishable)
-    provenance = CanonicalPublicationProvenance(
-        source_id=pages[0].batch.metadata.source.source_id,
-        raw_bindings=tuple(
-            RawProvenanceBinding(
-                artifact_id=page.identity.artifact_id,
-                raw_batch_id=page.batch.metadata.batch_id,
-            )
-            for page in pages
-        ),
-    )
-    if any(page.batch.metadata.source.source_id != provenance.source_id for page in pages):
-        raise CanonicalProcessingError("raw page chain contains different source identities")
     ordered_outcomes = tuple(sorted(outcomes, key=lambda value: value.stream_id))
     expectation = CanonicalBatchExpectation(
         specification=specification,
@@ -454,14 +538,46 @@ def prepare_alpaca_sip_canonical_batch(
     )
 
 
+def prepare_alpaca_sip_canonical_batch(
+    *,
+    specification: RequestSpecification,
+    pages: tuple[RawProcessingPage, ...],
+    acquisition_authorization: AcquisitionPolicyAuthorization,
+    calendar_snapshot: CalendarSnapshot,
+    fixed_ingested_at: datetime,
+    manifest_created_at: datetime,
+) -> PreparedCanonicalBatch:
+    """Compatibility helper; durable services must persist between its two explicit phases."""
+
+    prepared_context = prepare_alpaca_sip_batch_context(
+        specification=specification,
+        pages=pages,
+        acquisition_authorization=acquisition_authorization,
+        calendar_snapshot=calendar_snapshot,
+        fixed_ingested_at=fixed_ingested_at,
+        manifest_created_at=manifest_created_at,
+    )
+    return prepare_alpaca_sip_canonical_batch_from_context(
+        specification=prepared_context.specification,
+        pages=pages,
+        acquisition_authorization=prepared_context.acquisition_authorization,
+        calendar_snapshot=calendar_snapshot,
+        batch_context=prepared_context.batch_context,
+        provenance=prepared_context.provenance,
+    )
+
+
 __all__ = [
     "ALPACA_SIP_NORMALIZER_VERSION",
     "CANONICAL_PRICE_BAR_SCHEMA_VERSION",
     "PRICE_BAR_VALIDATOR_VERSION",
     "CanonicalProcessingError",
+    "PreparedBatchContext",
     "PreparedCanonicalBatch",
     "RawProcessingPage",
+    "prepare_alpaca_sip_batch_context",
     "prepare_alpaca_sip_canonical_batch",
+    "prepare_alpaca_sip_canonical_batch_from_context",
     "processing_pages_from_acquisition",
     "session_schedule_from_snapshot",
 ]

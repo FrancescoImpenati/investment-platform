@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import os
 from collections.abc import Iterator, Mapping
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from enum import StrEnum
 from urllib.parse import quote
-from uuid import NAMESPACE_URL, uuid5
+from uuid import NAMESPACE_URL, UUID, uuid5
+from zoneinfo import ZoneInfo
 
 from investment_platform.data.models import AdjustmentState, Timeframe, TradingSession
 from investment_platform.data.provenance import DataSource, LicenseClassification, RawBatch
@@ -16,7 +18,7 @@ from investment_platform.data.providers._support import (
     BatchIdFactory,
     Clock,
     new_batch_id,
-    parse_json_object,
+    parse_json_response,
     raw_batch_from_response,
     require_success,
     safe_numeric_header,
@@ -36,15 +38,18 @@ from investment_platform.data.providers.errors import (
     ProviderResponseError,
 )
 from investment_platform.data.providers.http import (
+    AttemptScopedHttpTransport,
     HttpResponse,
     HttpTransport,
     QueryParameters,
     UrllibHttpTransport,
 )
+from investment_platform.data.storage.transport_spool import TransportSpoolFaultInjector
 
 _PROVIDER = "alpaca"
 _DEFAULT_DATA_BASE_URL = "https://data.alpaca.markets"
 _DEFAULT_TRADING_BASE_URL = "https://paper-api.alpaca.markets"
+_NEW_YORK = ZoneInfo("America/New_York")
 
 
 class AlpacaFeed(StrEnum):
@@ -159,14 +164,46 @@ def _rfc3339(value: datetime) -> str:
 
 
 def _inclusive_end(request: BarRequest) -> datetime:
-    inclusive = request.end - timedelta(microseconds=1)
-    if inclusive < request.start:
+    return _inclusive_end_for_bounds(request.start, request.end)
+
+
+def _inclusive_end_for_bounds(start: datetime, end: datetime) -> datetime:
+    inclusive = end - timedelta(microseconds=1)
+    if inclusive < start:
         raise ProviderCapabilityError(
             _PROVIDER,
             "price_bars",
             "requested interval is shorter than Alpaca timestamp precision",
         )
     return inclusive
+
+
+def _provider_bar_query_bounds(request: BarRequest) -> tuple[datetime, datetime]:
+    """Map canonical RTH bounds to Alpaca's provider timestamp convention.
+
+    Alpaca daily stock bars are labeled at midnight America/New_York.  The
+    deterministic request identity remains bounded by the canonical XNYS
+    session open/close; only the wire query expands to the midnight envelope
+    containing the same first and last session dates.
+    """
+
+    if request.timeframe is not Timeframe.ONE_DAY:
+        return request.start, request.end
+    first_session_date = request.start.astimezone(_NEW_YORK).date()
+    last_session_date = (request.end - timedelta(microseconds=1)).astimezone(
+        _NEW_YORK
+    ).date()
+    provider_start = datetime.combine(
+        first_session_date,
+        time.min,
+        tzinfo=_NEW_YORK,
+    ).astimezone(UTC)
+    provider_end = datetime.combine(
+        last_session_date + timedelta(days=1),
+        time.min,
+        tzinfo=_NEW_YORK,
+    ).astimezone(UTC)
+    return provider_start, provider_end
 
 
 def _timeframe(timeframe: Timeframe) -> str:
@@ -238,8 +275,17 @@ class AlpacaProvider:
         self._batch_id_factory = batch_id_factory
 
     @classmethod
-    def from_environment(cls, *, feed: AlpacaFeed = AlpacaFeed.SIP) -> AlpacaProvider:
-        return cls(AlpacaCredentials.from_environment(), feed=feed)
+    def from_environment(
+        cls,
+        *,
+        feed: AlpacaFeed = AlpacaFeed.SIP,
+        transport: HttpTransport | None = None,
+    ) -> AlpacaProvider:
+        return cls(
+            AlpacaCredentials.from_environment(),
+            feed=feed,
+            transport=transport,
+        )
 
     @property
     def provider_name(self) -> str:
@@ -248,6 +294,21 @@ class AlpacaProvider:
     @property
     def feed(self) -> AlpacaFeed:
         return self._feed
+
+    def transport_attempt(
+        self,
+        attempt_id: UUID,
+        *,
+        fault_injector: TransportSpoolFaultInjector | None = None,
+    ) -> AbstractContextManager[None]:
+        """Bind file-backed transport to one attempt; legacy fakes need no scope."""
+
+        if isinstance(self._transport, AttemptScopedHttpTransport):
+            return self._transport.attempt_scope(
+                attempt_id,
+                fault_injector=fault_injector,
+            )
+        return nullcontext()
 
     def _headers(self) -> Mapping[str, str]:
         return {
@@ -274,7 +335,7 @@ class AlpacaProvider:
         )
         if response.status_code == 422:
             try:
-                provider_error = parse_json_object(_PROVIDER, dataset, response.body)
+                provider_error = parse_json_response(_PROVIDER, dataset, response)
             except ProviderResponseError:
                 provider_error = {}
             if provider_error.get("code") == 42210000:
@@ -317,7 +378,7 @@ class AlpacaProvider:
                 batch_id_factory=self._batch_id_factory,
             )
             yield batch
-            parsed = parse_json_object(_PROVIDER, dataset, response.body)
+            parsed = parse_json_response(_PROVIDER, dataset, response)
             token_value = parsed.get("next_page_token")
             if token_value is None or token_value == "":
                 return
@@ -403,11 +464,12 @@ class AlpacaProvider:
                 f"session {request.session.value} is not explicitly supported",
             )
         identifiers = _joined_identifiers(request.instruments, dataset="price_bars")
+        provider_start, provider_end = _provider_bar_query_bounds(request)
         query = (
             ("symbols", identifiers),
             ("timeframe", _timeframe(request.timeframe)),
-            ("start", _rfc3339(request.start)),
-            ("end", _rfc3339(_inclusive_end(request))),
+            ("start", _rfc3339(provider_start)),
+            ("end", _rfc3339(_inclusive_end_for_bounds(provider_start, provider_end))),
             ("limit", "10000"),
             ("adjustment", provider_adjustment),
             ("asof", symbol_mapping_as_of),
@@ -552,7 +614,11 @@ class AlpacaProvider:
         observation_count: int | None = None
         if response.status_code == 200:
             try:
-                parsed = parse_json_object(_PROVIDER, "sip_entitlement_preflight", response.body)
+                parsed = parse_json_response(
+                    _PROVIDER,
+                    "sip_entitlement_preflight",
+                    response,
+                )
                 bars = parsed.get("bars")
                 if not isinstance(bars, dict):
                     raise ProviderResponseError(
@@ -579,10 +645,10 @@ class AlpacaProvider:
             outcome = AlpacaSipPreflightOutcome.AUTH_OR_PERMISSION_DENIED
         elif response.status_code == 422:
             try:
-                provider_error = parse_json_object(
+                provider_error = parse_json_response(
                     _PROVIDER,
                     "sip_entitlement_preflight",
-                    response.body,
+                    response,
                 )
             except ProviderResponseError:
                 provider_error = {}

@@ -48,6 +48,7 @@ from investment_platform.data.retention import (
 )
 
 PLANNER_PERSISTENCE_CONTRACT_VERSION = 1
+_MAX_DURABLE_REQUEST_DISPATCHES = 1000
 _REQUEST_INSTANCE_NAMESPACE = UUID("f1680721-6906-47d0-a762-4e9fd3d771d5")
 _DURABLE_ID_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._:@-]{0,191}$"
 _SHA256_PATTERN = r"^[0-9a-f]{64}$"
@@ -140,6 +141,22 @@ class PlanPersistenceRequest(_FrozenOperationalModel):
     calendar_snapshot_id: str = Field(pattern=_DURABLE_ID_PATTERN, max_length=128)
     reason: Annotated[str, Field(min_length=1, max_length=256)]
     max_attempts: Annotated[int, Field(gt=0)]
+    max_pages: Annotated[
+        int,
+        Field(gt=0, le=_MAX_DURABLE_REQUEST_DISPATCHES),
+    ] = _MAX_DURABLE_REQUEST_DISPATCHES
+    max_calls: Annotated[
+        int,
+        Field(gt=0, le=_MAX_DURABLE_REQUEST_DISPATCHES),
+    ] = _MAX_DURABLE_REQUEST_DISPATCHES
+    max_pages_per_request: Annotated[
+        int,
+        Field(gt=0, le=_MAX_DURABLE_REQUEST_DISPATCHES),
+    ] = _MAX_DURABLE_REQUEST_DISPATCHES
+    max_calls_per_request: Annotated[
+        int,
+        Field(gt=0, le=_MAX_DURABLE_REQUEST_DISPATCHES),
+    ] = _MAX_DURABLE_REQUEST_DISPATCHES
     plan: IngestionPlan
 
     @field_validator("reason", mode="after")
@@ -148,6 +165,14 @@ class PlanPersistenceRequest(_FrozenOperationalModel):
         if _is_sensitive_text(value):
             raise ValueError("plan reason contains a URL, secret-shaped text, or line break")
         return value
+
+    @model_validator(mode="after")
+    def validate_execution_limits(self) -> Self:
+        if self.max_pages < self.plan.estimated_pages:
+            raise ValueError("run page ceiling is below the deterministic plan estimate")
+        if self.max_calls < self.plan.estimated_calls:
+            raise ValueError("run call ceiling is below the deterministic plan estimate")
+        return self
 
 
 class PersistedIngestionPlan(_FrozenOperationalModel):
@@ -377,6 +402,24 @@ class IngestionPlanRepository:
                         len(request.plan.requests),
                     ),
                 )
+                limits_hash = _execution_limits_hash(request)
+                request_limits = _allocate_request_execution_limits(request)
+                connection.execute(
+                    """
+                    INSERT INTO ingestion_execution_limits(
+                        run_id, max_pages, max_calls, max_pages_per_request,
+                        max_calls_per_request, limits_hash
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        str(request.run_id),
+                        request.max_pages,
+                        request.max_calls,
+                        request.max_pages_per_request,
+                        request.max_calls_per_request,
+                        limits_hash,
+                    ),
+                )
                 connection.execute(
                     """
                     INSERT INTO ingestion_plan_records(
@@ -419,6 +462,7 @@ class IngestionPlanRepository:
                         request,
                         planned,
                         ordinal=ordinal,
+                        execution_limit=request_limits[ordinal],
                         policy_snapshot_id=policy_snapshot_id,
                         recorded_at=recorded_at,
                     )
@@ -1058,6 +1102,7 @@ class IngestionPlanRepository:
         planned: PlannedRequest,
         *,
         ordinal: int,
+        execution_limit: tuple[int, int],
         policy_snapshot_id: str,
         recorded_at: datetime,
     ) -> None:
@@ -1084,6 +1129,26 @@ class IngestionPlanRepository:
                 request.reason,
                 ordinal,
                 _format_utc(recorded_at),
+            ),
+        )
+        max_pages, max_calls = execution_limit
+        connection.execute(
+            """
+            INSERT INTO request_execution_limits(
+                request_instance_id, run_id, max_pages, max_calls, limits_hash
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                request_instance_id,
+                str(request.run_id),
+                max_pages,
+                max_calls,
+                _request_execution_limits_hash(
+                    request.run_id,
+                    identity.request_instance_id,
+                    max_pages=max_pages,
+                    max_calls=max_calls,
+                ),
             ),
         )
         connection.execute(
@@ -1246,6 +1311,28 @@ class IngestionPlanRepository:
         )
         if run_actual != run_expected:
             raise PlanIdentityCollisionError("run row collides with immutable plan scope")
+        limits = connection.execute(
+            "SELECT * FROM ingestion_execution_limits WHERE run_id = ?",
+            (str(request.run_id),),
+        ).fetchone()
+        expected_limits = (
+            request.max_pages,
+            request.max_calls,
+            request.max_pages_per_request,
+            request.max_calls_per_request,
+            _execution_limits_hash(request),
+        )
+        if limits is None or tuple(
+            limits[column]
+            for column in (
+                "max_pages",
+                "max_calls",
+                "max_pages_per_request",
+                "max_calls_per_request",
+                "limits_hash",
+            )
+        ) != expected_limits:
+            raise PlanIdentityCollisionError("request execution limits collide with replay")
 
         streams = connection.execute(
             """
@@ -1267,6 +1354,7 @@ class IngestionPlanRepository:
         ).fetchall()
         if len(instances) != len(request.plan.requests):
             raise PlanIdentityCollisionError("persisted request count collides with replay")
+        allocated_limits = _allocate_request_execution_limits(request)
         for ordinal, (instance, planned) in enumerate(
             zip(instances, request.plan.requests, strict=True)
         ):
@@ -1291,6 +1379,27 @@ class IngestionPlanRepository:
             )
             if actual_instance != expected_instance:
                 raise PlanIdentityCollisionError("request instance collides with replay")
+            request_limit = connection.execute(
+                "SELECT * FROM request_execution_limits WHERE request_instance_id = ?",
+                (str(identity.request_instance_id),),
+            ).fetchone()
+            max_pages, max_calls = allocated_limits[ordinal]
+            expected_request_limit = (
+                str(request.run_id),
+                max_pages,
+                max_calls,
+                _request_execution_limits_hash(
+                    request.run_id,
+                    identity.request_instance_id,
+                    max_pages=max_pages,
+                    max_calls=max_calls,
+                ),
+            )
+            if request_limit is None or tuple(
+                request_limit[column]
+                for column in ("run_id", "max_pages", "max_calls", "limits_hash")
+            ) != expected_request_limit:
+                raise PlanIdentityCollisionError("request dispatch limits collide with replay")
             self._persist_request_spec(
                 connection,
                 planned.specification,
@@ -1516,6 +1625,10 @@ def _plan_hash(request: PlanPersistenceRequest) -> str:
         ),
         "repair_reason": plan.repair_reason,
         "max_attempts": request.max_attempts,
+        "max_pages": request.max_pages,
+        "max_calls": request.max_calls,
+        "max_pages_per_request": request.max_pages_per_request,
+        "max_calls_per_request": request.max_calls_per_request,
         "policy_snapshot_id": deterministic_policy_snapshot_id(snapshot),
         "planning_authorized_at": _format_utc(plan.policy_authorization.authorized_at),
         "provider": plan.provider,
@@ -1561,6 +1674,91 @@ def _plan_hash(request: PlanPersistenceRequest) -> str:
 def _hash_json(value: object) -> str:
     canonical = json.dumps(value, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _execution_limits_hash(request: PlanPersistenceRequest) -> str:
+    return _hash_json(
+        {
+            "max_calls": request.max_calls,
+            "max_calls_per_request": request.max_calls_per_request,
+            "max_pages": request.max_pages,
+            "max_pages_per_request": request.max_pages_per_request,
+            "run_id": str(request.run_id),
+            "version": 1,
+        }
+    )
+
+
+def _request_execution_limits_hash(
+    run_id: UUID,
+    request_instance_id: UUID,
+    *,
+    max_pages: int,
+    max_calls: int,
+) -> str:
+    return _hash_json(
+        {
+            "max_calls": max_calls,
+            "max_pages": max_pages,
+            "request_instance_id": str(request_instance_id),
+            "run_id": str(run_id),
+            "version": 1,
+        }
+    )
+
+
+def _allocate_request_execution_limits(
+    request: PlanPersistenceRequest,
+) -> tuple[tuple[int, int], ...]:
+    """Allocate bounded headroom without multiplying the run ceilings.
+
+    The deterministic estimate is the minimum allocation.  Any remaining run
+    headroom is distributed in plan order one dispatch at a time, capped by the
+    per-request ceiling.  Consequently a short provider page can continue, while
+    the sum of every request's possible dispatches never exceeds the caller's
+    durable run budget.
+    """
+
+    page_limits = _allocate_one_execution_limit(
+        tuple(planned.estimated_pages for planned in request.plan.requests),
+        run_ceiling=request.max_pages,
+        per_request_ceiling=request.max_pages_per_request,
+    )
+    call_limits = _allocate_one_execution_limit(
+        tuple(planned.estimated_calls for planned in request.plan.requests),
+        run_ceiling=request.max_calls,
+        per_request_ceiling=request.max_calls_per_request,
+    )
+    return tuple(zip(page_limits, call_limits, strict=True))
+
+
+def _allocate_one_execution_limit(
+    estimates: tuple[int, ...],
+    *,
+    run_ceiling: int,
+    per_request_ceiling: int,
+) -> tuple[int, ...]:
+    if not estimates:
+        return ()
+    if any(estimate <= 0 or estimate > per_request_ceiling for estimate in estimates):
+        raise ValueError("request estimate exceeds its durable dispatch ceiling")
+    remaining = run_ceiling - sum(estimates)
+    if remaining < 0:
+        raise ValueError("request estimates exceed the durable run dispatch ceiling")
+    allocated = list(estimates)
+    while remaining:
+        progressed = False
+        for ordinal, current in enumerate(allocated):
+            if current >= per_request_ceiling:
+                continue
+            allocated[ordinal] += 1
+            remaining -= 1
+            progressed = True
+            if remaining == 0:
+                break
+        if not progressed:
+            break
+    return tuple(allocated)
 
 
 def _ordered_raw_artifact_ids_hash(artifact_ids: tuple[str, ...]) -> str:

@@ -11,7 +11,7 @@ from __future__ import annotations
 import re
 from collections import defaultdict
 from collections.abc import Callable, Sequence
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from enum import StrEnum
 from typing import Annotated, Final, Self
@@ -27,6 +27,7 @@ from investment_platform.data.ingestion.identity import (
     StreamKey,
 )
 from investment_platform.data.market_time import to_utc
+from investment_platform.data.models import Timeframe
 from investment_platform.data.retention import (
     DatasetRuntimeStatus,
     PlanningPolicyAuthorization,
@@ -715,15 +716,19 @@ def _complete_eligible_slots(
 ) -> tuple[ExpectedCalendarSlot, ...]:
     selected: list[ExpectedCalendarSlot] = []
     for slot in slots:
+        # Filter non-finalized slots before checking whether user bounds cut
+        # through them.  A scheduler's default ``end=now`` commonly lands in
+        # the current 5m slot or daily session; that slot is outside the strict
+        # historical-age grant and therefore cannot make an otherwise safe
+        # update invalid.
+        if slot.end_utc >= safe_end:
+            continue
         intersects = slot.start_utc < desired_end and slot.end_utc > desired_start
         if not intersects:
             continue
         if slot.start_utc < desired_start or slot.end_utc > desired_end:
             raise PlanningError("desired bounds cut through a calendar-eligible slot")
-        # The policy grant is strict: equality with the age/finalization frontier
-        # is not eligible and therefore cannot create a bounded request.
-        if slot.end_utc < safe_end:
-            selected.append(slot)
+        selected.append(slot)
     return tuple(selected)
 
 
@@ -786,12 +791,19 @@ def _slot_runs(
 ) -> tuple[tuple[ExpectedCalendarSlot, ...], ...]:
     runs: list[list[ExpectedCalendarSlot]] = []
     previous_index: int | None = None
+    previous_session_date: date | None = None
     for slot in slots:
         index = slot_index[(slot.start_utc, slot.end_utc)]
-        if previous_index is None or index != previous_index + 1:
+        crosses_intraday_session = (
+            slot.timeframe is Timeframe.FIVE_MINUTES
+            and previous_session_date is not None
+            and slot.session_date != previous_session_date
+        )
+        if previous_index is None or index != previous_index + 1 or crosses_intraday_session:
             runs.append([])
         runs[-1].append(slot)
         previous_index = index
+        previous_session_date = slot.session_date
     return tuple(tuple(run) for run in runs)
 
 

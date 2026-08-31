@@ -44,6 +44,14 @@ from investment_platform.data.storage.raw import (
     RawStorageError,
     replay_raw_artifact,
 )
+from investment_platform.data.storage.quarantine import (
+    PublishedQuarantineArtifact,
+    QuarantineArtifactManifest,
+    QuarantineArtifactPublisher,
+    deterministic_quarantine_artifact_id,
+    quarantine_artifact_relative_directory,
+    verify_quarantine_artifact_directory,
+)
 from investment_platform.data.storage.recovery import (
     PublicationRecoveryInspector,
     RecoveryArtifactKind,
@@ -72,6 +80,7 @@ __all__ = [
     "PublicationIntegrityError",
     "PublicationRecoveryInspector",
     "PublishedCanonicalBatch",
+    "PublishedQuarantineArtifact",
     "PublishedRawArtifact",
     "RawArtifact",
     "RawArtifactManifest",
@@ -80,14 +89,19 @@ __all__ = [
     "RawPayloadManifest",
     "RawProvenanceBinding",
     "RawStorageError",
+    "QuarantineArtifactManifest",
+    "QuarantineArtifactPublisher",
     "RecoveryArtifactKind",
     "RecoveryInspection",
     "RecoveryInspectionState",
     "StreamPublicationOutcome",
     "empty_price_bar_frame",
+    "deterministic_quarantine_artifact_id",
     "price_bars_to_frame",
     "raw_artifact_relative_directory",
+    "quarantine_artifact_relative_directory",
     "replay_raw_artifact",
     "verify_canonical_batch_directory",
+    "verify_quarantine_artifact_directory",
     "verify_raw_artifact_directory",
 ]

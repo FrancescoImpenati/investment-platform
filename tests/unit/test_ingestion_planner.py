@@ -332,6 +332,39 @@ def test_partition_union_equals_missing_expected_slots_without_overlap() -> None
 
 
 @pytest.mark.unit
+def test_five_minute_requests_never_span_two_exchange_sessions() -> None:
+    snapshot = _snapshot()
+    intraday = _plan(
+        limits=_limits(
+            max_expected_observations_per_request=500,
+            max_observations_per_page=500,
+            max_pages_per_request=1,
+            max_calls_per_request=1,
+        )
+    )
+
+    assert len(intraday.requests) == len(snapshot.sessions) == 3
+    for request, session in zip(intraday.requests, snapshot.sessions, strict=True):
+        assert {slot.session_date for slot in request.expected_slots} == {session.session_date}
+        assert request.specification.start == session.open_utc
+        assert request.specification.end == session.close_utc
+
+    daily = _plan(
+        streams=(_stream(timeframe=Timeframe.ONE_DAY),),
+        limits=_limits(
+            max_expected_observations_per_request=500,
+            max_observations_per_page=500,
+            max_pages_per_request=1,
+            max_calls_per_request=1,
+        ),
+    )
+    assert len(daily.requests) == 1
+    assert {slot.session_date for slot in daily.requests[0].expected_slots} == {
+        session.session_date for session in snapshot.sessions
+    }
+
+
+@pytest.mark.unit
 def test_synthetic_calendar_holiday_and_early_close_drive_expected_counts() -> None:
     snapshot = _snapshot()
     plan = _plan()
@@ -430,6 +463,49 @@ def test_strict_safe_end_excludes_slot_ending_at_exact_policy_frontier() -> None
     assert all(
         slot.end_utc < safe_end for request in plan.requests for slot in request.expected_slots
     )
+
+
+@pytest.mark.unit
+def test_mid_slot_default_update_end_ignores_unfinalized_5m_slot() -> None:
+    now = datetime(2025, 7, 2, 14, 32, tzinfo=UTC)
+    plan = _plan(
+        planner=_planner(clock=now),
+        intent=IngestionIntent.UPDATE,
+        start=_snapshot().sessions[0].open_utc,
+        end=now,
+    )
+
+    planned_slots = tuple(slot for request in plan.requests for slot in request.expected_slots)
+    assert planned_slots
+    assert planned_slots[-1].end_utc == datetime(2025, 7, 2, 14, 15, tzinfo=UTC)
+    assert all(slot.end_utc < plan.safe_end for slot in planned_slots)
+
+
+@pytest.mark.unit
+def test_mid_session_default_update_end_is_daily_noop_until_session_finalizes() -> None:
+    now = datetime(2025, 7, 2, 18, 0, tzinfo=UTC)
+    session = _snapshot().sessions[0]
+    plan = _plan(
+        planner=_planner(clock=now),
+        streams=(_stream(timeframe=Timeframe.ONE_DAY),),
+        intent=IngestionIntent.UPDATE,
+        start=session.open_utc,
+        end=now,
+    )
+
+    assert plan.is_no_op
+    assert plan.eligible_slot_count == 0
+
+
+@pytest.mark.unit
+def test_explicit_bound_cutting_a_finalized_slot_remains_invalid() -> None:
+    session = _snapshot().sessions[0]
+    with pytest.raises(PlanningError, match="cut through"):
+        _plan(
+            planner=_planner(clock=datetime(2025, 7, 2, 15, 0, tzinfo=UTC)),
+            start=session.open_utc,
+            end=datetime(2025, 7, 2, 14, 32, tzinfo=UTC),
+        )
 
 
 @pytest.mark.unit
@@ -632,8 +708,19 @@ def test_per_request_cost_ceiling_partitions_at_exact_boundary() -> None:
         )
     )
 
-    assert [request.expected_observations for request in plan.requests[:-1]] == [20] * 9
-    assert plan.requests[-1].expected_observations == 18
+    assert [request.expected_observations for request in plan.requests] == [
+        20,
+        20,
+        20,
+        18,
+        20,
+        20,
+        2,
+        20,
+        20,
+        20,
+        18,
+    ]
     assert all(request.estimated_cost <= Decimal("0.50") for request in plan.requests)
 
 

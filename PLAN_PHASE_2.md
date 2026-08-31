@@ -1,7 +1,8 @@
 # Phase 2 Implementation Plan — Living Data Ingestion
 
-- **Status:** Implementation contract complete; implementation not started
+- **Status:** Active implementation contract; offline checkpoint implemented; live acceptance pending
 - **Date:** 2026-08-31
+- **Status updated:** 2026-09-01
 - **Design:** [Phase 2 — Living Data Ingestion](docs/architecture/phase-2-living-ingestion.md)
 - **Baseline:** Phase 0–1 approved; Databento research present in main at 76e3ffd
 
@@ -22,6 +23,9 @@ The first live implementation is Alpaca historical SIP US stock bars for 1d and 
 tests and CI remain synthetic, offline, credential-free, and isolated from private data.
 
 This plan is the Phase 2 implementation contract. PLAN.md remains the historical Phase 0 contract.
+The source and synthetic test suite now implement the offline control plane described below. This
+status does not mark the contract complete: controlled Alpaca acceptance, final review, the pull
+request, and CI confirmation remain required, and Phase 3 is not authorized.
 
 ## 2. Frozen design decisions
 

@@ -307,6 +307,61 @@ class RawArtifactPublisher:
             dataset=specification.dataset,
         )
 
+    def list_verified_for_request(
+        self,
+        specification: RequestSpecification,
+    ) -> tuple[tuple[RawArtifactIdentity, PublishedRawArtifact], ...]:
+        """Discover complete raw publications for one exact request identity.
+
+        This recovery-only scan does not authorize the bytes for processing or
+        invent retrieval provenance.  It exposes verified immutable artifacts
+        so the operational catalog can mark interrupted publications as
+        purgeable before a new provider dispatch.
+        """
+
+        self._data_root.validate(expected_root_id=self._root_id)
+        base = managed_path(
+            self._data_root,
+            self._root_id,
+            PurePosixPath(
+                "raw",
+                f"provider={safe_partition_value(specification.provider, label='provider')}",
+                f"dataset={safe_partition_value(specification.dataset, label='dataset')}",
+                "artifacts",
+            ),
+        )
+        if not base.exists():
+            return ()
+        directories = {path.parent for path in iter_safe_regular_files(base)}
+        recovered: list[tuple[RawArtifactIdentity, PublishedRawArtifact]] = []
+        for directory in sorted(directories, key=lambda value: value.as_posix()):
+            manifest = verify_raw_artifact_directory(
+                directory,
+                expected_provider=specification.provider,
+                expected_dataset=specification.dataset,
+                chunk_size=self._chunk_size,
+            )
+            if manifest.identity.request_spec_hash != specification.request_spec_hash:
+                continue
+            relative = PurePosixPath(directory.relative_to(self._data_root.root).as_posix())
+            recovered.append(
+                (
+                    manifest.identity,
+                    PublishedRawArtifact(
+                        root_id=self._root_id,
+                        artifact_id=manifest.artifact_id,
+                        relative_directory=relative.as_posix(),
+                        payload_relative_path=(relative / _PAYLOAD_NAME).as_posix(),
+                        manifest_relative_path=(relative / _MANIFEST_NAME).as_posix(),
+                        content_sha256=manifest.payload.sha256,
+                        byte_count=manifest.payload.byte_count,
+                        first_persisted_at=manifest.first_persisted_at,
+                        created=False,
+                    ),
+                )
+            )
+        return tuple(sorted(recovered, key=lambda value: value[0].artifact_id))
+
     @staticmethod
     def _staging_prefix(identity: RawArtifactIdentity) -> str:
         return f"artifact={identity.artifact_hash}."

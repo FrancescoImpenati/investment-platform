@@ -6,17 +6,19 @@
   research.
 - Preserve the dependency direction: data -> deterministic analytics -> Market State -> optional
   AI interpretation -> strategy -> execution.
-- Phase 0 and Phase 1 are implemented and approved. Phase 2 living ingestion is designed in
-  `docs/architecture/phase-2-living-ingestion.md` but is not implemented yet. Never describe
-  Designed or Planned behavior as Implemented.
+- Phase 0 and Phase 1 are implemented and approved. The approved Phase 2 design now has an offline
+  implementation checkpoint: the control plane and synthetic acceptance behavior are implemented,
+  while controlled Alpaca persistence, final review, the pull request, and Phase 2 approval remain
+  pending. Never describe pending live acceptance, external scheduling, or Planned/Future behavior
+  as Implemented.
 - Phase 2 implementation is limited to the contract in `PLAN_PHASE_2.md`, initially Alpaca
   historical SIP US stock bars at `1d` and `5m` after the dataset's strict historical-age gate. Do
   not add new provider adapters, internal schedulers, feature execution, dashboards, agents,
   strategy/backtesting engines, or trading integrations unless a later task explicitly changes
   scope.
 - Read `docs/architecture/design-v0.1.md`, the Phase 2 design, and the relevant ADR before changing
-  architecture. `PLAN.md` remains the historical Phase 0 contract; `PLAN_PHASE_2.md` is the next
-  implementation contract.
+  architecture. `PLAN.md` remains the historical Phase 0 contract; `PLAN_PHASE_2.md` remains the
+  active Phase 2 implementation and acceptance contract.
 
 ## Architectural invariants
 
@@ -66,8 +68,10 @@ Do not create empty packages for future subsystems.
 - Use Polars for columnar transformations, Parquet for analytical persistence, DuckDB for local
   analytical queries, and Pydantic for serializable boundary/domain contracts.
 - Do not add overlapping tools or libraries without evidence: no parallel formatter/linter stack,
-  Pandas, database server, framework, or provider SDK by default. The planned exchange-calendar
-  dependency must pass the explicit Phase 2 dependency gate before it is added.
+  Pandas use in domain/analytics code, database server, framework, or provider SDK by default. The
+  Phase 2 dependency gate accepted `exchange-calendars` and its locked Pandas/NumPy transitive
+  dependencies only behind the calendar adapter; that exception does not authorize their wider
+  use.
 - Preserve public contracts deliberately. Update tests and documentation when behavior or schema
   changes.
 

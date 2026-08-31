@@ -52,12 +52,16 @@ from investment_platform.data.ingestion.planner import (
     PlannedRequest,
     RepairStrategy,
 )
+from investment_platform.data.operational.execution import SemanticNoOpObservationProof
 from investment_platform.data.operational.planning import (
     PLANNER_PERSISTENCE_CONTRACT_VERSION,
     IngestionRunStatus,
     PlanPersistenceRequest,
     RequestInstanceStatus,
+    _allocate_request_execution_limits,
+    _execution_limits_hash,
     _plan_hash,
+    _request_execution_limits_hash,
     deterministic_catalog_snapshot_id,
     deterministic_policy_snapshot_id,
     deterministic_request_instance_identity,
@@ -66,6 +70,7 @@ from investment_platform.data.operational.repository import deterministic_calend
 from investment_platform.data.operational.store import (
     OperationalStateError,
     OperationalStateStore,
+    _format_utc,
     _parse_utc,
 )
 from investment_platform.data.retention import (
@@ -122,6 +127,7 @@ class RestartAction(StrEnum):
     RESUME_PROCESSING = "RESUME_PROCESSING"
     ADOPT_PUBLICATION = "ADOPT_PUBLICATION"
     WAIT_RETRY = "WAIT_RETRY"
+    RETRY_DISPATCH = "RETRY_DISPATCH"
     RECONCILE_RUN = "RECONCILE_RUN"
     POLICY_BLOCKED = "POLICY_BLOCKED"
     CALENDAR_BLOCKED = "CALENDAR_BLOCKED"
@@ -222,11 +228,15 @@ class RestartRequestProjection(_FrozenRestartModel):
     authorization: RequestPolicyAuthorization
     expected_slot_count: Annotated[int, Field(gt=0)]
     expected_observation_count: Annotated[int, Field(gt=0)]
+    max_pages: Annotated[int, Field(gt=0, le=1000)]
+    max_calls: Annotated[int, Field(gt=0, le=1000)]
     max_attempts: Annotated[int, Field(gt=0)]
     retry_count: Annotated[int, Field(ge=0)]
     next_eligible_at: datetime | None = None
     latest_attempt: RestartAttemptProjection | None = None
     publication: RestartPublicationProjection | None = None
+    semantic_noop_committed: bool = False
+    nonpublication_partial_committed: bool = False
     action: RestartAction
 
     @field_validator("next_eligible_at", mode="after")
@@ -413,19 +423,77 @@ class RestartProjectionReader:
             raise RestartProjectionIntegrityError(
                 "durable stream proofs failed their integrity checks"
             ) from None
+
+    def load_optional_stream_proofs(
+        self,
+        stream_ids: Sequence[str],
+    ) -> StreamProofProjection | None:
+        """Load selected proofs, returning ``None`` only when no stream is cataloged.
+
+        A partially cataloged selection remains an integrity error.  This narrow
+        bootstrap API lets a first bounded backfill build its calendar before the
+        deterministic plan catalogs the stream keys without weakening normal
+        restart proof validation.
+        """
+
+        selected = tuple(stream_ids)
+        if (
+            not selected
+            or selected != tuple(sorted(set(selected)))
+            or any(_DURABLE_ID.fullmatch(value) is None for value in selected)
+        ):
+            raise ValueError("stream selection must be non-empty, unique, and ordered")
+        try:
+            with self._store.read_only_connection() as connection:
+                connection.execute("PRAGMA query_only = ON")
+                connection.execute("BEGIN")
+                try:
+                    placeholders = ",".join("?" for _ in selected)
+                    cataloged = tuple(
+                        str(row[0])
+                        for row in connection.execute(
+                            f"""
+                            SELECT stream_id FROM stream_keys
+                            WHERE stream_id IN ({placeholders}) ORDER BY stream_id
+                            """,
+                            selected,
+                        ).fetchall()
+                    )
+                    if not cataloged:
+                        result = None
+                    elif cataloged != selected:
+                        raise RestartProjectionIntegrityError(
+                            "selected streams are only partially cataloged"
+                        )
+                    else:
+                        result = self._load_stream_proofs(connection, selected)
+                finally:
+                    connection.rollback()
+            return result
+        except (RestartProjectionIntegrityError, sqlite3.DatabaseError):
+            raise RestartProjectionIntegrityError(
+                "durable stream proofs failed their integrity checks"
+            ) from None
         except (KeyError, TypeError, ValueError, ValidationError):
             raise RestartProjectionIntegrityError(
                 "durable stream proofs contain invalid typed metadata"
             ) from None
 
     def _load_run(self, connection: sqlite3.Connection, run_id: UUID) -> RestartRunContext:
+        evaluated_at = self._store._now()
         row = connection.execute(
             """
             SELECT run.*, plan.*,
+                   limits.max_pages,
+                   limits.max_calls,
+                   limits.max_pages_per_request,
+                   limits.max_calls_per_request,
+                   limits.limits_hash,
                    run.policy_snapshot_id AS run_policy_snapshot_id,
                    run.status AS run_status
             FROM ingestion_runs AS run
             JOIN ingestion_plan_records AS plan ON plan.run_id = run.run_id
+            JOIN ingestion_execution_limits AS limits ON limits.run_id = run.run_id
             WHERE run.run_id = ?
             """,
             (str(run_id),),
@@ -455,16 +523,25 @@ class RestartProjectionReader:
             raise RestartProjectionIntegrityError("run policy scope is inconsistent")
 
         environment = RuntimeEnvironment(str(row["environment"]))
+        authorized_at = _parse_utc(str(row["authorized_at"]))
+        # ``policy_snapshot_id`` identifies the semantic policy revision and is
+        # intentionally reused across runs.  The authorization snapshot carried
+        # by a reconstructed plan is nevertheless captured at that run's exact
+        # authorization time, not at the first use of the semantic policy row.
+        policy = policy.model_copy(update={"captured_at": authorized_at})
         planning_authorization = PlanningPolicyAuthorization(
             policy_snapshot=policy,
             environment=environment,
             eligible_before=_parse_utc(str(row["safe_end"])),
-            authorized_at=_parse_utc(str(row["authorized_at"])),
+            authorized_at=authorized_at,
         )
         streams = self._load_plan_streams(connection, run_id)
         request_rows = connection.execute(
             """
             SELECT instance.*, spec.*, estimate.*,
+                   request_limit.max_pages AS request_max_pages,
+                   request_limit.max_calls AS request_max_calls,
+                   request_limit.limits_hash AS request_limits_hash,
                    instance.request_instance_id AS instance_id,
                    instance.status AS instance_status,
                    retry.retry_count, retry.max_attempts,
@@ -473,6 +550,9 @@ class RestartProjectionReader:
             JOIN request_specs AS spec ON spec.request_spec_id = instance.request_spec_id
             JOIN request_plan_estimates AS estimate
               ON estimate.request_instance_id = instance.request_instance_id
+            JOIN request_execution_limits AS request_limit
+              ON request_limit.request_instance_id = instance.request_instance_id
+             AND request_limit.run_id = instance.run_id
             JOIN retry_state AS retry
               ON retry.request_instance_id = instance.request_instance_id
             WHERE instance.run_id = ?
@@ -562,16 +642,22 @@ class RestartProjectionReader:
             calendar_snapshot_id=str(row["calendar_snapshot_id"]),
             reason=str(row["reason"]),
             max_attempts=int(row["max_attempts"]),
+            max_pages=int(row["max_pages"]),
+            max_calls=int(row["max_calls"]),
+            max_pages_per_request=int(row["max_pages_per_request"]),
+            max_calls_per_request=int(row["max_calls_per_request"]),
             plan=plan,
         )
         if (
             _plan_hash(persistence) != str(row["plan_hash"])
+            or _execution_limits_hash(persistence) != str(row["limits_hash"])
             or deterministic_catalog_snapshot_id(policy) != str(row["catalog_snapshot_id"])
             or deterministic_calendar_snapshot_id(calendar) != str(row["calendar_snapshot_id"])
         ):
             raise RestartProjectionIntegrityError("plan content identity is inconsistent")
 
         projections: list[RestartRequestProjection] = []
+        allocated_limits = _allocate_request_execution_limits(persistence)
         for request_row, specification, authorization in zip(
             request_rows, specifications, authorizations, strict=True
         ):
@@ -586,6 +672,21 @@ class RestartProjectionReader:
                 or str(request_row["intent"]) != plan.intent.value
             ):
                 raise RestartProjectionIntegrityError("request instance identity is inconsistent")
+            allocated_pages, allocated_calls = allocated_limits[int(request_row["plan_ordinal"])]
+            if (
+                int(request_row["request_max_pages"]) != allocated_pages
+                or int(request_row["request_max_calls"]) != allocated_calls
+                or str(request_row["request_limits_hash"])
+                != _request_execution_limits_hash(
+                    run_id,
+                    identity.request_instance_id,
+                    max_pages=allocated_pages,
+                    max_calls=allocated_calls,
+                )
+            ):
+                raise RestartProjectionIntegrityError(
+                    "request dispatch limits are inconsistent"
+                )
             status = RequestInstanceStatus(str(request_row["instance_status"]))
             attempts = self._load_attempts(
                 connection,
@@ -600,13 +701,37 @@ class RestartProjectionReader:
                 calendar=calendar,
                 attempts=attempts,
             )
+            semantic_noop_committed = self._load_semantic_noop(
+                connection,
+                request_instance_id=identity.request_instance_id,
+                specification=specification,
+                latest=latest,
+                policy_snapshot_id=str(row["policy_snapshot_id"]),
+                evaluated_at=evaluated_at,
+            )
+            nonpublication_partial_committed = self._load_nonpublication_partial(
+                connection,
+                request_instance_id=identity.request_instance_id,
+                specification=specification,
+                latest=latest,
+                policy_snapshot_id=str(row["policy_snapshot_id"]),
+            )
+            retry_count = int(request_row["retry_count"])
+            max_attempts = int(request_row["max_attempts"])
+            retry_next_eligible_at = _parse_optional_utc(request_row["retry_next_eligible_at"])
             action = self._derive_action(
                 run_status=run_status,
                 request_status=status,
                 latest=latest,
                 publication=publication,
+                semantic_noop_committed=semantic_noop_committed,
+                nonpublication_partial_committed=nonpublication_partial_committed,
                 policy_current=policy_current,
                 calendar_current=calendar_current,
+                retry_count=retry_count,
+                max_attempts=max_attempts,
+                next_eligible_at=retry_next_eligible_at,
+                evaluated_at=evaluated_at,
             )
             projections.append(
                 RestartRequestProjection(
@@ -617,11 +742,15 @@ class RestartProjectionReader:
                     authorization=authorization,
                     expected_slot_count=int(request_row["expected_slot_count"]),
                     expected_observation_count=int(request_row["expected_observation_count"]),
-                    max_attempts=int(request_row["max_attempts"]),
-                    retry_count=int(request_row["retry_count"]),
-                    next_eligible_at=_parse_optional_utc(request_row["retry_next_eligible_at"]),
+                    max_pages=allocated_pages,
+                    max_calls=allocated_calls,
+                    max_attempts=max_attempts,
+                    retry_count=retry_count,
+                    next_eligible_at=retry_next_eligible_at,
                     latest_attempt=latest,
                     publication=publication,
+                    semantic_noop_committed=semantic_noop_committed,
+                    nonpublication_partial_committed=nonpublication_partial_committed,
                     action=action,
                 )
             )
@@ -1135,6 +1264,308 @@ class RestartProjectionReader:
             publication_committed=state is PublicationRecoveryState.CATALOGED,
         )
 
+    def _load_semantic_noop(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        request_instance_id: UUID,
+        specification: RequestSpecification,
+        latest: RestartAttemptProjection | None,
+        policy_snapshot_id: str,
+        evaluated_at: datetime,
+    ) -> bool:
+        row = connection.execute(
+            """
+            SELECT noop.*, instance.status AS request_status,
+                   attempt.status AS attempt_status,
+                   acquisition.authorization_hash,
+                   context_request.batch_context_id AS linked_batch_context_id,
+                   contract.processing_signature_hash,
+                    active.status AS active_policy_status,
+                    active.policy_snapshot_id AS active_policy_snapshot_id,
+                    active.retention_mode AS active_retention_mode,
+                    active.expires_at AS active_policy_expires_at,
+                    active.unavailable_at AS active_policy_unavailable_at
+            FROM semantic_noop_commits AS noop
+            JOIN request_instances AS instance
+              ON instance.request_instance_id = noop.request_instance_id
+            JOIN request_attempts AS attempt ON attempt.attempt_id = noop.attempt_id
+            JOIN attempt_acquisition_records AS acquisition
+              ON acquisition.attempt_id = noop.attempt_id
+            JOIN batch_context_requests AS context_request
+              ON context_request.batch_context_id = noop.batch_context_id
+             AND context_request.request_instance_id = noop.request_instance_id
+            JOIN batch_context_processing_contracts AS contract
+              ON contract.batch_context_id = noop.batch_context_id
+            LEFT JOIN dataset_policy_status AS active
+              ON active.provider = ? AND active.dataset = ?
+            WHERE noop.request_instance_id = ?
+            """,
+            (
+                specification.provider,
+                specification.dataset,
+                str(request_instance_id),
+            ),
+        ).fetchone()
+        if row is None:
+            return False
+        if latest is None or latest.acquisition_authorization is None:
+            raise RestartProjectionIntegrityError(
+                "semantic no-op lacks a completed acquisition attempt"
+            )
+        try:
+            observation_payload = _strict_json(str(row["duplicate_observations_json"]))
+            if not isinstance(observation_payload, list):
+                raise ValueError("semantic no-op observations are not a list")
+            observations = tuple(
+                SemanticNoOpObservationProof.model_validate(value) for value in observation_payload
+            )
+        except (ValueError, ValidationError, json.JSONDecodeError) as error:
+            raise RestartProjectionIntegrityError(
+                "semantic no-op observation proof is invalid"
+            ) from error
+        canonical_observations = [
+            {
+                "end": _format_utc(value.end),
+                "matching_supporting_batch_ids": list(value.matching_supporting_batch_ids),
+                "observation_id": value.observation_id,
+                "start": _format_utc(value.start),
+                "stream_id": value.stream_id,
+                "value_fingerprint": value.value_fingerprint,
+            }
+            for value in observations
+        ]
+        expected_order = tuple(
+            sorted(
+                observations,
+                key=lambda value: (value.start, value.stream_id, value.observation_id),
+            )
+        )
+        duplicate_count = len(observations)
+        observation_support = tuple(
+            sorted(
+                {
+                    batch_id
+                    for observation in observations
+                    for batch_id in observation.matching_supporting_batch_ids
+                }
+            )
+        )
+        supporting = tuple(
+            str(value["canonical_batch_id"])
+            for value in connection.execute(
+                """
+                SELECT canonical_batch_id FROM semantic_noop_supporting_batches
+                WHERE request_instance_id = ? ORDER BY canonical_batch_id
+                """,
+                (str(request_instance_id),),
+            ).fetchall()
+        )
+        proof_payload = {
+            "acquisition_authorization_hash": str(row["acquisition_authorization_hash"]),
+            "attempt_id": str(row["attempt_id"]),
+            "batch_context_id": str(row["batch_context_id"]),
+            "duplicate_observations_hash": str(row["duplicate_observations_hash"]),
+            "processing_signature_hash": str(row["processing_signature_hash"]),
+            "request_instance_id": str(request_instance_id),
+            "request_spec_id": specification.request_spec_id,
+            "semantic_duplicate_count": duplicate_count,
+            "supporting_batch_ids": list(supporting),
+            "version": 1,
+        }
+        if (
+            str(row["request_spec_id"]) != specification.request_spec_id
+            or str(row["batch_context_id"]) != str(row["linked_batch_context_id"])
+            or str(row["policy_snapshot_id"]) != policy_snapshot_id
+            or str(row["request_status"]) != RequestInstanceStatus.SUCCESS.value
+            or str(row["attempt_status"]) != AttemptStatus.SUCCESS.value
+            or str(row["attempt_id"]) != str(latest.attempt_id)
+            or str(row["authorization_hash"]) != str(row["acquisition_authorization_hash"])
+            or _hash_json(latest.acquisition_authorization.model_dump(mode="json"))
+            != str(row["acquisition_authorization_hash"])
+            or _canonical_json(canonical_observations) != str(row["duplicate_observations_json"])
+            or _hash_json(canonical_observations) != str(row["duplicate_observations_hash"])
+            or duplicate_count != int(row["semantic_duplicate_count"])
+            or not observations
+            or observations != expected_order
+            or len({value.observation_id for value in observations}) != duplicate_count
+            or {value.stream_id for value in observations}
+            != {stream.stream_id for stream in specification.stream_keys()}
+            or any(
+                value.start < specification.start or value.end > specification.end
+                for value in observations
+            )
+            or observation_support != supporting
+            or not supporting
+            or _hash_json(proof_payload) != str(row["proof_hash"])
+            or str(row["active_policy_status"]) != DatasetPolicyStatus.ACTIVE.value
+            or str(row["active_policy_snapshot_id"]) != policy_snapshot_id
+            or str(row["active_retention_mode"])
+            in {RetentionMode.PROHIBITED.value, RetentionMode.EPHEMERAL.value}
+            or (
+                row["active_policy_expires_at"] is not None
+                and _parse_utc(str(row["active_policy_expires_at"])) <= evaluated_at
+            )
+            or row["active_policy_unavailable_at"] is not None
+        ):
+            raise RestartProjectionIntegrityError("semantic no-op terminal proof is inconsistent")
+        support_rows = connection.execute(
+            """
+            SELECT link.canonical_batch_id, batch.state, batch.policy_snapshot_id,
+                   spec.provider, spec.dataset,
+                   contract.processing_signature_hash,
+                   count(file.relative_path) AS file_count
+            FROM semantic_noop_supporting_batches AS link
+            JOIN canonical_batches AS batch
+              ON batch.canonical_batch_id = link.canonical_batch_id
+            JOIN batch_contexts AS context
+              ON context.batch_context_id = batch.batch_context_id
+            JOIN request_specs AS spec ON spec.request_spec_id = context.request_spec_id
+            JOIN batch_context_processing_contracts AS contract
+              ON contract.batch_context_id = context.batch_context_id
+            LEFT JOIN canonical_files AS file
+              ON file.canonical_batch_id = batch.canonical_batch_id
+            WHERE link.request_instance_id = ?
+            GROUP BY link.canonical_batch_id
+            ORDER BY link.canonical_batch_id
+            """,
+            (str(request_instance_id),),
+        ).fetchall()
+        if len(support_rows) != len(supporting) or any(
+            str(value["state"]) != "VERIFIED"
+            or str(value["policy_snapshot_id"]) != policy_snapshot_id
+            or (str(value["provider"]), str(value["dataset"]))
+            != (specification.provider, specification.dataset)
+            or str(value["processing_signature_hash"]) != str(row["processing_signature_hash"])
+            or int(value["file_count"]) <= 0
+            for value in support_rows
+        ):
+            raise RestartProjectionIntegrityError(
+                "semantic no-op supporting catalog proof is no longer valid"
+            )
+        return True
+
+    def _load_nonpublication_partial(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        request_instance_id: UUID,
+        specification: RequestSpecification,
+        latest: RestartAttemptProjection | None,
+        policy_snapshot_id: str,
+    ) -> bool:
+        rows = connection.execute(
+            """
+            SELECT quarantine.batch_context_id, quarantine.policy_snapshot_id,
+                   quarantine.validation_summary_json, quarantine.state,
+                   error.attempt_id, error.category, error.code,
+                   error.sanitized_message, error.retryable
+            FROM batch_context_requests AS context_request
+            JOIN quarantine_artifacts AS quarantine
+              ON quarantine.batch_context_id = context_request.batch_context_id
+            JOIN errors AS error
+              ON error.request_instance_id = context_request.request_instance_id
+            WHERE context_request.request_instance_id = ?
+              AND error.code = 'PARTIAL_STREAMS_BLOCKED'
+            ORDER BY quarantine.quarantine_artifact_id, error.error_id
+            """,
+            (str(request_instance_id),),
+        ).fetchall()
+        if not rows:
+            return False
+        if len(rows) != 1 or latest is None:
+            raise RestartProjectionIntegrityError(
+                "partial non-publication outcome has ambiguous durable evidence"
+            )
+        row = rows[0]
+        try:
+            summary = _strict_json(str(row["validation_summary_json"]))
+        except (ValueError, json.JSONDecodeError) as error:
+            raise RestartProjectionIntegrityError(
+                "partial non-publication quarantine proof is invalid"
+            ) from error
+        if (
+            not isinstance(summary, dict)
+            or set(summary) != {"blocked_streams", "schema_version"}
+            or summary["schema_version"] != 1
+            or not isinstance(summary["blocked_streams"], list)
+            or not summary["blocked_streams"]
+            or _canonical_json(summary) != str(row["validation_summary_json"])
+        ):
+            raise RestartProjectionIntegrityError(
+                "partial non-publication quarantine proof is malformed"
+            )
+        blocked: list[tuple[str, datetime, datetime]] = []
+        for value in summary["blocked_streams"]:
+            if (
+                not isinstance(value, dict)
+                or set(value) != {"request_end", "request_start", "stream_id", "validation_codes"}
+                or not isinstance(value["stream_id"], str)
+                or not isinstance(value["request_start"], str)
+                or not isinstance(value["request_end"], str)
+                or not isinstance(value["validation_codes"], list)
+                or not value["validation_codes"]
+                or any(not isinstance(code, str) for code in value["validation_codes"])
+            ):
+                raise RestartProjectionIntegrityError(
+                    "partial non-publication blocked-stream proof is malformed"
+                )
+            blocked.append(
+                (
+                    value["stream_id"],
+                    _parse_utc(value["request_start"]),
+                    _parse_utc(value["request_end"]),
+                )
+            )
+        gap_rows = connection.execute(
+            """
+            SELECT stream_id, interval_start, interval_end, gap_type, status,
+                   blocking, resolved_at, canonical_batch_id
+            FROM gaps
+            WHERE request_instance_id = ?
+            ORDER BY stream_id, interval_start, interval_end
+            """,
+            (str(request_instance_id),),
+        ).fetchall()
+        gaps = tuple(
+            (
+                str(value["stream_id"]),
+                _parse_utc(str(value["interval_start"])),
+                _parse_utc(str(value["interval_end"])),
+            )
+            for value in gap_rows
+        )
+        expected_streams = {stream.stream_id for stream in specification.stream_keys()}
+        if (
+            str(row["state"]) != "VERIFIED"
+            or str(row["policy_snapshot_id"]) != policy_snapshot_id
+            or str(row["attempt_id"]) != str(latest.attempt_id)
+            or latest.status is not AttemptStatus.SUCCESS
+            or str(row["category"]) != "VALIDATION"
+            or int(row["retryable"]) != 0
+            or not str(row["sanitized_message"])
+            or len(set(blocked)) != len(blocked)
+            or any(
+                stream_id not in expected_streams
+                or start != specification.start
+                or end != specification.end
+                for stream_id, start, end in blocked
+            )
+            or tuple(sorted(blocked)) != gaps
+            or any(
+                str(value["gap_type"]) != "INTEGRITY"
+                or str(value["status"]) != "OPEN"
+                or not _as_bool(value["blocking"])
+                or value["resolved_at"] is not None
+                or value["canonical_batch_id"] is not None
+                for value in gap_rows
+            )
+        ):
+            raise RestartProjectionIntegrityError(
+                "partial non-publication terminal proof is inconsistent"
+            )
+        return True
+
     @staticmethod
     def _derive_action(
         *,
@@ -1142,8 +1573,14 @@ class RestartProjectionReader:
         request_status: RequestInstanceStatus,
         latest: RestartAttemptProjection | None,
         publication: RestartPublicationProjection | None,
+        semantic_noop_committed: bool,
+        nonpublication_partial_committed: bool,
         policy_current: bool,
         calendar_current: bool,
+        retry_count: int,
+        max_attempts: int,
+        next_eligible_at: datetime | None,
+        evaluated_at: datetime,
     ) -> RestartAction:
         if request_status in _TERMINAL_REQUESTS:
             if request_status in {
@@ -1152,8 +1589,17 @@ class RestartProjectionReader:
             } and (
                 latest is None
                 or latest.status is not AttemptStatus.SUCCESS
-                or publication is None
-                or publication.state is not PublicationRecoveryState.CATALOGED
+                or (
+                    not semantic_noop_committed
+                    and not (
+                        request_status is RequestInstanceStatus.PARTIAL
+                        and nonpublication_partial_committed
+                    )
+                    and (
+                        publication is None
+                        or publication.state is not PublicationRecoveryState.CATALOGED
+                    )
+                )
             ):
                 raise RestartProjectionIntegrityError(
                     "successful request lacks terminal publication proof"
@@ -1170,7 +1616,20 @@ class RestartProjectionReader:
         if request_status is RequestInstanceStatus.RETRY_WAIT:
             if latest is None or latest.status is not AttemptStatus.RETRYABLE_FAILED:
                 raise RestartProjectionIntegrityError("retry state lacks a retryable attempt")
-            return RestartAction.WAIT_RETRY
+            if (
+                next_eligible_at is None
+                or latest.next_eligible_at != next_eligible_at
+                or retry_count != latest.attempt_number
+                or retry_count >= max_attempts
+            ):
+                raise RestartProjectionIntegrityError(
+                    "retry state is inconsistent with attempt history or limits"
+                )
+            return (
+                RestartAction.RETRY_DISPATCH
+                if next_eligible_at <= evaluated_at
+                else RestartAction.WAIT_RETRY
+            )
         if request_status is RequestInstanceStatus.PLANNED:
             if latest is not None:
                 raise RestartProjectionIntegrityError("planned request unexpectedly has an attempt")
@@ -1656,14 +2115,14 @@ class RestartProjectionReader:
         ):
             raise RestartProjectionIntegrityError("watermark lacks contiguous calendar coverage")
         active_gaps = tuple(
-            gap
-            for gap in gaps
-            if gap.stream_id == watermark.stream_id
-            and gap.actively_blocks
-            and gap.start < watermark.exclusive_frontier
-            and gap.end > watermark.coverage_start
+            gap for gap in gaps if gap.stream_id == watermark.stream_id and gap.actively_blocks
         )
-        if len(active_gaps) != watermark.blocking_gap_count or active_gaps:
+        prefix_gaps = tuple(
+            gap
+            for gap in active_gaps
+            if gap.start < watermark.exclusive_frontier and gap.end > watermark.coverage_start
+        )
+        if len(active_gaps) != watermark.blocking_gap_count or prefix_gaps:
             raise RestartProjectionIntegrityError("verified watermark disagrees with blocking gaps")
         return watermark
 

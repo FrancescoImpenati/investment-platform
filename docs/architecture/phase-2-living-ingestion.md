@@ -1,7 +1,7 @@
 # Phase 2 — Living Data Ingestion
 
-- **Status:** Design complete; implementation not started
-- **Date:** 2026-08-31
+- **Status:** Design approved; offline implementation checkpoint present; live acceptance pending
+- **Date:** 2026-09-01
 - **Baseline:** main at 76e3ffd, including approved Phase 0, Phase 1, and Databento research
 - **Implementation contract:** [PLAN_PHASE_2.md](../../PLAN_PHASE_2.md)
 - **Scope:** local persistent historical market-data ingestion for private research
@@ -56,9 +56,9 @@ The complete corporate-action source remains unresolved. That does not block una
 explicitly provider-adjusted historical bar ingestion. Phase 2 must not imply that provider
 adjustment solves point-in-time corporate actions.
 
-## 3. Current implementation reconstructed
+## 3. Implementation state
 
-### 3.1 Implemented through Phase 1
+### 3.1 Baseline implemented through Phase 1 at design approval
 
 The repository already implements:
 
@@ -79,7 +79,7 @@ The repository already implements:
 The provider quality report records the empirical result. The Databento report is approved
 research only and adds no adapter or persistence behavior.
 
-### 3.2 Designed previously, but not implemented
+### 3.2 Designed previously, but not implemented at design approval
 
 The Phase 0 design already anticipated:
 
@@ -91,9 +91,9 @@ The Phase 0 design already anticipated:
 
 Those passages were forward-looking and must not be reported as current capabilities.
 
-### 3.3 Missing before Phase 2 implementation
+### 3.3 Gaps identified at design approval
 
-The repository does not yet contain:
+At design approval the repository did not contain:
 
 - runtime environment profiles;
 - a durable external private data-root contract with a sentinel;
@@ -106,13 +106,38 @@ The repository does not yet contain:
 - a maintained exchange calendar;
 - a user-facing ingestion CLI or scheduler integration.
 
-The current provider response transport is bounded but materializes each HTTP response in memory.
-The raw payload boundary permits file-backed payloads, but the live transport does not yet spool
-large pages directly to the private root.
+At that baseline the provider response transport was bounded but materialized each HTTP response
+in memory. The raw payload boundary permitted file-backed payloads, but the live transport did not
+spool large pages directly to the private root.
 
-The current Parquet store publishes the files of a multi-part batch individually and discovers
-files by glob. An abrupt process crash can therefore leave a partial batch visible. Phase 2 must
-replace that publication behavior for living ingestion.
+At that baseline the Parquet store published the files of a multi-part batch individually and
+discovered files by glob. An abrupt process crash could therefore leave a partial batch visible.
+
+### 3.4 Implemented in the current offline checkpoint
+
+The Phase 2 source and synthetic test suite now implement:
+
+- the five runtime profiles and their fail-closed capability matrix;
+- explicit initialization and repeated validation of an external sentinel-owned private root;
+- an exact machine-readable retention catalog and enforcement at request, storage, query,
+  quarantine, watermark, export, and purge boundaries;
+- standard-library SQLite migrations, operational repositories, short transactions, diagnostics,
+  and a durable single-writer lease;
+- a provider-neutral XNYS calendar adapter with immutable snapshots, expected 1d/5m RTH slots,
+  calendar-diff reconciliation, and deterministic checksums;
+- deterministic stream/request/artifact/batch/observation identities, bounded planning, budgets,
+  and persisted progress for backfill, update, repair, and resume;
+- bounded file-backed response spooling, raw-first immutable publication, atomic canonical batch
+  publication, catalog-driven DuckDB visibility, and crash recovery;
+- retention-aware coverage, gap episodes, reconstructed watermarks, semantic no-op handling,
+  same-provider revision provenance, and state-first invalidation/purge;
+- a non-interactive CLI for root initialization, ingestion, resume, status, verify, and retention;
+- offline synthetic integration and fault-injection tests covering restart, incremental no-op,
+  gap repair, raw replay, orphan adoption, pacing, publication failures, and integrity loss.
+
+No real Alpaca payload has been persisted by this checkpoint. The private root/evidence gate,
+controlled AAPL and 16-security acceptance, external scheduler activation, final Phase 2 pull
+request, and Phase 2 approval remain pending. Phase 3 has not started.
 
 ## 4. Architectural invariants
 
@@ -496,7 +521,7 @@ SQLite fits the Phase 2 deployment:
 - constraints, indexes, foreign keys, migrations, and restart recovery;
 - one local machine and one ingestion writer with concurrent status readers.
 
-Planned connection policy:
+Implemented connection policy:
 
 - foreign_keys=ON;
 - journal_mode=WAL, with failure if the local VFS cannot enable it;
@@ -553,10 +578,25 @@ sessions(start_date, end_date)
 -> (session_date, open_utc, close_utc, calendar_snapshot_id)
 ~~~
 
-The initial implementation should evaluate and adopt exchange_calendars with calendar XNYS behind
-that boundary. It provides maintained sessions and regular-trading open/close semantics for NYSE.
-Its current project metadata declares Python 3.13 support and its documented API exposes XNYS
-sessions and UTC schedule values:
+The offline implementation adopts `exchange-calendars` with calendar XNYS behind that boundary.
+It provides maintained sessions and regular-trading open/close semantics for NYSE. The dependency
+gate was resolved in the locked project environment as follows:
+
+| Gate fact | Verified resolution |
+| --- | --- |
+| Project Python | 3.13.14 |
+| `exchange-calendars` | 4.13.2, constrained to `>=4.13.2,<5` and locked by uv |
+| Declared Python range | `>=3.10,<4` |
+| Direct calendar dependencies in the lock | korean-lunar-calendar, NumPy, Pandas, python-dateutil, pyluach, toolz, and tzdata |
+| Boundary proof | XNYS is imported only by the calendar adapter; adapter tests cover ordinary sessions, the 2025-07-03 early close, DST, holidays, half-open bounds, counts, and checksums |
+
+The resolved installed-package metadata records Apache-2.0 for `exchange-calendars` and `tzdata`,
+MIT for `korean-lunar-calendar`, BSD-3-Clause for Pandas and toolz, a dual-license marker for
+python-dateutil, and a permissive license expression for NumPy. The installed pyluach metadata does
+not declare a license field, so this record does not infer one. This inventory records the
+dependency-gate observation; it is not a legal opinion or a substitute for upstream license files.
+
+Package and API references used by the architectural decision remain:
 
 - [exchange_calendars package and examples](https://pypi.org/project/exchange-calendars/);
 - [current dependency metadata](https://github.com/gerrymanoim/exchange_calendars/blob/master/pyproject.toml).
@@ -566,11 +606,10 @@ adding another wrapper without a Phase 2 need. Annual exchange PDFs remain autho
 regression evidence, not a manually copied production calendar. A custom multi-year holiday table
 is rejected.
 
-exchange_calendars currently brings Pandas and NumPy transitively. That is a deliberate,
+`exchange-calendars` brings Pandas and NumPy transitively. The accepted dependency is a deliberate,
 calendar-only exception to the default dependency policy, not permission to introduce Pandas into
-domain or analytical transformations. The implementation milestone must first verify the locked
-Python 3.13 resolution, package licenses, and the frozen Phase 1 session regressions. If it fails
-that gate, the calendar decision returns for review rather than silently hard-coding dates.
+domain or analytical transformations. Both libraries remain confined behind the adapter from the
+platform's point of view; the rest of the project continues to use Polars for columnar work.
 
 Each persisted calendar snapshot records:
 
@@ -1026,7 +1065,8 @@ required to make the store living.
 
 ## 19. Manual CLI and external scheduling
 
-Phase 2 plans a small standard-library command-line entry point, with commands equivalent to:
+The offline checkpoint implements a small standard-library command-line entry point with these
+command families:
 
 ~~~text
 investment-platform data-root init
@@ -1038,13 +1078,15 @@ investment-platform verify
 investment-platform retention enforce
 ~~~
 
-Commands are bounded, idempotent, restartable, and return stable nonzero exit codes for incomplete
-or failed work. status and verify expose sanitized counts, intervals, gaps, state, and IDs without
-market-data values or credentials.
+Commands are bounded, idempotent, restartable, and return stable nonzero exit codes for invalid
+configuration, incomplete work, failed work, and failed verification. status and verify expose
+sanitized counts, intervals, gaps, state, and IDs without market-data values or credentials.
 
-update accepts all configuration from the explicit profile, environment, policy catalog, and
-non-secret arguments. After manual acceptance it can be invoked unchanged by Windows Task
-Scheduler, cron, or another external scheduler.
+update accepts all configuration from the explicit profile, process environment, policy catalog,
+and non-secret arguments. Scheduler command templates are documented in the
+[operator guide](../operations/living-ingestion.md), but no schedule is activated. Only after
+manual live acceptance may the same command be invoked by Windows Task Scheduler, cron, or another
+external scheduler.
 
 Phase 2 does not introduce Celery, Redis, Kafka, a daemon, a queue, a cloud orchestrator, or an
 internal scheduler.
@@ -1069,10 +1111,13 @@ The controlled live progression is:
 4. a deliberately bounded larger subset;
 5. full current S&P 500 only after all prior acceptance gates.
 
-No real download is part of this design task. Phase 2 implementation must estimate and confirm
-each live request before expanding scope.
+No real download occurred in the offline checkpoint. Controlled live acceptance must estimate and
+confirm each request before expanding scope.
 
 ## 21. Acceptance design
+
+The [sanitized acceptance record](../operations/phase-2-acceptance.md) distinguishes the implemented
+offline checkpoint from the still-pending controlled live progression.
 
 ### 21.1 Environment isolation
 
@@ -1136,9 +1181,11 @@ Fault injection proves:
 - all normal tests remain offline and deterministic;
 - formatting, lint, typing, tests, build, diff, Git-ignore, tracked-data, and secret scans pass.
 
-## 22. Implementation milestones
+## 22. Implementation milestones and current status
 
-Milestones are internal ordering within Phase 2, not new official phases:
+Milestones are internal ordering within Phase 2, not new official phases. Items 1–10 are
+implemented and exercised offline with synthetic data; item 11 is pending, and item 12 is
+documented but deliberately not activated:
 
 1. environment capability matrix and configuration hierarchy;
 2. external root initialization, sentinel, path guards, and safe staging;
@@ -1150,8 +1197,8 @@ Milestones are internal ordering within Phase 2, not new official phases:
 8. manual synthetic and one-security backfill;
 9. incremental update, no-op, status, and verify;
 10. repair/revision handling and retention invalidation/purge;
-11. progressive 1 -> 16 -> larger-subset live acceptance;
-12. external scheduler invocation documentation only after manual reliability.
+11. **Pending:** progressive 1 -> 16 -> larger-subset live acceptance;
+12. **Documentation only:** external scheduler invocation after manual reliability.
 
 PLAN_PHASE_2.md owns the detailed deliverables and gates.
 
@@ -1160,12 +1207,10 @@ PLAN_PHASE_2.md owns the detailed deliverables and gates.
 There are no unresolved architectural questions that block starting the narrow Alpaca SIP
 implementation.
 
-The following are implementation or pre-live gates, not design blockers:
+The following are pre-live gates, not design blockers:
 
 - choose and initialize the actual external private-root path;
 - place the complete ticket evidence at the documented private location;
-- validate the current exchange_calendars resolution, licenses, and Phase 1 session cases before
-  adding the dependency;
 - calibrate Alpaca request partition size and conservative finalization buffer with the
   one-security acceptance;
 - activate no Twelve Data durable stream until its exact dataset policy and subscription status
@@ -1192,13 +1237,13 @@ data. It does not authorize a backtesting engine in Phase 2.
 
 ## 25. Readiness verdict
 
-**READY FOR PHASE 2 IMPLEMENTATION**
+**OFFLINE IMPLEMENTATION READY FOR CONTROLLED LIVE ACCEPTANCE**
 
-The provider pipeline, raw-first boundary, canonical schema, and empirical Alpaca SIP evidence
-already exist. The new written Alpaca authorization removes the durable-retention blocker for the
-initial dataset. The design now fixes the missing security boundary, dataset policy, operational
-store, calendar, identity, publication, recovery, coverage, watermark, and acceptance contracts
-without expanding into later analytical or product phases.
+The approved design has been implemented through its synthetic/offline gates without expanding
+into later analytical or product phases. The dependency gate and offline safety contracts are
+resolved. Phase 2 is not complete: a safe initialized external root with the actual private
+evidence, controlled Alpaca SIP acceptance, final quality review, pull request, and CI confirmation
+are still required. This is not authorization to start Phase 3.
 
 ## 26. Learning notes
 

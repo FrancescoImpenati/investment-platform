@@ -14,6 +14,7 @@ import pytest
 
 from investment_platform.data_root import (
     ALPACA_EVIDENCE_RELATIVE_PATH,
+    MANAGED_NAMESPACES,
     SENTINEL_NAME,
     SENTINEL_PURPOSE,
     PrivateDataRoot,
@@ -98,7 +99,7 @@ def test_initialize_is_idempotent_and_persists_the_exact_sentinel_contract(
     assert UUID(str(document["root_id"])) == first.root_id
 
 
-def test_initialize_creates_only_the_expected_private_evidence_locator(
+def test_initialize_creates_the_complete_approved_layout_and_empty_evidence_locator(
     initialized_private_root: tuple[PrivateDataRoot, PrivateRootSentinel],
 ) -> None:
     private_root, _ = initialized_private_root
@@ -107,10 +108,11 @@ def test_initialize_creates_only_the_expected_private_evidence_locator(
         private_root.root / ALPACA_EVIDENCE_RELATIVE_PATH
     )
     assert private_root.alpaca_evidence_directory.is_dir()
-    assert sorted(path.name for path in private_root.root.iterdir()) == [
-        SENTINEL_NAME,
-        "governance",
-    ]
+    assert not tuple(private_root.alpaca_evidence_directory.iterdir())
+    assert sorted(path.name for path in private_root.root.iterdir()) == sorted(
+        (SENTINEL_NAME, *MANAGED_NAMESPACES)
+    )
+    assert all((private_root.root / namespace).is_dir() for namespace in MANAGED_NAMESPACES)
 
 
 def test_relative_private_root_is_rejected(repository_root: Path) -> None:

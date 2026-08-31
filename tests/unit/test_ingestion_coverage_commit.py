@@ -88,6 +88,7 @@ def _commit(
     existing_segments: Sequence[CoverageSegment] = (),
     existing_gaps: Sequence[GapFinding] = (),
     existing_watermarks: Sequence[MaterializedWatermark] = (),
+    semantic_duplicate_slots: Sequence[tuple[str, datetime, datetime]] = (),
 ) -> CoverageCommit:
     catalog = RetentionPolicyCatalog.load_default()
     policy = catalog.lookup("alpaca", "price_bars_sip")
@@ -107,6 +108,7 @@ def _commit(
         existing_segments=existing_segments,
         existing_gaps=existing_gaps,
         existing_watermarks=existing_watermarks,
+        semantic_duplicate_slots=semantic_duplicate_slots,
     )
 
 
@@ -144,7 +146,42 @@ def test_absent_alpaca_bar_is_blocking_gap_not_verified_empty() -> None:
     assert len(commit.gaps) == 1
     assert commit.gaps[0].status is GapStatus.OPEN
     assert commit.gaps[0].start == _OPEN + timedelta(minutes=5)
+    assert commit.segments[0].request_terminal_state.value == "PARTIAL"
     assert commit.watermarks[0].exclusive_frontier == _OPEN + timedelta(minutes=5)
+
+
+def test_explicit_semantic_duplicate_proof_uses_existing_coverage_without_gap() -> None:
+    complete = _prepare(
+        _specification(),
+        {
+            "XPH1": [
+                _bar("2025-07-02T13:30:00Z"),
+                _bar("2025-07-02T13:35:00Z"),
+            ]
+        },
+    )
+    complete_commit = _commit(complete)
+    changed_only = _prepare(
+        _specification(),
+        {"XPH1": [_bar("2025-07-02T13:30:00Z")]},
+    )
+    stream_id = changed_only.stream_outcomes[0].stream_id
+
+    commit = _commit(
+        changed_only,
+        existing_segments=complete_commit.segments,
+        existing_watermarks=complete_commit.watermarks,
+        semantic_duplicate_slots=(
+            (
+                stream_id,
+                _OPEN + timedelta(minutes=5),
+                _OPEN + timedelta(minutes=10),
+            ),
+        ),
+    )
+
+    assert commit.gaps == ()
+    assert commit.segments[0].request_terminal_state.value == "SUCCESS"
 
 
 def test_new_gap_below_existing_frontier_requires_invalidation_not_backward_watermark() -> None:
@@ -227,6 +264,49 @@ def test_repair_resolves_gap_and_advances_from_existing_coverage() -> None:
     assert repaired.gaps[0].canonical_batch_id == _manifest(repair).canonical_batch_id
     assert repaired.watermarks[0].exclusive_frontier == _OPEN + timedelta(minutes=10)
     assert repaired.watermarks[0].generation == 2
+
+
+def test_repair_resolves_every_active_episode_covered_by_the_batch() -> None:
+    first = _prepare(
+        _specification(),
+        {"XPH1": [_bar("2025-07-02T13:30:00Z")]},
+    )
+    first_commit = _commit(first)
+    first_gap = first_commit.gaps[0]
+    recurrence = first_gap.model_copy(
+        update={
+            "gap_id": "gap_v1_recurring_episode",
+            "request_instance_id": "60000000-0000-4000-8000-000000000002",
+        }
+    )
+    base = _specification()
+    repair_spec = RequestSpecification.model_validate(
+        {
+            **base.model_dump(mode="python"),
+            "start": _OPEN + timedelta(minutes=5),
+            "end": _OPEN + timedelta(minutes=10),
+        }
+    )
+    repair = _prepare(
+        repair_spec,
+        {"XPH1": [_bar("2025-07-02T13:35:00Z")]},
+    )
+
+    repaired = _commit(
+        repair,
+        existing_segments=first_commit.segments,
+        existing_gaps=(first_gap, recurrence),
+        existing_watermarks=first_commit.watermarks,
+    )
+
+    assert {gap.gap_id for gap in repaired.gaps} == {
+        first_gap.gap_id,
+        recurrence.gap_id,
+    }
+    assert all(gap.status is GapStatus.RESOLVED for gap in repaired.gaps)
+    assert all(
+        gap.canonical_batch_id == _manifest(repair).canonical_batch_id for gap in repaired.gaps
+    )
 
 
 def test_partial_repair_does_not_resolve_unrequested_remainder_of_larger_gap() -> None:

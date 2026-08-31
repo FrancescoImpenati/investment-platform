@@ -25,7 +25,9 @@ from investment_platform.data.ingestion.processing import (
     CanonicalProcessingError,
     PreparedCanonicalBatch,
     RawProcessingPage,
+    prepare_alpaca_sip_batch_context,
     prepare_alpaca_sip_canonical_batch,
+    prepare_alpaca_sip_canonical_batch_from_context,
 )
 from investment_platform.data.models import AdjustmentState, Timeframe, TradingSession
 from investment_platform.data.provenance import BytesRawPayload, RawBatch
@@ -207,6 +209,55 @@ def test_five_minute_preparation_is_deterministic_and_partitioned() -> None:
     assert first.parts[0].relative_path == "timeframe=5m/year=2025/month=07/part-0000.parquet"
     assert first.parts[0].frame.height == 2
     assert first.stream_outcomes[0].row_count == 2
+
+
+def test_context_is_frozen_before_normalization_and_reused_after_fault(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    specification = _specification()
+    pages, authorization = _processing_input(
+        specification,
+        {"XPH1": [_bar("2025-07-02T13:30:00Z")]},
+    )
+    frozen = prepare_alpaca_sip_batch_context(
+        specification=specification,
+        pages=pages,
+        acquisition_authorization=authorization,
+        calendar_snapshot=_calendar(),
+        fixed_ingested_at=_NOW + timedelta(minutes=1),
+        manifest_created_at=_NOW + timedelta(minutes=2),
+    )
+
+    def fail_normalization(*args: object, **kwargs: object) -> object:
+        raise RuntimeError("synthetic normalization crash")
+
+    monkeypatch.setattr(
+        "investment_platform.data.ingestion.processing.normalize_alpaca_bars",
+        fail_normalization,
+    )
+    with pytest.raises(RuntimeError, match="synthetic normalization crash"):
+        prepare_alpaca_sip_canonical_batch_from_context(
+            specification=specification,
+            pages=pages,
+            acquisition_authorization=authorization,
+            calendar_snapshot=_calendar(),
+            batch_context=frozen.batch_context,
+            provenance=frozen.provenance,
+        )
+
+    monkeypatch.undo()
+    recovered = prepare_alpaca_sip_canonical_batch_from_context(
+        specification=specification,
+        pages=pages,
+        acquisition_authorization=authorization,
+        calendar_snapshot=_calendar(),
+        batch_context=frozen.batch_context,
+        provenance=frozen.provenance,
+    )
+
+    assert recovered.batch_context is frozen.batch_context
+    assert recovered.batch_context.fixed_ingested_at == _NOW + timedelta(minutes=1)
+    assert recovered.batch_context.manifest_created_at == _NOW + timedelta(minutes=2)
 
 
 def test_multi_stream_request_publishes_independent_nonempty_stream() -> None:

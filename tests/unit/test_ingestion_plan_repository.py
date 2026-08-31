@@ -166,6 +166,8 @@ def _plan(
     intent: IngestionIntent = IngestionIntent.BACKFILL,
     repair_strategy: RepairStrategy | None = None,
     repair_reason: str | None = None,
+    max_expected_observations_per_request: int = 2,
+    max_run_dispatches: int = 3,
 ) -> IngestionPlan:
     return _planner(clock).plan(
         intent=intent,
@@ -182,7 +184,7 @@ def _plan(
         coverage=coverage,
         limits=PlannerLimits(
             max_instruments_per_request=1,
-            max_expected_observations_per_request=2,
+            max_expected_observations_per_request=max_expected_observations_per_request,
             max_observations_per_page=2,
             max_pages_per_request=1,
             max_calls_per_request=1,
@@ -193,11 +195,11 @@ def _plan(
             max_estimated_cost_per_request=Decimal("0.01"),
         ),
         budget=PlannerBudget(
-            max_calls=3,
+            max_calls=max_run_dispatches,
             max_expected_observations=6,
-            max_pages=3,
+            max_pages=max_run_dispatches,
             max_estimated_bytes=1_000,
-            max_estimated_cost=Decimal("0.03"),
+            max_estimated_cost=Decimal("0.01") * max_run_dispatches,
         ),
         environment=RuntimeEnvironment.TEST,
         mapping_semantic_version="synthetic-bars-request-v1",
@@ -613,6 +615,49 @@ def test_same_run_identity_with_different_plan_metadata_fails_without_overwrite(
         repository.persist(lease, collision)
 
     assert repository.load_progress(request.run_id).plan_hash == original.plan_hash
+
+
+def test_request_dispatch_headroom_is_allocated_within_the_run_ceiling(
+    store: OperationalStateStore,
+    lease: WriterLease,
+    clock: MutableClock,
+) -> None:
+    _persist_calendar(store, lease)
+    plan = _plan(
+        clock,
+        max_expected_observations_per_request=1,
+        max_run_dispatches=7,
+    )
+    assert len(plan.requests) == 6
+    request = PlanPersistenceRequest(
+        run_id=UUID(int=7),
+        calendar_snapshot_id=deterministic_calendar_snapshot_id(_snapshot()),
+        reason="bounded multi-request dispatch allocation",
+        max_attempts=3,
+        max_pages=7,
+        max_calls=7,
+        max_pages_per_request=2,
+        max_calls_per_request=2,
+        plan=plan,
+    )
+
+    IngestionPlanRepository(store).persist(lease, request)
+
+    with store.read_only_connection() as connection:
+        rows = connection.execute(
+            """
+            SELECT limits.max_pages, limits.max_calls
+            FROM request_instances AS instance
+            JOIN request_execution_limits AS limits
+              ON limits.request_instance_id = instance.request_instance_id
+            WHERE instance.run_id = ? ORDER BY instance.plan_ordinal
+            """,
+            (str(request.run_id),),
+        ).fetchall()
+    allocated = [tuple(int(value) for value in row) for row in rows]
+    assert allocated == [(2, 2), (1, 1), (1, 1), (1, 1), (1, 1), (1, 1)]
+    assert sum(value[0] for value in allocated) == request.max_pages
+    assert sum(value[1] for value in allocated) == request.max_calls
 
 
 def test_repair_strategy_and_reason_are_immutable_plan_provenance(

@@ -499,11 +499,14 @@ class RetentionPolicyCatalog:
         return self._document.content_hash
 
     def lookup(self, provider: str, dataset: str) -> DatasetRetentionPolicy:
-        key = (provider.strip().casefold(), dataset.strip().casefold())
+        # Provider/dataset is an authorization boundary, not user-facing search.
+        # Never repair casing or whitespace here: a caller must name the exact
+        # canonical key that was reviewed and cataloged, otherwise we fail closed.
+        key = (provider, dataset)
         policy = self._policies.get(key)
         if policy is None:
             raise DatasetPolicyDenied(
-                f"no active retention policy exists for exact dataset {key[0]}/{key[1]}"
+                "no active retention policy exists for the exact provider/dataset key"
             )
         return policy
 
@@ -542,6 +545,12 @@ class RetentionPolicyEnforcer:
     ) -> None:
         self._catalog = catalog
         self._clock = clock or (lambda: datetime.now(UTC))
+
+    @property
+    def catalog(self) -> RetentionPolicyCatalog:
+        """Expose the immutable committed catalog for exact runtime-status reconstruction."""
+
+        return self._catalog
 
     def _now(self) -> datetime:
         value = self._clock()

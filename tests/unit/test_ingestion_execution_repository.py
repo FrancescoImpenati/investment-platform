@@ -15,6 +15,10 @@ import polars as pl
 import pytest
 
 from investment_platform.data.calendar import CalendarSession, CalendarSnapshot
+from investment_platform.data.diagnostics import (
+    DiagnosticStatus,
+    Phase2OperationalDiagnostics,
+)
 from investment_platform.data.ingestion import (
     BarSemantics,
     BatchContext,
@@ -48,22 +52,31 @@ from investment_platform.data.models import (
     TradingSession,
 )
 from investment_platform.data.operational import (
+    AttemptFailureStatus,
     CalendarSnapshotRepository,
     CoverageCommit,
     ExecutionFaultPoint,
     ExecutionIdentityCollisionError,
     ExecutionIntegrityError,
+    ExecutionStateConflictError,
     IngestionExecutionRepository,
     IngestionPlanRepository,
     IngestionRunStatus,
     PlanPersistenceRequest,
     PublicationCommitRequest,
     PublicationCommitSource,
+    QuarantineArtifactRepository,
+    QuarantineCatalogIntegrityError,
     RequestInstanceStatus,
+    RestartProjectionReader,
     deterministic_calendar_snapshot_id,
     deterministic_policy_snapshot_id,
 )
-from investment_platform.data.operational.store import OperationalStateStore, _format_utc
+from investment_platform.data.operational.store import (
+    OperationalStateStore,
+    WriterLease,
+    _format_utc,
+)
 from investment_platform.data.provenance import (
     DataSource,
     LicenseClassification,
@@ -71,6 +84,7 @@ from investment_platform.data.provenance import (
 )
 from investment_platform.data.retention import (
     AcquisitionPolicyAuthorization,
+    DatasetPolicyDenied,
     RetentionPolicyCatalog,
     RetentionPolicyEnforcer,
 )
@@ -81,11 +95,15 @@ from investment_platform.data.storage import (
     CanonicalParquetPart,
     CanonicalPublicationProvenance,
     CanonicalStreamOutcome,
+    PublicationFaultPoint,
     PublishedCanonicalBatch,
     PublishedRawArtifact,
+    QuarantineArtifactManifest,
+    QuarantineArtifactPublisher,
     RawArtifactPublisher,
     RawProvenanceBinding,
     StreamPublicationOutcome,
+    deterministic_quarantine_artifact_id,
     price_bars_to_frame,
 )
 from investment_platform.data_root import PrivateDataRoot
@@ -550,6 +568,42 @@ def _prepare_scenario(
     )
 
 
+def _prepare_running_attempt(
+    store: OperationalStateStore,
+    clock: MutableClock,
+    *,
+    max_attempts: int = 3,
+) -> tuple[
+    IngestionExecutionRepository,
+    WriterLease,
+    AttemptIdentity,
+    PlanPersistenceRequest,
+]:
+    enforcer = RetentionPolicyEnforcer(RetentionPolicyCatalog.load_default(), clock=clock)
+    plan_request = _plan(enforcer).model_copy(update={"max_attempts": max_attempts})
+    lease = store.acquire_writer_lease("attempt-failure-test", timedelta(minutes=30))
+    CalendarSnapshotRepository(store).persist(lease, _calendar())
+    IngestionPlanRepository(store).persist(lease, plan_request)
+    request_id = (
+        IngestionPlanRepository(store)
+        .load_progress(plan_request.run_id)
+        .requests[0]
+        .request_instance_id
+    )
+    identity = AttemptIdentity(
+        attempt_id=_ATTEMPT_ID,
+        request_instance_id=request_id,
+        attempt_number=1,
+    )
+    repository = IngestionExecutionRepository(store)
+    repository.begin_attempt(
+        lease,
+        identity,
+        plan_request.plan.requests[0].authorization,
+    )
+    return repository, lease, identity, plan_request
+
+
 def test_publication_commit_is_atomic_restartable_and_replay_safe(tmp_path: Path) -> None:
     root = _private_root(tmp_path)
     clock = MutableClock(_NOW)
@@ -982,3 +1036,717 @@ def test_all_blocked_processing_can_fail_without_publication(tmp_path: Path) -> 
                 == "ABANDONED"
             )
         assert repository.reconcile_run(lease, scenario.run_id).value == "FAILED"
+
+
+def test_retryable_attempt_failure_is_atomic_idempotent_and_never_sleeps(
+    tmp_path: Path,
+) -> None:
+    root = _private_root(tmp_path)
+    clock = MutableClock(_NOW)
+    with OperationalStateStore.open(root, clock=clock) as store:
+        repository, lease, identity, _ = _prepare_running_attempt(store, clock)
+        clock.advance()
+        eligible_at = clock.value + timedelta(minutes=5)
+
+        first = repository.record_attempt_failure(
+            lease,
+            identity,
+            retryable=True,
+            category="PROVIDER_TRANSIENT",
+            code="RATE_LIMITED",
+            sanitized_message="Provider requested a bounded retry delay.",
+            failed_at=clock.value,
+            next_eligible_at=eligible_at,
+        )
+        replay = repository.record_attempt_failure(
+            lease,
+            identity,
+            retryable=True,
+            category="PROVIDER_TRANSIENT",
+            code="RATE_LIMITED",
+            sanitized_message="Provider requested a bounded retry delay.",
+            failed_at=clock.value + timedelta(seconds=1),
+            next_eligible_at=eligible_at,
+        )
+
+        assert first.attempt_status is AttemptFailureStatus.RETRYABLE_FAILED
+        assert first.request_status is RequestInstanceStatus.RETRY_WAIT
+        assert first.retry_count == 1
+        assert first.max_attempts == 3
+        assert first.next_eligible_at == eligible_at
+        assert not first.replayed
+        assert replay.replayed
+        assert replay.failed_at == first.failed_at
+        with store.read_only_connection() as connection:
+            assert connection.execute("SELECT count(*) FROM errors").fetchone()[0] == 1
+            attempt = connection.execute(
+                "SELECT status, completed_at, next_eligible_at FROM request_attempts"
+            ).fetchone()
+            retry = connection.execute("SELECT * FROM retry_state").fetchone()
+            request = connection.execute(
+                "SELECT status, completed_at FROM request_instances"
+            ).fetchone()
+        assert attempt is not None and tuple(attempt) == (
+            "RETRYABLE_FAILED",
+            _format_utc(clock.value),
+            _format_utc(eligible_at),
+        )
+        assert retry is not None
+        assert int(retry["retry_count"]) == 1
+        assert retry["last_error_id"] == first.error_id
+        assert retry["next_eligible_at"] == _format_utc(eligible_at)
+        assert request is not None and tuple(request) == ("RETRY_WAIT", None)
+        store.release_writer_lease(lease)
+
+
+def test_fatal_attempt_failure_terminates_request_without_retry_eligibility(
+    tmp_path: Path,
+) -> None:
+    root = _private_root(tmp_path)
+    clock = MutableClock(_NOW)
+    with OperationalStateStore.open(root, clock=clock) as store:
+        repository, lease, identity, _ = _prepare_running_attempt(store, clock)
+        clock.advance()
+
+        result = repository.record_attempt_failure(
+            lease,
+            identity,
+            retryable=False,
+            category="PROVIDER_FATAL",
+            code="ENTITLEMENT_DENIED",
+            sanitized_message="Provider entitlement does not authorize this request.",
+            failed_at=clock.value,
+        )
+
+        assert result.attempt_status is AttemptFailureStatus.FATAL_FAILED
+        assert result.request_status is RequestInstanceStatus.FAILED
+        assert result.next_eligible_at is None
+        with store.read_only_connection() as connection:
+            assert (
+                connection.execute("SELECT status FROM request_attempts").fetchone()[0]
+                == "FATAL_FAILED"
+            )
+            assert (
+                connection.execute("SELECT status FROM request_instances").fetchone()[0] == "FAILED"
+            )
+            assert (
+                connection.execute("SELECT next_eligible_at FROM retry_state").fetchone()[0] is None
+            )
+        store.release_writer_lease(lease)
+
+
+def test_retry_dispatch_enforces_eligibility_and_durable_max_attempts(
+    tmp_path: Path,
+) -> None:
+    root = _private_root(tmp_path)
+    clock = MutableClock(_NOW)
+    with OperationalStateStore.open(root, clock=clock) as store:
+        repository, lease, first_identity, plan_request = _prepare_running_attempt(
+            store,
+            clock,
+            max_attempts=2,
+        )
+        clock.advance()
+        eligible_at = clock.value + timedelta(minutes=1)
+        repository.record_attempt_failure(
+            lease,
+            first_identity,
+            retryable=True,
+            category="PROVIDER_TRANSIENT",
+            code="TEMPORARILY_UNAVAILABLE",
+            sanitized_message="Provider endpoint is temporarily unavailable.",
+            failed_at=clock.value,
+            next_eligible_at=eligible_at,
+        )
+        second_identity = AttemptIdentity(
+            attempt_id=_SECOND_ATTEMPT_ID,
+            request_instance_id=first_identity.request_instance_id,
+            attempt_number=2,
+        )
+        with pytest.raises(ExecutionStateConflictError, match="not yet eligible"):
+            repository.begin_attempt(
+                lease,
+                second_identity,
+                plan_request.plan.requests[0].authorization,
+            )
+
+        clock.advance(timedelta(minutes=1))
+        repository.begin_attempt(
+            lease,
+            second_identity,
+            plan_request.plan.requests[0].authorization,
+        )
+        clock.advance()
+        exhausted = repository.record_attempt_failure(
+            lease,
+            second_identity,
+            retryable=True,
+            category="PROVIDER_TRANSIENT",
+            code="TEMPORARILY_UNAVAILABLE",
+            sanitized_message="Provider endpoint is temporarily unavailable.",
+            failed_at=clock.value,
+            next_eligible_at=clock.value + timedelta(minutes=1),
+        )
+
+        assert exhausted.attempt_status is AttemptFailureStatus.RETRYABLE_FAILED
+        assert exhausted.request_status is RequestInstanceStatus.FAILED
+        assert exhausted.retry_count == exhausted.max_attempts == 2
+        assert exhausted.next_eligible_at is None
+        with store.read_only_connection() as connection:
+            retry = connection.execute("SELECT * FROM retry_state").fetchone()
+            assert retry is not None
+            assert int(retry["retry_count"]) == 2
+            assert retry["next_eligible_at"] is None
+            assert (
+                connection.execute("SELECT status FROM request_instances").fetchone()[0] == "FAILED"
+            )
+        store.release_writer_lease(lease)
+
+
+def _blocked_outcome(scenario: Scenario) -> CanonicalStreamOutcome:
+    specification = scenario.expectation.specification
+    return CanonicalStreamOutcome(
+        stream=specification.stream_keys()[0],
+        outcome=StreamPublicationOutcome.BLOCKED,
+        request_start=specification.start,
+        request_end=specification.end,
+        row_count=0,
+        validation_codes=("QUALITY:DUPLICATE_BAR",),
+    )
+
+
+@pytest.mark.parametrize(
+    "fault_point",
+    [
+        PublicationFaultPoint.STAGING,
+        PublicationFaultPoint.MANIFEST,
+        PublicationFaultPoint.STAGED_MANIFEST_VERIFIED,
+        PublicationFaultPoint.RENAME,
+        PublicationFaultPoint.REOPEN,
+    ],
+)
+def test_quarantine_manifest_publication_is_atomic_and_retryable(
+    tmp_path: Path,
+    fault_point: PublicationFaultPoint,
+) -> None:
+    root = _private_root(tmp_path)
+    clock = MutableClock(_NOW)
+    with OperationalStateStore.open(root, clock=clock) as store:
+        scenario = _prepare_scenario(root, store, clock)
+        enforcer = RetentionPolicyEnforcer(RetentionPolicyCatalog.load_default(), clock=clock)
+        publisher = QuarantineArtifactPublisher(root, enforcer)
+        outcome = _blocked_outcome(scenario)
+
+        def crash(point: PublicationFaultPoint) -> None:
+            if point is fault_point:
+                raise InjectedCrash(point.value)
+
+        with pytest.raises(InjectedCrash):
+            publisher.publish(
+                scenario.expectation.specification,
+                scenario.expectation.batch_context,
+                (outcome,),
+                authorization=scenario.acquisition,
+                environment=RuntimeEnvironment.TEST,
+                fault_injector=crash,
+            )
+        recovered = publisher.publish(
+            scenario.expectation.specification,
+            scenario.expectation.batch_context,
+            (outcome,),
+            authorization=scenario.acquisition,
+            environment=RuntimeEnvironment.TEST,
+        )
+        assert recovered is not None
+        manifest_path = root.root / recovered.manifest_relative_path
+        manifest = QuarantineArtifactManifest.model_validate_json(manifest_path.read_bytes())
+        assert manifest.blocked_streams == (outcome,)
+        assert tuple(manifest_path.parent.iterdir()) == (manifest_path,)
+        assert b"synthetic-parquet-placeholder" not in manifest_path.read_bytes()
+        assert recovered.created is (
+            fault_point not in {PublicationFaultPoint.RENAME, PublicationFaultPoint.REOPEN}
+        )
+
+
+def test_quarantine_catalog_is_idempotent_and_bound_to_exact_attempt(
+    tmp_path: Path,
+) -> None:
+    root = _private_root(tmp_path)
+    clock = MutableClock(_NOW)
+    with OperationalStateStore.open(root, clock=clock) as store:
+        scenario = _prepare_scenario(root, store, clock)
+        lease = store.get_writer_lease()
+        assert lease is not None
+        enforcer = RetentionPolicyEnforcer(RetentionPolicyCatalog.load_default(), clock=clock)
+        outcome = _blocked_outcome(scenario)
+        published = QuarantineArtifactPublisher(root, enforcer).publish(
+            scenario.expectation.specification,
+            scenario.expectation.batch_context,
+            (outcome,),
+            authorization=scenario.acquisition,
+            environment=RuntimeEnvironment.TEST,
+        )
+        assert published is not None
+        manifest = QuarantineArtifactManifest.model_validate_json(
+            (root.root / published.manifest_relative_path).read_bytes()
+        )
+        identity = AttemptIdentity(
+            attempt_id=scenario.attempt_id,
+            request_instance_id=scenario.request_id,
+            attempt_number=1,
+        )
+        repository = QuarantineArtifactRepository(store, root, enforcer)
+        first = repository.catalog(
+            lease,
+            identity,
+            scenario.expectation.specification,
+            scenario.acquisition,
+            manifest,
+            published,
+            environment=RuntimeEnvironment.TEST,
+        )
+        replay = repository.catalog(
+            lease,
+            identity,
+            scenario.expectation.specification,
+            scenario.acquisition,
+            manifest,
+            published,
+            environment=RuntimeEnvironment.TEST,
+        )
+        assert not first.replayed
+        assert replay.replayed
+        with store.read_only_connection() as connection:
+            row = connection.execute("SELECT * FROM quarantine_artifacts").fetchone()
+        assert row is not None
+        assert row["state"] == "VERIFIED"
+        assert row["relative_path"] == published.relative_directory
+        with pytest.raises(QuarantineCatalogIntegrityError, match="differs"):
+            repository.catalog(
+                lease,
+                identity,
+                scenario.expectation.specification,
+                scenario.acquisition,
+                manifest,
+                published.model_copy(update={"manifest_byte_count": 1}),
+                environment=RuntimeEnvironment.TEST,
+            )
+
+
+def test_quarantine_policy_gate_denies_a_layer_without_explicit_permission(
+    tmp_path: Path,
+) -> None:
+    root = _private_root(tmp_path)
+    clock = MutableClock(_NOW)
+    with OperationalStateStore.open(root, clock=clock) as store:
+        scenario = _prepare_scenario(root, store, clock)
+        default = RetentionPolicyCatalog.load_default()
+        policy = default.lookup("synthetic", "price_bars")
+        denied = policy.model_copy(
+            update={
+                "normalized": policy.normalized.model_copy(update={"quarantine_allowed": False})
+            }
+        )
+        document = default.document.model_copy(
+            update={
+                "policies": tuple(
+                    denied if value == policy else value for value in default.document.policies
+                )
+            }
+        )
+        publisher = QuarantineArtifactPublisher(
+            root,
+            RetentionPolicyEnforcer(RetentionPolicyCatalog(document), clock=clock),
+        )
+        with pytest.raises(DatasetPolicyDenied, match="quarantine"):
+            publisher.publish(
+                scenario.expectation.specification,
+                scenario.expectation.batch_context,
+                (_blocked_outcome(scenario),),
+                authorization=scenario.acquisition,
+                environment=RuntimeEnvironment.TEST,
+            )
+
+
+def test_quarantine_filesystem_identity_is_independent_of_policy_revision(
+    tmp_path: Path,
+) -> None:
+    root = _private_root(tmp_path)
+    clock = MutableClock(_NOW)
+    with OperationalStateStore.open(root, clock=clock) as store:
+        scenario = _prepare_scenario(root, store, clock)
+        outcome = _blocked_outcome(scenario)
+        artifact_id = deterministic_quarantine_artifact_id(
+            specification=scenario.expectation.specification,
+            batch_context=scenario.expectation.batch_context,
+            blocked_streams=(outcome,),
+        )
+        revised_snapshot = scenario.acquisition.request.policy_snapshot.model_copy(
+            update={
+                "policy_revision": (
+                    scenario.acquisition.request.policy_snapshot.policy_revision + 1
+                ),
+                "policy_hash": "f" * 64,
+            }
+        )
+        assert deterministic_policy_snapshot_id(revised_snapshot) != (
+            deterministic_policy_snapshot_id(scenario.acquisition.request.policy_snapshot)
+        )
+        published = QuarantineArtifactPublisher(
+            root,
+            RetentionPolicyEnforcer(RetentionPolicyCatalog.load_default(), clock=clock),
+        ).publish(
+            scenario.expectation.specification,
+            scenario.expectation.batch_context,
+            (outcome,),
+            authorization=scenario.acquisition,
+            environment=RuntimeEnvironment.TEST,
+        )
+        assert published is not None
+        manifest_bytes = (root.root / published.manifest_relative_path).read_bytes()
+        assert published.quarantine_artifact_id == artifact_id
+        assert b"policy_snapshot" not in manifest_bytes
+        assert b"policy_hash" not in manifest_bytes
+
+
+def test_quarantine_diagnostics_detect_corruption_and_uncataloged_publication(
+    tmp_path: Path,
+) -> None:
+    root = _private_root(tmp_path)
+    clock = MutableClock(_NOW)
+    with OperationalStateStore.open(root, clock=clock) as store:
+        scenario = _prepare_scenario(root, store, clock)
+        enforcer = RetentionPolicyEnforcer(RetentionPolicyCatalog.load_default(), clock=clock)
+        publisher = QuarantineArtifactPublisher(root, enforcer)
+        published = publisher.publish(
+            scenario.expectation.specification,
+            scenario.expectation.batch_context,
+            (_blocked_outcome(scenario),),
+            authorization=scenario.acquisition,
+            environment=RuntimeEnvironment.TEST,
+        )
+        assert published is not None
+        diagnostics = Phase2OperationalDiagnostics(root, store, clock=clock)
+        orphan_check = next(
+            value for value in diagnostics.verify().checks if value.code == "PUBLISHED_ORPHANS"
+        )
+        assert "UNCATALOGED_QUARANTINE_PUBLICATION" in orphan_check.issue_codes
+
+        lease = store.get_writer_lease()
+        assert lease is not None
+        manifest_path = root.root / published.manifest_relative_path
+        manifest = QuarantineArtifactManifest.model_validate_json(manifest_path.read_bytes())
+        QuarantineArtifactRepository(store, root, enforcer).catalog(
+            lease,
+            AttemptIdentity(
+                attempt_id=scenario.attempt_id,
+                request_instance_id=scenario.request_id,
+                attempt_number=1,
+            ),
+            scenario.expectation.specification,
+            scenario.acquisition,
+            manifest,
+            published,
+            environment=RuntimeEnvironment.TEST,
+        )
+        assert diagnostics.status().quarantine_artifact_count == 1
+        healthy_check = next(
+            value
+            for value in diagnostics.verify().checks
+            if value.code == "QUARANTINE_CATALOG_CONTENT"
+        )
+        assert healthy_check.status is DiagnosticStatus.PASS
+
+        manifest_path.write_bytes(b"{}\n")
+        corrupted = next(
+            value
+            for value in diagnostics.verify().checks
+            if value.code == "QUARANTINE_CATALOG_CONTENT"
+        )
+        assert corrupted.status is DiagnosticStatus.FAIL
+        assert "QUARANTINE_FILE_OR_MANIFEST_INVALID" in corrupted.issue_codes
+
+
+def _calendar_replacement(
+    *,
+    library_version: str,
+    first_close: datetime = _END,
+    extend_range: bool = False,
+) -> CalendarSnapshot:
+    sessions = [
+        CalendarSession(
+            session_date=date(2025, 7, 2),
+            open_utc=_START,
+            close_utc=first_close,
+        )
+    ]
+    if extend_range:
+        sessions.append(
+            CalendarSession(
+                session_date=date(2026, 1, 2),
+                open_utc=datetime(2026, 1, 2, 14, 30, tzinfo=UTC),
+                close_utc=datetime(2026, 1, 2, 14, 40, tzinfo=UTC),
+            )
+        )
+    return CalendarSnapshot.create(
+        library_name="synthetic-calendar",
+        library_version=library_version,
+        tzdata_version="synthetic",
+        calendar_name="XNYS",
+        timezone_name="America/New_York",
+        range_start=date(2025, 7, 2),
+        range_end=date(2026, 1, 3) if extend_range else date(2025, 7, 3),
+        generated_at=_NOW + timedelta(days=1),
+        sessions=sessions,
+    )
+
+
+@pytest.mark.parametrize("extend_range", [False, True])
+def test_calendar_equivalent_upgrade_rebinds_coverage_and_watermark_with_ledger(
+    tmp_path: Path,
+    extend_range: bool,
+) -> None:
+    root = _private_root(tmp_path)
+    clock = MutableClock(_NOW)
+    old_calendar_id = deterministic_calendar_snapshot_id(_calendar())
+    target = _calendar_replacement(library_version="2", extend_range=extend_range)
+    target_id = deterministic_calendar_snapshot_id(target)
+    with OperationalStateStore.open(root, clock=clock) as store:
+        scenario = _prepare_scenario(root, store, clock)
+        lease = store.get_writer_lease()
+        assert lease is not None
+        IngestionExecutionRepository(store).commit_published_batch(
+            lease,
+            scenario.commit_request(),
+        )
+        clock.advance()
+
+        result = CalendarSnapshotRepository(store).persist_reconciling(lease, target)
+
+        assert result.snapshot_id == target_id
+        assert result.stale_snapshot_ids == (old_calendar_id,)
+        assert result.affected_session_dates == ()
+        assert result.stale_coverage_ids == ()
+        assert result.rebound_coverage_ids == (scenario.coverage.segments[0].coverage_id,)
+        assert result.stale_watermark_stream_ids == ()
+        assert result.rebound_watermark_stream_ids == (scenario.coverage.segments[0].stream_id,)
+        assert result.calendar_stale_gap_ids == ()
+        with store.read_only_connection() as connection:
+            assert (
+                connection.execute(
+                    "SELECT state FROM calendar_snapshots WHERE calendar_snapshot_id = ?",
+                    (old_calendar_id,),
+                ).fetchone()[0]
+                == "STALE"
+            )
+            coverage = connection.execute(
+                """
+                SELECT calendar_snapshot_id, verification_state, invalidated_at
+                FROM coverage_segments WHERE coverage_id = ?
+                """,
+                (scenario.coverage.segments[0].coverage_id,),
+            ).fetchone()
+            assert tuple(coverage) == (target_id, "VERIFIED", None)
+            watermark = connection.execute(
+                """
+                SELECT calendar_snapshot_id, verification_state, invalidated_at
+                FROM watermarks WHERE stream_id = ?
+                """,
+                (scenario.coverage.segments[0].stream_id,),
+            ).fetchone()
+            assert tuple(watermark) == (target_id, "VERIFIED", None)
+            assert (
+                connection.execute("SELECT count(*) FROM calendar_coverage_rebindings").fetchone()[
+                    0
+                ]
+                == 1
+            )
+            assert (
+                connection.execute("SELECT count(*) FROM calendar_watermark_rebindings").fetchone()[
+                    0
+                ]
+                == 1
+            )
+            assert (
+                connection.execute(
+                    """
+                SELECT count(*) FROM coverage_segments
+                WHERE calendar_snapshot_id = ? AND verification_state = 'VERIFIED'
+                """,
+                    (old_calendar_id,),
+                ).fetchone()[0]
+                == 0
+            )
+
+        replay = CalendarSnapshotRepository(store).persist_reconciling(lease, target)
+        assert replay.stale_snapshot_ids == ()
+        with store.read_only_connection() as connection:
+            assert (
+                connection.execute(
+                    "SELECT count(*) FROM calendar_snapshot_reconciliations"
+                ).fetchone()[0]
+                == 1
+            )
+        proofs = RestartProjectionReader(store).load_stream_proofs(
+            (scenario.coverage.segments[0].stream_id,)
+        )
+        assert proofs.coverage[0].calendar_snapshot_id == target_id
+        assert proofs.coverage[0].verification_state is CoverageVerificationState.VERIFIED
+        assert proofs.watermarks[0].calendar_snapshot_id == target_id
+        store.release_writer_lease(lease)
+
+    with OperationalStateStore.open(root, clock=clock) as reopened:
+        proofs = RestartProjectionReader(reopened).load_stream_proofs(
+            (scenario.coverage.segments[0].stream_id,)
+        )
+        assert proofs.coverage[0].calendar_snapshot_id == target_id
+        assert proofs.watermarks[0].calendar_snapshot_id == target_id
+
+
+def test_calendar_schedule_change_stales_only_affected_facts_and_creates_linked_gap(
+    tmp_path: Path,
+) -> None:
+    root = _private_root(tmp_path)
+    clock = MutableClock(_NOW)
+    old_calendar_id = deterministic_calendar_snapshot_id(_calendar())
+    target = _calendar_replacement(
+        library_version="2",
+        first_close=_END + timedelta(minutes=5),
+    )
+    target_id = deterministic_calendar_snapshot_id(target)
+    with OperationalStateStore.open(root, clock=clock) as store:
+        scenario = _prepare_scenario(root, store, clock)
+        lease = store.get_writer_lease()
+        assert lease is not None
+        IngestionExecutionRepository(store).commit_published_batch(
+            lease,
+            scenario.commit_request(),
+        )
+        clock.advance()
+
+        result = CalendarSnapshotRepository(store).persist_reconciling(lease, target)
+
+        assert result.affected_session_dates == (date(2025, 7, 2),)
+        assert result.stale_coverage_ids == (scenario.coverage.segments[0].coverage_id,)
+        assert result.rebound_coverage_ids == ()
+        assert result.stale_watermark_stream_ids == (scenario.coverage.segments[0].stream_id,)
+        assert len(result.calendar_stale_gap_ids) == 1
+        with store.read_only_connection() as connection:
+            coverage = connection.execute(
+                """
+                SELECT calendar_snapshot_id, verification_state, invalidated_at
+                FROM coverage_segments WHERE coverage_id = ?
+                """,
+                (scenario.coverage.segments[0].coverage_id,),
+            ).fetchone()
+            assert coverage[0] == old_calendar_id
+            assert coverage[1] == "STALE"
+            assert coverage[2] is not None
+            watermark = connection.execute(
+                """
+                SELECT calendar_snapshot_id, verification_state, invalidated_at
+                FROM watermarks WHERE stream_id = ?
+                """,
+                (scenario.coverage.segments[0].stream_id,),
+            ).fetchone()
+            assert watermark[0] == old_calendar_id
+            assert watermark[1] == "STALE"
+            assert watermark[2] is not None
+            gap = connection.execute(
+                """
+                SELECT gap.*, provenance.session_date,
+                       reconciliation.source_calendar_snapshot_id,
+                       reconciliation.target_calendar_snapshot_id
+                FROM gaps AS gap
+                JOIN calendar_stale_gap_provenance AS provenance USING(gap_id)
+                JOIN calendar_snapshot_reconciliations AS reconciliation
+                  USING(reconciliation_id)
+                WHERE gap.gap_id = ?
+                """,
+                (result.calendar_stale_gap_ids[0],),
+            ).fetchone()
+            assert gap["gap_type"] == "CALENDAR_STALE"
+            assert gap["request_instance_id"] == str(scenario.request_id)
+            assert gap["session_date"] == "2025-07-02"
+            assert gap["source_calendar_snapshot_id"] == old_calendar_id
+            assert gap["target_calendar_snapshot_id"] == target_id
+            assert (
+                connection.execute(
+                    "SELECT coverage_id FROM calendar_stale_gap_coverage WHERE gap_id = ?",
+                    (result.calendar_stale_gap_ids[0],),
+                ).fetchone()[0]
+                == scenario.coverage.segments[0].coverage_id
+            )
+            assert (
+                connection.execute(
+                    """
+                SELECT count(*) FROM watermarks
+                WHERE calendar_snapshot_id = ? AND verification_state = 'VERIFIED'
+                """,
+                    (old_calendar_id,),
+                ).fetchone()[0]
+                == 0
+            )
+        proofs = RestartProjectionReader(store).load_stream_proofs(
+            (scenario.coverage.segments[0].stream_id,)
+        )
+        assert proofs.coverage[0].verification_state is CoverageVerificationState.STALE
+        assert any(gap.gap_id == result.calendar_stale_gap_ids[0] for gap in proofs.gaps)
+        assert proofs.watermarks[0].verification_state is CoverageVerificationState.STALE
+        store.release_writer_lease(lease)
+
+
+def test_calendar_change_outside_verified_interval_rebinds_without_false_staleness(
+    tmp_path: Path,
+) -> None:
+    root = _private_root(tmp_path)
+    clock = MutableClock(_NOW)
+    extended = _calendar_replacement(library_version="2", extend_range=True)
+    changed_uncovered_session = CalendarSnapshot.create(
+        library_name="synthetic-calendar",
+        library_version="3",
+        tzdata_version="synthetic",
+        calendar_name="XNYS",
+        timezone_name="America/New_York",
+        range_start=extended.range_start,
+        range_end=extended.range_end,
+        generated_at=_NOW + timedelta(days=2),
+        sessions=(
+            extended.sessions[0],
+            extended.sessions[1].model_copy(
+                update={"close_utc": extended.sessions[1].close_utc + timedelta(minutes=5)}
+            ),
+        ),
+    )
+    with OperationalStateStore.open(root, clock=clock) as store:
+        scenario = _prepare_scenario(root, store, clock)
+        lease = store.get_writer_lease()
+        assert lease is not None
+        IngestionExecutionRepository(store).commit_published_batch(
+            lease,
+            scenario.commit_request(),
+        )
+        clock.advance()
+        CalendarSnapshotRepository(store).persist_reconciling(lease, extended)
+        clock.advance()
+
+        result = CalendarSnapshotRepository(store).persist_reconciling(
+            lease,
+            changed_uncovered_session,
+        )
+
+        assert result.affected_session_dates == (date(2026, 1, 2),)
+        assert result.stale_coverage_ids == ()
+        assert result.stale_watermark_stream_ids == ()
+        assert result.rebound_coverage_ids == (scenario.coverage.segments[0].coverage_id,)
+        assert result.rebound_watermark_stream_ids == (scenario.coverage.segments[0].stream_id,)
+        assert result.calendar_stale_gap_ids == ()
+        proofs = RestartProjectionReader(store).load_stream_proofs(
+            (scenario.coverage.segments[0].stream_id,)
+        )
+        target_id = deterministic_calendar_snapshot_id(changed_uncovered_session)
+        assert proofs.coverage[0].calendar_snapshot_id == target_id
+        assert proofs.coverage[0].verification_state is CoverageVerificationState.VERIFIED
+        assert proofs.watermarks[0].calendar_snapshot_id == target_id
+        assert proofs.watermarks[0].verification_state is CoverageVerificationState.VERIFIED
+        store.release_writer_lease(lease)

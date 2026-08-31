@@ -13,9 +13,11 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Callable, Iterator
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import BinaryIO, Protocol
+from typing import BinaryIO, Protocol, runtime_checkable
+from uuid import UUID
 
 from investment_platform.data.calendar import CalendarSnapshot
 from investment_platform.data.ingestion.identity import (
@@ -41,6 +43,7 @@ from investment_platform.data.providers.base import (
 )
 from investment_platform.data.retention import (
     AcquisitionPolicyAuthorization,
+    DatasetPolicySnapshot,
     DatasetRuntimeStatus,
     RequestPolicyAuthorization,
     ResponsePageAuthorization,
@@ -48,6 +51,11 @@ from investment_platform.data.retention import (
 )
 from investment_platform.data.storage import PublishedRawArtifact, RawArtifactPublisher
 from investment_platform.data.storage._publication import FaultInjector
+from investment_platform.data.storage.transport_spool import (
+    TransportSpoolError,
+    TransportSpoolFaultInjector,
+    TransportSpoolPayload,
+)
 
 _FIVE_MINUTES = timedelta(minutes=5)
 _DEFAULT_MAX_PAGE_BYTES = 64 * 1024 * 1024
@@ -74,6 +82,18 @@ class BarPageProvider(Protocol):
     def provider_name(self) -> str: ...
 
     def get_bars(self, request: BarRequest) -> Iterator[RawBatch]: ...
+
+
+@runtime_checkable
+class AttemptScopedBarPageProvider(Protocol):
+    """Optional provider capability for private-root file-backed transport."""
+
+    def transport_attempt(
+        self,
+        attempt_id: UUID,
+        *,
+        fault_injector: TransportSpoolFaultInjector | None = None,
+    ) -> AbstractContextManager[None]: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,10 +135,27 @@ class CompletedRawAcquisition:
 
 
 type PagePersistedHook = Callable[[AcquiredRawPage], None]
+type BeforeDispatchHook = Callable[[int], None]
 type PageInspector = Callable[
     [RawBatch, RequestSpecification, CalendarSnapshot],
     InspectedRawPage,
 ]
+
+
+def _stable_policy_snapshot_identity(value: DatasetPolicySnapshot) -> tuple[object, ...]:
+    return (
+        value.catalog_id,
+        value.catalog_revision,
+        value.catalog_hash,
+        value.policy_id,
+        value.policy_revision,
+        value.policy_hash,
+        value.provider,
+        value.dataset,
+        value.mode,
+        value.status,
+        value.verified_on,
+    )
 
 
 def specification_to_bar_request(specification: RequestSpecification) -> BarRequest:
@@ -152,22 +189,24 @@ def specification_to_bar_request(specification: RequestSpecification) -> BarRequ
     )
 
 
-def _read_bounded(reader: BinaryIO, *, max_bytes: int) -> bytes:
-    content = bytearray()
+def _hash_bounded(reader: BinaryIO, *, max_bytes: int) -> tuple[str, int]:
+    digest = hashlib.sha256()
+    byte_count = 0
     while True:
-        requested = min(_READ_CHUNK_BYTES, max_bytes + 1 - len(content))
+        requested = min(_READ_CHUNK_BYTES, max_bytes + 1 - byte_count)
         chunk = reader.read(requested)
         if not isinstance(chunk, bytes) or len(chunk) > requested:
             raise RawPageInspectionError(
                 "provider payload violated the bounded binary-reader contract"
             )
         if not chunk:
-            return bytes(content)
-        content.extend(chunk)
-        if len(content) > max_bytes:
+            return digest.hexdigest(), byte_count
+        byte_count += len(chunk)
+        if byte_count > max_bytes:
             raise RawPageTooLargeError(
                 f"provider page exceeds the configured {max_bytes}-byte ceiling"
             )
+        digest.update(chunk)
 
 
 def _parse_provider_timestamp(value: object) -> datetime:
@@ -187,7 +226,26 @@ def _canonical_observation_bounds(
     calendar_snapshot: CalendarSnapshot,
 ) -> tuple[datetime, datetime]:
     if timeframe is Timeframe.FIVE_MINUTES:
-        return timestamp, timestamp + _FIVE_MINUTES
+        session_date = timestamp.astimezone(US_EASTERN).date()
+        session = next(
+            (
+                candidate
+                for candidate in calendar_snapshot.sessions
+                if candidate.session_date == session_date
+            ),
+            None,
+        )
+        end = timestamp + _FIVE_MINUTES
+        if (
+            session is None
+            or timestamp < session.open_utc
+            or end > session.close_utc
+            or (timestamp - session.open_utc) % _FIVE_MINUTES
+        ):
+            raise RawPageInspectionError(
+                "Alpaca 5m response is not an exact XNYS regular-session slot"
+            )
+        return timestamp, end
     if timeframe is not Timeframe.ONE_DAY:
         raise RawPageInspectionError("unsupported Alpaca historical-bar timeframe")
     session_date = timestamp.astimezone(US_EASTERN).date()
@@ -265,8 +323,22 @@ def inspect_alpaca_sip_bar_page(
         ) from error
     try:
         with batch.payload.open_binary() as reader:
-            payload = _read_bounded(reader, max_bytes=max_page_bytes)
-        root = json.loads(payload)
+            payload_sha256, payload_size_bytes = _hash_bounded(
+                reader,
+                max_bytes=max_page_bytes,
+            )
+        if isinstance(batch.payload, TransportSpoolPayload) and (
+            payload_sha256 != batch.payload.content_sha256
+            or payload_size_bytes != batch.payload.byte_count
+        ):
+            raise RawPageInspectionError(
+                "file-backed response changed after bounded transport completion"
+            )
+        # A second bounded resource pass lets the JSON decoder work directly
+        # from a file-backed response.  The exact bytes are never assembled as
+        # one Python ``bytes`` object; raw publication later rechecks the hash.
+        with batch.payload.open_binary() as reader:
+            root = json.load(reader)
     except RawPageTooLargeError:
         raise
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
@@ -304,8 +376,8 @@ def inspect_alpaca_sip_bar_page(
             observed.append((start, end))
 
     return InspectedRawPage(
-        payload_sha256=hashlib.sha256(payload).hexdigest(),
-        payload_size_bytes=len(payload),
+        payload_sha256=payload_sha256,
+        payload_size_bytes=payload_size_bytes,
         canonical_media_type="application/json",
         content_encoding="identity",
         observed_start=min((start for start, _ in observed), default=None),
@@ -349,26 +421,111 @@ class RawAcquisitionService:
         calendar_snapshot: CalendarSnapshot,
         *,
         runtime_status: DatasetRuntimeStatus | None = None,
+        attempt_id: UUID | None = None,
+        max_pages: int = _MAX_ACQUISITION_PAGES,
+        max_calls: int = _MAX_ACQUISITION_PAGES,
+        before_dispatch: BeforeDispatchHook | None = None,
         on_page_persisted: PagePersistedHook | None = None,
         fault_injector: FaultInjector | None = None,
+        transport_fault_injector: TransportSpoolFaultInjector | None = None,
     ) -> CompletedRawAcquisition:
         """Consume the complete provider iterator and authorize its terminal page chain."""
 
+        if max_pages <= 0 or max_calls <= 0:
+            raise ValueError("acquisition page and call bounds must be positive")
         if self._provider.provider_name != specification.provider:
             raise RawAcquisitionError("provider adapter differs from the request specification")
         if request_authorization.request_spec_hash != specification.request_spec_hash:
             raise RawAcquisitionError("request authorization differs from the specification")
 
+        # Re-evaluate the exact active policy immediately before any transport
+        # scope can create a file or dispatch a request.  The response check
+        # remains mandatory because the policy may still change after dispatch.
+        current = self._policy_enforcer.authorize_request(
+            specification.provider,
+            specification.dataset,
+            environment=request_authorization.environment,
+            start=specification.start,
+            end=specification.end,
+            request_spec_hash=specification.request_spec_hash,
+            runtime_status=runtime_status,
+        )
+        if (
+            _stable_policy_snapshot_identity(current.policy_snapshot)
+            != _stable_policy_snapshot_identity(request_authorization.policy_snapshot)
+            or request_authorization.request_start != specification.start
+            or request_authorization.request_end != specification.end
+        ):
+            raise RawAcquisitionError("request policy authorization is no longer current")
+
         request = specification_to_bar_request(specification)
+        transport_scope: AbstractContextManager[None] = nullcontext()
+        if attempt_id is not None and isinstance(
+            self._provider,
+            AttemptScopedBarPageProvider,
+        ):
+            transport_scope = self._provider.transport_attempt(
+                attempt_id,
+                fault_injector=transport_fault_injector,
+            )
+        try:
+            with transport_scope:
+                return self._acquire_pages(
+                    specification,
+                    request_authorization,
+                    calendar_snapshot,
+                    request,
+                    max_pages=min(max_pages, _MAX_ACQUISITION_PAGES),
+                    max_calls=min(max_calls, _MAX_ACQUISITION_PAGES),
+                    runtime_status=runtime_status,
+                    before_dispatch=before_dispatch,
+                    on_page_persisted=on_page_persisted,
+                    fault_injector=fault_injector,
+                )
+        except TransportSpoolError as error:
+            raise RawAcquisitionError("transient provider response spool failed safely") from error
+
+    def _acquire_pages(
+        self,
+        specification: RequestSpecification,
+        request_authorization: RequestPolicyAuthorization,
+        calendar_snapshot: CalendarSnapshot,
+        request: BarRequest,
+        *,
+        max_pages: int,
+        max_calls: int,
+        runtime_status: DatasetRuntimeStatus | None,
+        before_dispatch: BeforeDispatchHook | None,
+        on_page_persisted: PagePersistedHook | None,
+        fault_injector: FaultInjector | None,
+    ) -> CompletedRawAcquisition:
+        """Consume pages while an optional attempt-scoped transport is active."""
+
         pages: list[AcquiredRawPage] = []
+        dispatch_bound = min(max_pages, max_calls)
+        iterator = iter(self._provider.get_bars(request))
         # The iterator may raise after yielding a page (for example while
         # validating the next token).  In that case raw pages remain evidence,
         # but this method never creates a completion authorization.
-        for page_ordinal, batch in enumerate(self._provider.get_bars(request)):
-            if page_ordinal >= _MAX_ACQUISITION_PAGES:
-                raise RawAcquisitionError("provider pagination exceeded the 1000-page safety bound")
+        for page_ordinal in range(dispatch_bound):
             if pages and pages[-1].inspection.pagination_terminal:
-                raise RawAcquisitionError("provider yielded a page after pagination termination")
+                # A terminal provider token means the adapter's iterator must
+                # already be locally exhausted.  Verify that contract without
+                # claiming another network dispatch; Alpaca's generator returns
+                # before issuing transport I/O when the token is absent.
+                try:
+                    next(iterator)
+                except StopIteration:
+                    break
+                raise RawAcquisitionError(
+                    "provider yielded a page after pagination termination"
+                )
+            if before_dispatch is not None:
+                before_dispatch(page_ordinal)
+            try:
+                batch = next(iterator)
+            except StopIteration:
+                break
             try:
                 require_matching_request_metadata(
                     batch,
@@ -436,6 +593,12 @@ class RawAcquisitionService:
             pages.append(acquired)
             if on_page_persisted is not None:
                 on_page_persisted(acquired)
+            if len(pages) == dispatch_bound and not inspection.pagination_terminal:
+                # Do not probe the iterator for another page: for a network-backed
+                # provider ``next()`` is itself the next dispatch boundary.
+                raise RawAcquisitionError(
+                    "provider pagination exceeded the deterministic request page/call bound"
+                )
 
         if not pages:
             raise RawAcquisitionError("provider returned no response page")
@@ -459,7 +622,9 @@ class RawAcquisitionService:
 
 __all__ = [
     "AcquiredRawPage",
+    "AttemptScopedBarPageProvider",
     "BarPageProvider",
+    "BeforeDispatchHook",
     "CompletedRawAcquisition",
     "InspectedRawPage",
     "PageInspector",

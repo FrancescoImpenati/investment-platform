@@ -1072,6 +1072,482 @@ _MIGRATION_3_STATEMENTS: Final[tuple[str, ...]] = (
 )
 
 
+_MIGRATION_4_STATEMENTS: Final[tuple[str, ...]] = (
+    """
+    CREATE TABLE provider_budget_reservations (
+        reservation_id TEXT PRIMARY KEY,
+        provider TEXT NOT NULL,
+        dataset TEXT NOT NULL,
+        budget_key TEXT NOT NULL,
+        window_start TEXT NOT NULL,
+        request_instance_id TEXT NOT NULL
+            REFERENCES request_instances(request_instance_id) ON DELETE RESTRICT,
+        attempt_id TEXT NOT NULL
+            REFERENCES request_attempts(attempt_id) ON DELETE RESTRICT,
+        dispatch_ordinal INTEGER NOT NULL CHECK (dispatch_ordinal > 0),
+        amount INTEGER NOT NULL CHECK (amount > 0),
+        state TEXT NOT NULL CHECK (state IN ('RESERVED', 'CONSUMED', 'RELEASED')),
+        reserved_at TEXT NOT NULL,
+        finalized_at TEXT,
+        FOREIGN KEY (provider, dataset, budget_key, window_start)
+            REFERENCES provider_budget_state(provider, dataset, budget_key, window_start)
+            ON DELETE RESTRICT,
+        UNIQUE (attempt_id, budget_key, dispatch_ordinal),
+        CHECK (
+            (state = 'RESERVED' AND finalized_at IS NULL)
+            OR (state IN ('CONSUMED', 'RELEASED') AND finalized_at IS NOT NULL)
+        )
+    ) WITHOUT ROWID
+    """,
+    """
+    CREATE INDEX provider_budget_reservation_request_idx
+        ON provider_budget_reservations(request_instance_id, state, reserved_at)
+    """,
+)
+
+
+_MIGRATION_5_STATEMENTS: Final[tuple[str, ...]] = (
+    """
+    CREATE TABLE raw_replay_provenance_v2 (
+        attempt_id TEXT NOT NULL REFERENCES request_attempts(attempt_id) ON DELETE RESTRICT,
+        artifact_id TEXT NOT NULL REFERENCES raw_artifacts(artifact_id) ON DELETE RESTRICT,
+        raw_batch_id TEXT NOT NULL,
+        source_id TEXT NOT NULL,
+        source_provider TEXT NOT NULL,
+        source_dataset TEXT NOT NULL,
+        logical_endpoint TEXT NOT NULL,
+        license_classification TEXT NOT NULL CHECK (license_classification IN (
+            'private', 'redistributable', 'sample', 'synthetic'
+        )),
+        retrieved_at TEXT NOT NULL,
+        media_type TEXT NOT NULL,
+        file_extension TEXT NOT NULL,
+        safe_provider_request_id TEXT,
+        request_metadata_json TEXT NOT NULL,
+        metadata_hash TEXT NOT NULL CHECK (
+            length(metadata_hash) = 64
+            AND metadata_hash NOT GLOB '*[^0-9a-f]*'
+        ),
+        recorded_at TEXT NOT NULL,
+        PRIMARY KEY (attempt_id, artifact_id),
+        FOREIGN KEY (attempt_id, artifact_id)
+            REFERENCES attempt_artifact_observations(attempt_id, artifact_id)
+            ON DELETE RESTRICT,
+        UNIQUE (attempt_id, raw_batch_id),
+        UNIQUE (attempt_id, metadata_hash)
+    ) WITHOUT ROWID
+    """,
+    """
+    INSERT INTO raw_replay_provenance_v2(
+        attempt_id, artifact_id, raw_batch_id, source_id, source_provider, source_dataset,
+        logical_endpoint, license_classification, retrieved_at, media_type, file_extension,
+        safe_provider_request_id, request_metadata_json, metadata_hash, recorded_at
+    )
+    SELECT attempt_id, artifact_id, raw_batch_id, source_id, source_provider, source_dataset,
+           logical_endpoint, license_classification, retrieved_at, media_type, file_extension,
+           safe_provider_request_id, request_metadata_json, metadata_hash, recorded_at
+    FROM raw_replay_provenance
+    """,
+    "DROP TABLE raw_replay_provenance",
+    "ALTER TABLE raw_replay_provenance_v2 RENAME TO raw_replay_provenance",
+    """
+    CREATE INDEX raw_replay_artifact_idx
+        ON raw_replay_provenance(artifact_id, retrieved_at)
+    """,
+    """
+    CREATE TABLE raw_acquisition_adoptions (
+        attempt_id TEXT PRIMARY KEY
+            REFERENCES attempt_acquisition_records(attempt_id) ON DELETE RESTRICT,
+        source_attempt_id TEXT NOT NULL
+            REFERENCES attempt_acquisition_records(attempt_id) ON DELETE RESTRICT,
+        canonical_batch_id TEXT NOT NULL
+            REFERENCES canonical_batches(canonical_batch_id) ON DELETE RESTRICT,
+        replay_reason TEXT NOT NULL CHECK (
+            replay_reason IN ('CANONICAL_LOSS', 'CANONICAL_STALE')
+        ),
+        evidence_json TEXT NOT NULL,
+        evidence_hash TEXT NOT NULL CHECK (
+            length(evidence_hash) = 64
+            AND evidence_hash NOT GLOB '*[^0-9a-f]*'
+        ),
+        adopted_at TEXT NOT NULL,
+        UNIQUE (attempt_id, source_attempt_id),
+        CHECK (attempt_id <> source_attempt_id)
+    ) WITHOUT ROWID
+    """,
+    """
+    CREATE INDEX raw_acquisition_adoption_source_idx
+        ON raw_acquisition_adoptions(source_attempt_id, adopted_at)
+    """,
+    "DROP TRIGGER canonical_batches_state_transition",
+    """
+    CREATE TRIGGER canonical_batches_state_transition
+    BEFORE UPDATE OF state ON canonical_batches
+    FOR EACH ROW WHEN NEW.state <> OLD.state
+    BEGIN
+        SELECT CASE WHEN NOT (
+            (OLD.state = 'PUBLISHED' AND NEW.state IN ('VERIFIED', 'INVALID', 'PURGED'))
+            OR (OLD.state = 'VERIFIED' AND NEW.state IN ('INVALID', 'PURGED'))
+            OR (OLD.state = 'INVALID' AND NEW.state IN ('VERIFIED', 'PURGED'))
+        ) THEN RAISE(ABORT, 'invalid canonical batch state transition') END;
+    END
+    """,
+)
+
+
+_MIGRATION_6_STATEMENTS: Final[tuple[str, ...]] = (
+    """
+    CREATE TABLE quarantine_artifacts (
+        quarantine_artifact_id TEXT PRIMARY KEY,
+        provider TEXT NOT NULL,
+        dataset TEXT NOT NULL,
+        request_spec_id TEXT NOT NULL
+            REFERENCES request_specs(request_spec_id) ON DELETE RESTRICT,
+        batch_context_id TEXT NOT NULL
+            REFERENCES batch_contexts(batch_context_id) ON DELETE RESTRICT,
+        policy_snapshot_id TEXT NOT NULL
+            REFERENCES policy_snapshots(policy_snapshot_id) ON DELETE RESTRICT,
+        request_instance_id TEXT NOT NULL
+            REFERENCES request_instances(request_instance_id) ON DELETE RESTRICT,
+        attempt_id TEXT NOT NULL
+            REFERENCES request_attempts(attempt_id) ON DELETE RESTRICT,
+        relative_path TEXT NOT NULL,
+        manifest_content_sha256 TEXT NOT NULL CHECK (
+            length(manifest_content_sha256) = 64
+            AND manifest_content_sha256 NOT GLOB '*[^0-9a-f]*'
+        ),
+        manifest_byte_count INTEGER NOT NULL CHECK (manifest_byte_count > 0),
+        validation_summary_json TEXT NOT NULL,
+        state TEXT NOT NULL CHECK (state IN ('VERIFIED', 'INVALID', 'PURGED')),
+        created_at TEXT NOT NULL,
+        invalidated_at TEXT,
+        UNIQUE (provider, dataset, relative_path),
+        UNIQUE (attempt_id, quarantine_artifact_id),
+        CHECK (
+            (state = 'VERIFIED' AND invalidated_at IS NULL)
+            OR (state IN ('INVALID', 'PURGED') AND invalidated_at IS NOT NULL)
+        )
+    ) WITHOUT ROWID
+    """,
+    """
+    CREATE INDEX quarantine_artifacts_dataset_state_idx
+        ON quarantine_artifacts(provider, dataset, state, created_at)
+    """,
+)
+
+
+_MIGRATION_7_STATEMENTS: Final[tuple[str, ...]] = (
+    """
+    CREATE TABLE raw_replay_operations (
+        operation_id TEXT PRIMARY KEY
+            REFERENCES ingestion_runs(run_id) ON DELETE RESTRICT,
+        canonical_batch_id TEXT NOT NULL
+            REFERENCES canonical_batches(canonical_batch_id) ON DELETE RESTRICT,
+        request_spec_id TEXT NOT NULL
+            REFERENCES request_specs(request_spec_id) ON DELETE RESTRICT,
+        provider TEXT NOT NULL,
+        dataset TEXT NOT NULL,
+        interval_start TEXT NOT NULL,
+        interval_end TEXT NOT NULL,
+        replay_reason TEXT NOT NULL CHECK (
+            replay_reason IN ('CANONICAL_LOSS', 'CANONICAL_STALE')
+        ),
+        evidence_json TEXT NOT NULL,
+        evidence_hash TEXT NOT NULL CHECK (
+            length(evidence_hash) = 64
+            AND evidence_hash NOT GLOB '*[^0-9a-f]*'
+        ),
+        status TEXT NOT NULL CHECK (status IN ('PLANNED', 'RUNNING', 'SUCCESS', 'FAILED')),
+        requested_at TEXT NOT NULL,
+        started_at TEXT,
+        completed_at TEXT,
+        result_hash TEXT CHECK (
+            result_hash IS NULL OR (
+                length(result_hash) = 64
+                AND result_hash NOT GLOB '*[^0-9a-f]*'
+            )
+        ),
+        error_code TEXT,
+        sanitized_error TEXT,
+        CHECK (interval_start < interval_end),
+        CHECK (
+            (status = 'PLANNED' AND started_at IS NULL AND completed_at IS NULL
+                AND result_hash IS NULL AND error_code IS NULL AND sanitized_error IS NULL)
+            OR (status = 'RUNNING' AND started_at IS NOT NULL AND completed_at IS NULL
+                AND result_hash IS NULL AND error_code IS NULL AND sanitized_error IS NULL)
+            OR (status = 'SUCCESS' AND started_at IS NOT NULL AND completed_at IS NOT NULL
+                AND result_hash IS NOT NULL AND error_code IS NULL AND sanitized_error IS NULL)
+            OR (status = 'FAILED' AND completed_at IS NOT NULL
+                AND result_hash IS NULL AND error_code IS NOT NULL
+                AND sanitized_error IS NOT NULL)
+        )
+    ) WITHOUT ROWID
+    """,
+    """
+    CREATE INDEX raw_replay_operations_target_idx
+        ON raw_replay_operations(request_spec_id, status, requested_at)
+    """,
+    """
+    CREATE TRIGGER raw_replay_operations_status_transition
+    BEFORE UPDATE OF status ON raw_replay_operations
+    FOR EACH ROW WHEN NEW.status <> OLD.status
+    BEGIN
+        SELECT CASE WHEN NOT (
+            (OLD.status = 'PLANNED' AND NEW.status IN ('RUNNING', 'FAILED'))
+            OR (OLD.status = 'RUNNING' AND NEW.status IN ('SUCCESS', 'FAILED'))
+        ) THEN RAISE(ABORT, 'invalid raw replay operation status transition') END;
+    END
+    """,
+)
+
+
+_MIGRATION_8_STATEMENTS: Final[tuple[str, ...]] = (
+    """
+    CREATE TABLE semantic_noop_commits (
+        request_instance_id TEXT PRIMARY KEY
+            REFERENCES request_instances(request_instance_id) ON DELETE RESTRICT,
+        attempt_id TEXT NOT NULL UNIQUE
+            REFERENCES attempt_acquisition_records(attempt_id) ON DELETE RESTRICT,
+        request_spec_id TEXT NOT NULL
+            REFERENCES request_specs(request_spec_id) ON DELETE RESTRICT,
+        batch_context_id TEXT NOT NULL
+            REFERENCES batch_contexts(batch_context_id) ON DELETE RESTRICT,
+        policy_snapshot_id TEXT NOT NULL
+            REFERENCES policy_snapshots(policy_snapshot_id) ON DELETE RESTRICT,
+        acquisition_authorization_hash TEXT NOT NULL,
+        processing_signature_hash TEXT NOT NULL CHECK (
+            length(processing_signature_hash) = 64
+            AND processing_signature_hash NOT GLOB '*[^0-9a-f]*'
+        ),
+        semantic_duplicate_count INTEGER NOT NULL CHECK (semantic_duplicate_count > 0),
+        duplicate_observations_json TEXT NOT NULL,
+        duplicate_observations_hash TEXT NOT NULL CHECK (
+            length(duplicate_observations_hash) = 64
+            AND duplicate_observations_hash NOT GLOB '*[^0-9a-f]*'
+        ),
+        proof_hash TEXT NOT NULL CHECK (
+            length(proof_hash) = 64
+            AND proof_hash NOT GLOB '*[^0-9a-f]*'
+        ),
+        lease_owner_id TEXT NOT NULL,
+        lease_generation INTEGER NOT NULL CHECK (lease_generation > 0),
+        committed_at TEXT NOT NULL,
+        FOREIGN KEY (attempt_id, acquisition_authorization_hash)
+            REFERENCES attempt_acquisition_records(attempt_id, authorization_hash)
+            ON DELETE RESTRICT
+    ) WITHOUT ROWID
+    """,
+    """
+    CREATE TABLE semantic_noop_supporting_batches (
+        request_instance_id TEXT NOT NULL
+            REFERENCES semantic_noop_commits(request_instance_id) ON DELETE RESTRICT,
+        canonical_batch_id TEXT NOT NULL
+            REFERENCES canonical_batches(canonical_batch_id) ON DELETE RESTRICT,
+        PRIMARY KEY (request_instance_id, canonical_batch_id)
+    ) WITHOUT ROWID
+    """,
+    """
+    CREATE INDEX semantic_noop_supporting_batches_batch_idx
+        ON semantic_noop_supporting_batches(canonical_batch_id, request_instance_id)
+    """,
+)
+
+
+_MIGRATION_9_STATEMENTS: Final[tuple[str, ...]] = (
+    "DROP INDEX gaps_stream_status_idx",
+    """
+    CREATE TABLE gaps_episode_m9 (
+        gap_id TEXT PRIMARY KEY,
+        stream_id TEXT NOT NULL REFERENCES stream_keys(stream_id) ON DELETE RESTRICT,
+        interval_start TEXT NOT NULL,
+        interval_end TEXT NOT NULL,
+        gap_type TEXT NOT NULL CHECK (gap_type IN (
+            'ACQUISITION', 'INTEGRITY', 'EXPECTED_OBSERVATION',
+            'CORRECTION', 'CALENDAR_STALE'
+        )),
+        status TEXT NOT NULL CHECK (status IN ('OPEN', 'REPAIRING', 'RESOLVED', 'INVALIDATED')),
+        blocking INTEGER NOT NULL CHECK (blocking IN (0, 1)),
+        detected_at TEXT NOT NULL,
+        resolved_at TEXT,
+        request_instance_id TEXT
+            REFERENCES request_instances(request_instance_id) ON DELETE RESTRICT,
+        canonical_batch_id TEXT REFERENCES canonical_batches(canonical_batch_id) ON DELETE RESTRICT,
+        CHECK (interval_start < interval_end)
+    )
+    """,
+    """
+    INSERT INTO gaps_episode_m9(
+        gap_id, stream_id, interval_start, interval_end, gap_type,
+        status, blocking, detected_at, resolved_at,
+        request_instance_id, canonical_batch_id
+    )
+    SELECT
+        gap_id, stream_id, interval_start, interval_end, gap_type,
+        status, blocking, detected_at, resolved_at,
+        request_instance_id, canonical_batch_id
+    FROM gaps
+    """,
+    "DROP TABLE gaps",
+    "ALTER TABLE gaps_episode_m9 RENAME TO gaps",
+    """
+    CREATE INDEX gaps_stream_status_idx ON gaps(stream_id, status, interval_start)
+    """,
+    """
+    CREATE INDEX gaps_episode_lookup_idx
+        ON gaps(stream_id, interval_start, interval_end, gap_type, status, detected_at)
+    """,
+    """
+    CREATE TABLE calendar_snapshot_reconciliations (
+        reconciliation_id TEXT PRIMARY KEY,
+        source_calendar_snapshot_id TEXT NOT NULL
+            REFERENCES calendar_snapshots(calendar_snapshot_id) ON DELETE RESTRICT,
+        target_calendar_snapshot_id TEXT NOT NULL
+            REFERENCES calendar_snapshots(calendar_snapshot_id) ON DELETE RESTRICT,
+        affected_sessions_json TEXT NOT NULL,
+        diff_hash TEXT NOT NULL CHECK (
+            length(diff_hash) = 64
+            AND diff_hash NOT GLOB '*[^0-9a-f]*'
+        ),
+        reconciled_at TEXT NOT NULL,
+        UNIQUE (source_calendar_snapshot_id, target_calendar_snapshot_id),
+        CHECK (source_calendar_snapshot_id <> target_calendar_snapshot_id)
+    ) WITHOUT ROWID
+    """,
+    """
+    CREATE TABLE calendar_coverage_rebindings (
+        reconciliation_id TEXT NOT NULL
+            REFERENCES calendar_snapshot_reconciliations(reconciliation_id) ON DELETE RESTRICT,
+        coverage_id TEXT NOT NULL
+            REFERENCES coverage_segments(coverage_id) ON DELETE RESTRICT,
+        source_calendar_snapshot_id TEXT NOT NULL
+            REFERENCES calendar_snapshots(calendar_snapshot_id) ON DELETE RESTRICT,
+        target_calendar_snapshot_id TEXT NOT NULL
+            REFERENCES calendar_snapshots(calendar_snapshot_id) ON DELETE RESTRICT,
+        rebound_at TEXT NOT NULL,
+        PRIMARY KEY (reconciliation_id, coverage_id),
+        CHECK (source_calendar_snapshot_id <> target_calendar_snapshot_id)
+    ) WITHOUT ROWID
+    """,
+    """
+    CREATE TABLE calendar_watermark_rebindings (
+        reconciliation_id TEXT NOT NULL
+            REFERENCES calendar_snapshot_reconciliations(reconciliation_id) ON DELETE RESTRICT,
+        stream_id TEXT NOT NULL REFERENCES stream_keys(stream_id) ON DELETE RESTRICT,
+        source_calendar_snapshot_id TEXT NOT NULL
+            REFERENCES calendar_snapshots(calendar_snapshot_id) ON DELETE RESTRICT,
+        target_calendar_snapshot_id TEXT NOT NULL
+            REFERENCES calendar_snapshots(calendar_snapshot_id) ON DELETE RESTRICT,
+        rebound_at TEXT NOT NULL,
+        PRIMARY KEY (reconciliation_id, stream_id),
+        CHECK (source_calendar_snapshot_id <> target_calendar_snapshot_id)
+    ) WITHOUT ROWID
+    """,
+    """
+    CREATE TABLE calendar_stale_gap_provenance (
+        gap_id TEXT PRIMARY KEY REFERENCES gaps(gap_id) ON DELETE RESTRICT,
+        reconciliation_id TEXT NOT NULL
+            REFERENCES calendar_snapshot_reconciliations(reconciliation_id) ON DELETE RESTRICT,
+        session_date TEXT NOT NULL,
+        UNIQUE (reconciliation_id, gap_id)
+    ) WITHOUT ROWID
+    """,
+    """
+    CREATE TABLE calendar_stale_gap_coverage (
+        gap_id TEXT NOT NULL
+            REFERENCES calendar_stale_gap_provenance(gap_id) ON DELETE RESTRICT,
+        coverage_id TEXT NOT NULL
+            REFERENCES coverage_segments(coverage_id) ON DELETE RESTRICT,
+        PRIMARY KEY (gap_id, coverage_id)
+    ) WITHOUT ROWID
+    """,
+    """
+    CREATE INDEX calendar_stale_gap_reconciliation_idx
+        ON calendar_stale_gap_provenance(reconciliation_id, session_date, gap_id)
+    """,
+)
+
+
+_MIGRATION_10_STATEMENTS: Final[tuple[str, ...]] = (
+    """
+    CREATE TABLE coverage_origin_rebindings (
+        rebind_id TEXT PRIMARY KEY,
+        stream_id TEXT NOT NULL REFERENCES stream_keys(stream_id) ON DELETE RESTRICT,
+        source_coverage_start TEXT NOT NULL,
+        target_coverage_start TEXT NOT NULL,
+        run_id TEXT NOT NULL REFERENCES ingestion_runs(run_id) ON DELETE RESTRICT,
+        request_instance_id TEXT NOT NULL
+            REFERENCES request_instances(request_instance_id) ON DELETE RESTRICT,
+        canonical_batch_id TEXT NOT NULL
+            REFERENCES canonical_batches(canonical_batch_id) ON DELETE RESTRICT,
+        rebound_at TEXT NOT NULL,
+        UNIQUE (stream_id, source_coverage_start, target_coverage_start, request_instance_id),
+        CHECK (target_coverage_start < source_coverage_start)
+    ) WITHOUT ROWID
+    """,
+    """
+    CREATE INDEX coverage_origin_rebindings_stream_idx
+        ON coverage_origin_rebindings(stream_id, rebound_at, rebind_id)
+    """,
+)
+
+
+_MIGRATION_11_STATEMENTS: Final[tuple[str, ...]] = (
+    """
+    CREATE TABLE ingestion_execution_limits (
+        run_id TEXT PRIMARY KEY REFERENCES ingestion_runs(run_id) ON DELETE RESTRICT,
+        max_pages INTEGER NOT NULL CHECK (max_pages > 0 AND max_pages <= 1000),
+        max_calls INTEGER NOT NULL CHECK (max_calls > 0 AND max_calls <= 1000),
+        max_pages_per_request INTEGER NOT NULL
+            CHECK (max_pages_per_request > 0 AND max_pages_per_request <= 1000),
+        max_calls_per_request INTEGER NOT NULL
+            CHECK (max_calls_per_request > 0 AND max_calls_per_request <= 1000),
+        limits_hash TEXT NOT NULL CHECK (
+            length(limits_hash) = 64
+            AND limits_hash NOT GLOB '*[^0-9a-f]*'
+        )
+    ) WITHOUT ROWID
+    """,
+    """
+    CREATE TABLE request_execution_limits (
+        request_instance_id TEXT PRIMARY KEY
+            REFERENCES request_instances(request_instance_id) ON DELETE RESTRICT,
+        run_id TEXT NOT NULL REFERENCES ingestion_execution_limits(run_id) ON DELETE RESTRICT,
+        max_pages INTEGER NOT NULL CHECK (max_pages > 0 AND max_pages <= 1000),
+        max_calls INTEGER NOT NULL CHECK (max_calls > 0 AND max_calls <= 1000),
+        limits_hash TEXT NOT NULL CHECK (
+            length(limits_hash) = 64
+            AND limits_hash NOT GLOB '*[^0-9a-f]*'
+        )
+    ) WITHOUT ROWID
+    """,
+    """
+    CREATE INDEX request_execution_limits_run_idx
+        ON request_execution_limits(run_id, request_instance_id)
+    """,
+    """
+    CREATE TABLE ingestion_dispatch_claims (
+        dispatch_claim_id TEXT PRIMARY KEY,
+        run_id TEXT NOT NULL REFERENCES ingestion_execution_limits(run_id) ON DELETE RESTRICT,
+        request_instance_id TEXT NOT NULL
+            REFERENCES request_execution_limits(request_instance_id) ON DELETE RESTRICT,
+        attempt_id TEXT NOT NULL REFERENCES request_attempts(attempt_id) ON DELETE RESTRICT,
+        dispatch_ordinal INTEGER NOT NULL CHECK (dispatch_ordinal > 0),
+        page_ordinal INTEGER NOT NULL CHECK (page_ordinal >= 0),
+        claimed_at TEXT NOT NULL,
+        UNIQUE (attempt_id, dispatch_ordinal)
+    ) WITHOUT ROWID
+    """,
+    """
+    CREATE INDEX ingestion_dispatch_claims_run_idx
+        ON ingestion_dispatch_claims(run_id, dispatch_claim_id)
+    """,
+    """
+    CREATE INDEX ingestion_dispatch_claims_request_idx
+        ON ingestion_dispatch_claims(request_instance_id, dispatch_claim_id)
+    """,
+)
+
+
 MIGRATIONS: Final[tuple[Migration, ...]] = (
     Migration(version=1, name="initial_operational_state", statements=_MIGRATION_1_STATEMENTS),
     Migration(
@@ -1083,6 +1559,46 @@ MIGRATIONS: Final[tuple[Migration, ...]] = (
         version=3,
         name="transactional_publication_commit",
         statements=_MIGRATION_3_STATEMENTS,
+    ),
+    Migration(
+        version=4,
+        name="idempotent_provider_budget_reservations",
+        statements=_MIGRATION_4_STATEMENTS,
+    ),
+    Migration(
+        version=5,
+        name="cross_run_raw_acquisition_replay",
+        statements=_MIGRATION_5_STATEMENTS,
+    ),
+    Migration(
+        version=6,
+        name="policy_authorized_quarantine_findings",
+        statements=_MIGRATION_6_STATEMENTS,
+    ),
+    Migration(
+        version=7,
+        name="dedicated_raw_replay_operations",
+        statements=_MIGRATION_7_STATEMENTS,
+    ),
+    Migration(
+        version=8,
+        name="semantic_noop_terminal_proofs",
+        statements=_MIGRATION_8_STATEMENTS,
+    ),
+    Migration(
+        version=9,
+        name="gap_episodes_and_calendar_reconciliation",
+        statements=_MIGRATION_9_STATEMENTS,
+    ),
+    Migration(
+        version=10,
+        name="coverage_origin_rebinding_provenance",
+        statements=_MIGRATION_10_STATEMENTS,
+    ),
+    Migration(
+        version=11,
+        name="durable_request_execution_limits",
+        statements=_MIGRATION_11_STATEMENTS,
     ),
 )
 LATEST_SCHEMA_VERSION: Final = MIGRATIONS[-1].version

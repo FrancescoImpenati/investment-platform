@@ -411,7 +411,7 @@ class PrivateDataRoot:
 
         if self.sentinel_path.exists():
             sentinel = self.read_sentinel()
-            self.ensure_directory(ALPACA_EVIDENCE_RELATIVE_PATH)
+            self._ensure_approved_layout(expected_root_id=sentinel.root_id)
             return sentinel
         try:
             entries = tuple(self._root.iterdir())
@@ -454,7 +454,9 @@ class PrivateDataRoot:
                 finally:
                     os.close(directory_descriptor)
         except FileExistsError:
-            return self.read_sentinel()
+            confirmed = self.read_sentinel()
+            self._ensure_approved_layout(expected_root_id=confirmed.root_id)
+            return confirmed
         except OSError as error:
             raise PrivateDataRootError(
                 "failed to publish the private data root sentinel"
@@ -463,8 +465,18 @@ class PrivateDataRoot:
             temporary.unlink(missing_ok=True)
 
         confirmed = self.read_sentinel()
-        self.ensure_directory(ALPACA_EVIDENCE_RELATIVE_PATH)
+        self._ensure_approved_layout(expected_root_id=confirmed.root_id)
         return confirmed
+
+    def _ensure_approved_layout(self, *, expected_root_id: UUID) -> None:
+        """Materialize the complete, fixed Phase 2 namespace layout below an owned root."""
+
+        for namespace in sorted(MANAGED_NAMESPACES):
+            self.ensure_directory(namespace, expected_root_id=expected_root_id)
+        self.ensure_directory(
+            ALPACA_EVIDENCE_RELATIVE_PATH,
+            expected_root_id=expected_root_id,
+        )
 
     def validate(self, *, expected_root_id: UUID | None = None) -> PrivateRootSentinel:
         sentinel = self.read_sentinel()

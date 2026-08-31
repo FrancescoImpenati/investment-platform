@@ -13,7 +13,7 @@ import hashlib
 import json
 import re
 import sqlite3
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 from enum import StrEnum
 from itertools import pairwise
@@ -26,11 +26,14 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from investment_platform.data.ingestion.coverage import (
     CoverageSegment,
     GapFinding,
+    GapStatus,
+    GapType,
     MaterializedWatermark,
 )
 from investment_platform.data.ingestion.identity import (
     AttemptIdentity,
     BatchContext,
+    ProcessingSignature,
     RawArtifactIdentity,
     RequestSpecification,
 )
@@ -94,9 +97,20 @@ class ExecutionIntegrityError(ExecutionRepositoryError):
     """Published files or their relational provenance are incomplete or inconsistent."""
 
 
+class ProviderDispatchLimitExceededError(ExecutionStateConflictError):
+    """A durable request or run provider-dispatch ceiling is exhausted."""
+
+
 class PublicationCommitSource(StrEnum):
     NORMAL = "NORMAL"
     RECOVERY_ADOPTION = "RECOVERY_ADOPTION"
+
+
+class AttemptFailureStatus(StrEnum):
+    """Durable terminal state of one provider acquisition attempt."""
+
+    RETRYABLE_FAILED = "RETRYABLE_FAILED"
+    FATAL_FAILED = "FATAL_FAILED"
 
 
 class ExecutionFaultPoint(StrEnum):
@@ -130,6 +144,57 @@ class DurableAttempt(_FrozenExecutionModel):
         return _as_utc(value, label="started_at")
 
 
+class ProviderDispatchClaim(_FrozenExecutionModel):
+    """One conservatively counted provider call claimed before network dispatch."""
+
+    dispatch_claim_id: str = Field(pattern=r"^dispatch_claim_v1_[0-9a-f]{64}$")
+    run_id: UUID
+    request_instance_id: UUID
+    attempt_id: UUID
+    dispatch_ordinal: Annotated[int, Field(gt=0)]
+    page_ordinal: Annotated[int, Field(ge=0)]
+    claimed_at: datetime
+
+    @field_validator("claimed_at", mode="after")
+    @classmethod
+    def normalize_claimed_at(cls, value: datetime) -> datetime:
+        return _as_utc(value, label="claimed_at")
+
+
+class AttemptFailureResult(_FrozenExecutionModel):
+    """Sanitized durable result of one failed provider attempt."""
+
+    run_id: UUID
+    request_instance_id: UUID
+    attempt_id: UUID
+    attempt_status: AttemptFailureStatus
+    request_status: RequestInstanceStatus
+    error_id: str = Field(pattern=_DURABLE_ID)
+    retry_count: Annotated[int, Field(gt=0)]
+    max_attempts: Annotated[int, Field(gt=0)]
+    next_eligible_at: datetime | None = None
+    failed_at: datetime
+    replayed: bool
+
+    @field_validator("next_eligible_at", "failed_at", mode="after")
+    @classmethod
+    def normalize_times(cls, value: datetime | None) -> datetime | None:
+        return None if value is None else _as_utc(value, label="failure timestamp")
+
+    @model_validator(mode="after")
+    def validate_retry_state(self) -> Self:
+        if self.retry_count > self.max_attempts:
+            raise ValueError("retry count exceeds the durable attempt limit")
+        should_wait = self.request_status is RequestInstanceStatus.RETRY_WAIT
+        if should_wait != (self.next_eligible_at is not None):
+            raise ValueError("retry-wait result and next eligibility disagree")
+        if should_wait and self.attempt_status is not AttemptFailureStatus.RETRYABLE_FAILED:
+            raise ValueError("only a retryable failure may enter retry wait")
+        if self.next_eligible_at is not None and self.next_eligible_at < self.failed_at:
+            raise ValueError("retry eligibility cannot precede the failure")
+        return self
+
+
 class CatalogedRawArtifact(_FrozenExecutionModel):
     attempt_id: UUID
     artifact_id: str = Field(pattern=r"^raw_v1_[0-9a-f]{64}$")
@@ -140,6 +205,15 @@ class CatalogedRawArtifact(_FrozenExecutionModel):
     byte_count: Annotated[int, Field(ge=0)]
     manifest_content_sha256: str = Field(pattern=_SHA256)
     manifest_byte_count: Annotated[int, Field(gt=0)]
+    replayed: bool
+
+
+class CatalogedRawOrphan(_FrozenExecutionModel):
+    """Verified physical raw bytes with no invented retrieval provenance."""
+
+    artifact_id: str = Field(pattern=r"^raw_v1_[0-9a-f]{64}$")
+    request_instance_id: UUID
+    state: str = Field(pattern=r"^(PRESENT|VERIFIED)$")
     replayed: bool
 
 
@@ -271,6 +345,97 @@ class PublicationCommitResult(_FrozenExecutionModel):
         return _as_utc(value, label="committed_at")
 
 
+class SemanticNoOpObservationProof(_FrozenExecutionModel):
+    observation_id: str = Field(pattern=r"^observation_v1_[0-9a-f]{64}$")
+    value_fingerprint: str = Field(pattern=_SHA256)
+    stream_id: str = Field(pattern=_DURABLE_ID)
+    start: datetime
+    end: datetime
+    matching_supporting_batch_ids: Annotated[tuple[str, ...], Field(min_length=1)]
+
+    @field_validator("start", "end", mode="after")
+    @classmethod
+    def normalize_observation_time(cls, value: datetime) -> datetime:
+        return _as_utc(value, label="semantic duplicate interval")
+
+    @model_validator(mode="after")
+    def validate_observation_proof(self) -> Self:
+        if self.end <= self.start:
+            raise ValueError("semantic duplicate interval must be half-open and non-empty")
+        if self.matching_supporting_batch_ids != tuple(
+            sorted(set(self.matching_supporting_batch_ids))
+        ) or any(
+            re.fullmatch(r"^batch_v1_[0-9a-f]{64}$", value) is None
+            for value in self.matching_supporting_batch_ids
+        ):
+            raise ValueError("semantic duplicate supporting batches must be unique and ordered")
+        return self
+
+
+class SemanticNoOpCommitRequest(_FrozenExecutionModel):
+    identity: AttemptIdentity
+    specification: RequestSpecification
+    acquisition_authorization: AcquisitionPolicyAuthorization
+    processing_signature: ProcessingSignature
+    batch_context_id: str = Field(pattern=r"^batch_context_v1_[0-9a-f]{64}$")
+    duplicate_observations: Annotated[tuple[SemanticNoOpObservationProof, ...], Field(min_length=1)]
+
+    @property
+    def supporting_batch_ids(self) -> tuple[str, ...]:
+        return tuple(
+            sorted(
+                {
+                    batch_id
+                    for observation in self.duplicate_observations
+                    for batch_id in observation.matching_supporting_batch_ids
+                }
+            )
+        )
+
+    @model_validator(mode="after")
+    def validate_exact_proof(self) -> Self:
+        expected_order = tuple(
+            sorted(
+                self.duplicate_observations,
+                key=lambda value: (value.start, value.stream_id, value.observation_id),
+            )
+        )
+        if self.duplicate_observations != expected_order or len(
+            {value.observation_id for value in self.duplicate_observations}
+        ) != len(self.duplicate_observations):
+            raise ValueError("semantic duplicate observations must be unique and ordered")
+        if {value.stream_id for value in self.duplicate_observations} != {
+            value.stream_id for value in self.specification.stream_keys()
+        }:
+            raise ValueError("semantic duplicate proof does not cover every exact request stream")
+        if any(
+            value.start < self.specification.start or value.end > self.specification.end
+            for value in self.duplicate_observations
+        ):
+            raise ValueError("semantic duplicate proof exceeds the bounded request")
+        if (
+            self.acquisition_authorization.request.request_spec_hash
+            != self.specification.request_spec_hash
+        ):
+            raise ValueError("semantic no-op authorization belongs to another request")
+        return self
+
+
+class SemanticNoOpCommitResult(_FrozenExecutionModel):
+    run_id: UUID
+    request_instance_id: UUID
+    attempt_id: UUID
+    semantic_duplicate_count: Annotated[int, Field(gt=0)]
+    supporting_batch_ids: tuple[str, ...]
+    committed_at: datetime
+    replayed: bool
+
+    @field_validator("committed_at", mode="after")
+    @classmethod
+    def normalize_semantic_noop_time(cls, value: datetime) -> datetime:
+        return _as_utc(value, label="committed_at")
+
+
 class TerminalFailureResult(_FrozenExecutionModel):
     run_id: UUID
     request_instance_id: UUID
@@ -318,8 +483,43 @@ def _hash_json(value: object) -> str:
     return hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()
 
 
+def _provider_dispatch_claim_id(
+    identity: AttemptIdentity,
+    *,
+    dispatch_ordinal: int,
+    page_ordinal: int,
+) -> str:
+    digest = _hash_json(
+        {
+            "attempt_id": str(identity.attempt_id),
+            "dispatch_ordinal": dispatch_ordinal,
+            "page_ordinal": page_ordinal,
+            "request_instance_id": str(identity.request_instance_id),
+            "version": 1,
+        }
+    )
+    return f"dispatch_claim_v1_{digest}"
+
+
 def _hash_model(value: BaseModel) -> str:
     return _hash_json(value.model_dump(mode="json"))
+
+
+def _parse_request_specification(value: str) -> RequestSpecification:
+    try:
+        document = json.loads(value)
+    except json.JSONDecodeError as error:
+        raise ExecutionIntegrityError("bounded request specification is malformed") from error
+    if (
+        not isinstance(document, dict)
+        or document.get("kind") != "request-specification"
+        or not isinstance(document.get("payload"), dict)
+    ):
+        raise ExecutionIntegrityError("bounded request specification is malformed")
+    specification = RequestSpecification.model_validate(document["payload"])
+    if specification.canonical_json != value:
+        raise ExecutionIntegrityError("bounded request specification is non-canonical")
+    return specification
 
 
 def _raw_identity_from_authorization(
@@ -374,8 +574,9 @@ class IngestionExecutionRepository:
 
         authorization_json = _canonical_json(authorization)
         authorization_hash = _hash_json(authorization.model_dump(mode="json"))
+        dispatch_observed_at = self._store._now()
         started = (
-            self._store._now() if started_at is None else _as_utc(started_at, label="started_at")
+            dispatch_observed_at if started_at is None else _as_utc(started_at, label="started_at")
         )
         if started < authorization.authorized_at:
             raise ExecutionStateConflictError("attempt cannot start before request authorization")
@@ -468,6 +669,24 @@ class IngestionExecutionRepository:
                     raise ExecutionStateConflictError(
                         "attempt number must continue the durable 1-based sequence"
                     )
+                retry = connection.execute(
+                    "SELECT * FROM retry_state WHERE request_instance_id = ?",
+                    (str(identity.request_instance_id),),
+                ).fetchone()
+                if retry is None:
+                    raise ExecutionStateConflictError("request retry policy is not durable")
+                if identity.attempt_number > int(retry["max_attempts"]):
+                    raise ExecutionStateConflictError("durable attempt limit is exhausted")
+                if request_status is RequestInstanceStatus.RETRY_WAIT:
+                    eligible_at = retry["next_eligible_at"]
+                    if (
+                        eligible_at is None
+                        or int(retry["retry_count"]) != identity.attempt_number - 1
+                        or _parse_utc(str(eligible_at)) > dispatch_observed_at
+                    ):
+                        raise ExecutionStateConflictError(
+                            "retry attempt is not yet eligible or has inconsistent state"
+                        )
                 if str(request["run_status"]) == IngestionRunStatus.PLANNED.value:
                     connection.execute(
                         """
@@ -493,6 +712,13 @@ class IngestionExecutionRepository:
                     WHERE request_instance_id = ? AND status = 'DISPATCHING'
                     """,
                     (str(identity.request_instance_id),),
+                )
+                connection.execute(
+                    """
+                    UPDATE retry_state SET next_eligible_at = NULL, updated_at = ?
+                    WHERE request_instance_id = ?
+                    """,
+                    (_format_utc(started), str(identity.request_instance_id)),
                 )
                 connection.execute(
                     """
@@ -541,6 +767,356 @@ class IngestionExecutionRepository:
             request_authorization_hash=authorization_hash,
             started_at=started,
             replayed=False,
+        )
+
+    def claim_provider_dispatch(
+        self,
+        lease: WriterLease,
+        identity: AttemptIdentity,
+        *,
+        page_ordinal: int,
+    ) -> ProviderDispatchClaim:
+        """Count a possible provider call before crossing the network boundary.
+
+        A claim is never released.  A crash between this transaction and the
+        transport call therefore over-counts conservatively instead of allowing
+        a restart to exceed the request or run ceiling.
+        """
+
+        if page_ordinal < 0:
+            raise ValueError("page ordinal must be non-negative")
+        claimed_at = self._store._now()
+        try:
+            with self._store._leased_transaction(lease) as connection:
+                self._require_running_attempt(connection, identity)
+                limits = connection.execute(
+                    """
+                    SELECT instance.run_id,
+                           run_limit.max_pages AS run_max_pages,
+                           run_limit.max_calls AS run_max_calls,
+                           request_limit.max_pages AS request_max_pages,
+                           request_limit.max_calls AS request_max_calls
+                    FROM request_instances AS instance
+                    JOIN ingestion_execution_limits AS run_limit
+                      ON run_limit.run_id = instance.run_id
+                    JOIN request_execution_limits AS request_limit
+                      ON request_limit.request_instance_id = instance.request_instance_id
+                     AND request_limit.run_id = instance.run_id
+                    WHERE instance.request_instance_id = ?
+                    """,
+                    (str(identity.request_instance_id),),
+                ).fetchone()
+                if limits is None:
+                    raise ExecutionIntegrityError(
+                        "provider dispatch ceilings are not durably bound to the request"
+                    )
+                run_id = UUID(str(limits["run_id"]))
+                run_used = int(
+                    connection.execute(
+                        "SELECT count(*) FROM ingestion_dispatch_claims WHERE run_id = ?",
+                        (str(run_id),),
+                    ).fetchone()[0]
+                )
+                request_used = int(
+                    connection.execute(
+                        """
+                        SELECT count(*) FROM ingestion_dispatch_claims
+                        WHERE request_instance_id = ?
+                        """,
+                        (str(identity.request_instance_id),),
+                    ).fetchone()[0]
+                )
+                if run_used >= min(
+                    int(limits["run_max_pages"]),
+                    int(limits["run_max_calls"]),
+                ):
+                    raise ProviderDispatchLimitExceededError(
+                        "durable run provider-dispatch ceiling is exhausted"
+                    )
+                if request_used >= min(
+                    int(limits["request_max_pages"]),
+                    int(limits["request_max_calls"]),
+                ):
+                    raise ProviderDispatchLimitExceededError(
+                        "durable request provider-dispatch ceiling is exhausted"
+                    )
+                dispatch_ordinal = int(
+                    connection.execute(
+                        """
+                        SELECT count(*) FROM ingestion_dispatch_claims
+                        WHERE attempt_id = ?
+                        """,
+                        (str(identity.attempt_id),),
+                    ).fetchone()[0]
+                ) + 1
+                claim_id = _provider_dispatch_claim_id(
+                    identity,
+                    dispatch_ordinal=dispatch_ordinal,
+                    page_ordinal=page_ordinal,
+                )
+                connection.execute(
+                    """
+                    INSERT INTO ingestion_dispatch_claims(
+                        dispatch_claim_id, run_id, request_instance_id, attempt_id,
+                        dispatch_ordinal, page_ordinal, claimed_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        claim_id,
+                        str(run_id),
+                        str(identity.request_instance_id),
+                        str(identity.attempt_id),
+                        dispatch_ordinal,
+                        page_ordinal,
+                        _format_utc(claimed_at),
+                    ),
+                )
+                return ProviderDispatchClaim(
+                    dispatch_claim_id=claim_id,
+                    run_id=run_id,
+                    request_instance_id=identity.request_instance_id,
+                    attempt_id=identity.attempt_id,
+                    dispatch_ordinal=dispatch_ordinal,
+                    page_ordinal=page_ordinal,
+                    claimed_at=claimed_at,
+                )
+        except sqlite3.IntegrityError as error:
+            raise ExecutionIdentityCollisionError(
+                "SQLite rejected the provider dispatch claim"
+            ) from error
+
+    def record_attempt_failure(
+        self,
+        lease: WriterLease,
+        identity: AttemptIdentity,
+        *,
+        retryable: bool,
+        category: str,
+        code: str,
+        sanitized_message: str,
+        failed_at: datetime,
+        next_eligible_at: datetime | None = None,
+        blocking_gaps: Sequence[GapFinding] = (),
+    ) -> AttemptFailureResult:
+        """Durably finish one provider attempt without sleeping or dispatching its retry."""
+
+        if not re.fullmatch(_SAFE_CODE, category) or not re.fullmatch(_SAFE_CODE, code):
+            raise ValueError("failure category/code must be sanitized stable identifiers")
+        if (
+            not 1 <= len(sanitized_message) <= 512
+            or "\r" in sanitized_message
+            or "\n" in sanitized_message
+            or _SECRET_TEXT.search(sanitized_message)
+        ):
+            raise ValueError("failure message contains unsafe or secret-shaped text")
+        failed = _as_utc(failed_at, label="failed_at")
+        requested_next = (
+            None
+            if next_eligible_at is None
+            else _as_utc(next_eligible_at, label="next_eligible_at")
+        )
+        if not retryable and requested_next is not None:
+            raise ValueError("a fatal failure cannot schedule retry eligibility")
+        if requested_next is not None and requested_next < failed:
+            raise ValueError("next retry eligibility cannot precede the failure")
+        attempt_status = (
+            AttemptFailureStatus.RETRYABLE_FAILED
+            if retryable
+            else AttemptFailureStatus.FATAL_FAILED
+        )
+        error_id = "error_v1_" + _hash_json(
+            {
+                "attempt_id": str(identity.attempt_id),
+                "request_instance_id": str(identity.request_instance_id),
+                "retryable": retryable,
+                "category": category,
+                "code": code,
+            }
+        )
+        with self._store._leased_transaction(lease) as connection:
+            row = connection.execute(
+                """
+                SELECT attempt.*, instance.run_id, instance.status AS request_status,
+                       instance.completed_at AS request_completed_at,
+                       spec.specification_json,
+                       run.status AS run_status,
+                       retry.retry_count, retry.max_attempts,
+                       retry.next_eligible_at AS retry_next_eligible_at,
+                       retry.last_error_id
+                FROM request_attempts AS attempt
+                JOIN request_instances AS instance
+                  ON instance.request_instance_id = attempt.request_instance_id
+                JOIN ingestion_runs AS run ON run.run_id = instance.run_id
+                JOIN request_specs AS spec ON spec.request_spec_id = instance.request_spec_id
+                JOIN retry_state AS retry
+                  ON retry.request_instance_id = instance.request_instance_id
+                WHERE attempt.attempt_id = ?
+                """,
+                (str(identity.attempt_id),),
+            ).fetchone()
+            if row is None:
+                raise ExecutionStateConflictError("attempt is not durable")
+            if (
+                str(row["request_instance_id"]) != str(identity.request_instance_id)
+                or int(row["attempt_number"]) != identity.attempt_number
+            ):
+                raise ExecutionIdentityCollisionError(
+                    "attempt identity does not match durable state"
+                )
+            if row["started_at"] is None or failed < _parse_utc(str(row["started_at"])):
+                raise ExecutionStateConflictError("attempt failure precedes its durable start")
+            max_attempts = int(row["max_attempts"])
+            if identity.attempt_number > max_attempts:
+                raise ExecutionStateConflictError("attempt exceeds the durable attempt limit")
+            will_retry = retryable and identity.attempt_number < max_attempts
+            if will_retry and blocking_gaps:
+                raise ExecutionStateConflictError(
+                    "retryable acquisition cannot create a terminal blocking gap"
+                )
+            request_status = (
+                RequestInstanceStatus.RETRY_WAIT if will_retry else RequestInstanceStatus.FAILED
+            )
+            existing_error = connection.execute(
+                "SELECT * FROM errors WHERE error_id = ?",
+                (error_id,),
+            ).fetchone()
+            error_values = (
+                error_id,
+                str(row["run_id"]),
+                str(identity.request_instance_id),
+                str(identity.attempt_id),
+                category,
+                code,
+                sanitized_message,
+                int(retryable),
+                _format_utc(failed),
+            )
+            error_columns = (
+                "error_id",
+                "run_id",
+                "request_instance_id",
+                "attempt_id",
+                "category",
+                "code",
+                "sanitized_message",
+                "retryable",
+                "occurred_at",
+            )
+            replayed = existing_error is not None
+            if existing_error is not None:
+                if _row_tuple(existing_error, error_columns[:-1]) != error_values[:-1]:
+                    raise ExecutionIdentityCollisionError(
+                        "attempt failure identity collides with different sanitized facts"
+                    )
+                failed = _parse_utc(str(existing_error["occurred_at"]))
+            effective_next = (requested_next or failed) if will_retry else None
+            if replayed:
+                stored_next = (
+                    None
+                    if row["retry_next_eligible_at"] is None
+                    else _parse_utc(str(row["retry_next_eligible_at"]))
+                )
+                attempt_next = (
+                    None
+                    if row["next_eligible_at"] is None
+                    else _parse_utc(str(row["next_eligible_at"]))
+                )
+                request_completed = (
+                    None
+                    if row["request_completed_at"] is None
+                    else _parse_utc(str(row["request_completed_at"]))
+                )
+                expected_completed = None if will_retry else failed
+                if (
+                    str(row["status"]) != attempt_status.value
+                    or str(row["request_status"]) != request_status.value
+                    or int(row["retry_count"]) != identity.attempt_number
+                    or str(row["last_error_id"]) != error_id
+                    or stored_next != effective_next
+                    or attempt_next != effective_next
+                    or request_completed != expected_completed
+                ):
+                    raise ExecutionStateConflictError(
+                        "attempt failure replay differs from current durable retry state"
+                    )
+            else:
+                if (
+                    str(row["status"]) != "RUNNING"
+                    or str(row["request_status"]) != RequestInstanceStatus.ACQUIRING.value
+                    or str(row["run_status"]) != IngestionRunStatus.RUNNING.value
+                    or int(row["retry_count"]) != identity.attempt_number - 1
+                ):
+                    raise ExecutionStateConflictError(
+                        "attempt failure requires the current actively acquiring ordinal"
+                    )
+                connection.execute(
+                    f"INSERT INTO errors({', '.join(error_columns)}) "
+                    f"VALUES ({', '.join('?' for _ in error_columns)})",
+                    error_values,
+                )
+                connection.execute(
+                    """
+                    UPDATE request_attempts
+                    SET status = ?, completed_at = ?, next_eligible_at = ?
+                    WHERE attempt_id = ? AND status = 'RUNNING'
+                    """,
+                    (
+                        attempt_status.value,
+                        _format_utc(failed),
+                        None if effective_next is None else _format_utc(effective_next),
+                        str(identity.attempt_id),
+                    ),
+                )
+                connection.execute(
+                    """
+                    UPDATE retry_state
+                    SET retry_count = ?, next_eligible_at = ?, last_error_id = ?, updated_at = ?
+                    WHERE request_instance_id = ?
+                    """,
+                    (
+                        identity.attempt_number,
+                        None if effective_next is None else _format_utc(effective_next),
+                        error_id,
+                        _format_utc(failed),
+                        str(identity.request_instance_id),
+                    ),
+                )
+                connection.execute(
+                    """
+                    UPDATE request_instances SET status = ?, completed_at = ?
+                    WHERE request_instance_id = ? AND status = 'ACQUIRING'
+                    """,
+                    (
+                        request_status.value,
+                        None if will_retry else _format_utc(failed),
+                        str(identity.request_instance_id),
+                    ),
+                )
+            if not will_retry and blocking_gaps:
+                specification = _parse_request_specification(
+                    str(row["specification_json"])
+                )
+                self._upsert_terminal_gaps(
+                    connection,
+                    identity=identity,
+                    specification=specification,
+                    gaps=blocking_gaps,
+                    expected_gap_type=GapType.ACQUISITION,
+                    completed_at=failed,
+                    require_all_streams=True,
+                )
+        return AttemptFailureResult(
+            run_id=UUID(str(row["run_id"])),
+            request_instance_id=identity.request_instance_id,
+            attempt_id=identity.attempt_id,
+            attempt_status=attempt_status,
+            request_status=request_status,
+            error_id=error_id,
+            retry_count=identity.attempt_number,
+            max_attempts=max_attempts,
+            next_eligible_at=effective_next,
+            failed_at=failed,
+            replayed=replayed,
         )
 
     def record_raw_artifact(
@@ -738,6 +1314,93 @@ class IngestionExecutionRepository:
             byte_count=published.byte_count,
             manifest_content_sha256=manifest_sha256,
             manifest_byte_count=manifest_bytes,
+            replayed=replayed,
+        )
+
+    def catalog_raw_orphan(
+        self,
+        lease: WriterLease,
+        identity: AttemptIdentity,
+        specification: RequestSpecification,
+        artifact_identity: RawArtifactIdentity,
+        published: PublishedRawArtifact,
+        *,
+        verified_at: datetime,
+    ) -> CatalogedRawOrphan:
+        """Catalog interrupted immutable bytes as PRESENT, without replay provenance.
+
+        PRESENT artifacts are purgeable and visible to diagnostics, but cannot
+        support acquisition completion.  A later response with the exact same
+        content may attach real current-attempt provenance and promote the row
+        to VERIFIED through :meth:`record_raw_artifact`.
+        """
+
+        checked_at = _as_utc(verified_at, label="verified_at")
+        if str(published.root_id) != self._store.root_id:
+            raise ExecutionIntegrityError("raw orphan belongs to another private root")
+        if (
+            artifact_identity.request_spec_hash != specification.request_spec_hash
+            or published.artifact_id != artifact_identity.artifact_id
+            or published.content_sha256 != artifact_identity.content_sha256
+            or published.byte_count != artifact_identity.byte_count
+        ):
+            raise ExecutionIntegrityError("raw orphan differs from its exact request identity")
+        if not self._store._managed_file_matches_catalog(
+            published.payload_relative_path,
+            expected_sha256=published.content_sha256,
+            expected_bytes=published.byte_count,
+        ):
+            raise ExecutionIntegrityError("raw orphan payload failed content verification")
+        manifest_bytes = self._store._read_managed_file_bounded(
+            published.manifest_relative_path,
+            max_bytes=1024 * 1024,
+        )
+        try:
+            manifest = RawArtifactManifest.model_validate_json(manifest_bytes)
+        except ValueError as error:
+            raise ExecutionIntegrityError("raw orphan manifest is invalid") from error
+        if (
+            manifest.identity != artifact_identity
+            or manifest.provider != specification.provider
+            or manifest.dataset != specification.dataset
+            or manifest.first_persisted_at != published.first_persisted_at
+        ):
+            raise ExecutionIntegrityError("raw orphan manifest differs from recovery input")
+        manifest_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
+        with self._store._leased_transaction(lease) as connection:
+            attempt = self._require_running_attempt(connection, identity)
+            authorization = RequestPolicyAuthorization.model_validate_json(
+                str(attempt["authorization_json"])
+            )
+            if (
+                authorization.request_spec_hash != specification.request_spec_hash
+                or str(attempt["request_spec_id"]) != specification.request_spec_id
+                or authorization.request_start != specification.start
+                or authorization.request_end != specification.end
+            ):
+                raise ExecutionIntegrityError(
+                    "raw orphan recovery differs from durable request authorization"
+                )
+            replayed = self._persist_raw_artifact_row(
+                connection,
+                artifact_identity,
+                published,
+                manifest_sha256=manifest_sha256,
+                manifest_bytes=len(manifest_bytes),
+                verified_at=checked_at,
+                requested_state="PRESENT",
+            )
+            row = connection.execute(
+                "SELECT state FROM raw_artifacts WHERE artifact_id = ?",
+                (artifact_identity.artifact_id,),
+            ).fetchone()
+            if row is None:
+                raise ExecutionIntegrityError("raw orphan catalog transaction lost its row")
+            state = str(row["state"])
+        return CatalogedRawOrphan(
+            artifact_id=artifact_identity.artifact_id,
+            request_instance_id=identity.request_instance_id,
+            state=state,
             replayed=replayed,
         )
 
@@ -1023,6 +1686,21 @@ class IngestionExecutionRepository:
             byte_count=int(row["byte_count"]),
             metadata=metadata,
         )
+
+    def load_verified_artifact_replay(self, artifact_id: str) -> RawReplayRecord:
+        """Load the first stable provenance bound to an existing immutable artifact."""
+
+        with self._store.read_only_connection() as connection:
+            row = connection.execute(
+                """
+                SELECT attempt_id FROM raw_replay_provenance
+                WHERE artifact_id = ? ORDER BY recorded_at, attempt_id LIMIT 1
+                """,
+                (artifact_id,),
+            ).fetchone()
+        if row is None:
+            raise ExecutionStateConflictError("raw artifact has no replayable provenance")
+        return self.load_raw_replay(UUID(str(row["attempt_id"])), artifact_id)
 
     def record_batch_context(
         self,
@@ -1524,6 +2202,7 @@ class IngestionExecutionRepository:
                     request,
                     policy_snapshot_id=policy_snapshot_id,
                     authorization_hash=authorization_hash,
+                    rebound_at=committed,
                 )
                 self._persist_gaps(connection, request)
                 self._invalidate_watermarks_blocked_by_gaps(
@@ -1681,6 +2360,276 @@ class IngestionExecutionRepository:
             _invoke_fault(fault_injector, ExecutionFaultPoint.RUN_COMPLETION)
             return status
 
+    def commit_semantic_noop(
+        self,
+        lease: WriterLease,
+        request: SemanticNoOpCommitRequest,
+        *,
+        committed_at: datetime | None = None,
+    ) -> SemanticNoOpCommitResult:
+        """Terminalize an all-duplicate request without filesystem or coverage effects."""
+
+        committed = (
+            self._store._now()
+            if committed_at is None
+            else _as_utc(committed_at, label="committed_at")
+        )
+        authorization_hash = _hash_model(request.acquisition_authorization)
+        signature_hash = _hash_model(request.processing_signature)
+        observation_payload = [
+            {
+                "end": _format_utc(value.end),
+                "matching_supporting_batch_ids": list(value.matching_supporting_batch_ids),
+                "observation_id": value.observation_id,
+                "start": _format_utc(value.start),
+                "stream_id": value.stream_id,
+                "value_fingerprint": value.value_fingerprint,
+            }
+            for value in request.duplicate_observations
+        ]
+        observations_json = _canonical_json(observation_payload)
+        observations_hash = _hash_json(observation_payload)
+        duplicate_count = len(request.duplicate_observations)
+        supporting_batch_ids = request.supporting_batch_ids
+        proof_payload = {
+            "acquisition_authorization_hash": authorization_hash,
+            "attempt_id": str(request.identity.attempt_id),
+            "batch_context_id": request.batch_context_id,
+            "duplicate_observations_hash": observations_hash,
+            "processing_signature_hash": signature_hash,
+            "request_instance_id": str(request.identity.request_instance_id),
+            "request_spec_id": request.specification.request_spec_id,
+            "semantic_duplicate_count": duplicate_count,
+            "supporting_batch_ids": list(supporting_batch_ids),
+            "version": 1,
+        }
+        proof_hash = _hash_json(proof_payload)
+        with self._store._leased_transaction(lease) as connection:
+            acquisition = self._require_completed_acquisition(connection, request.identity)
+            row = connection.execute(
+                """
+                SELECT instance.run_id, instance.status AS request_status,
+                       instance.request_spec_id, spec.request_spec_hash,
+                       spec.specification_json, run.policy_snapshot_id,
+                       attempt.status AS attempt_status,
+                       acquisition.authorization_hash,
+                       acquisition.authorization_json,
+                       context.batch_context_id, contract.processing_signature_hash,
+                       contract.processing_signature_json,
+                       active.status AS active_status,
+                       active.policy_snapshot_id AS active_policy_snapshot_id,
+                       active.retention_mode AS active_retention_mode,
+                       active.unavailable_at AS active_unavailable_at,
+                       active.expires_at AS active_expires_at
+                FROM request_instances AS instance
+                JOIN request_specs AS spec ON spec.request_spec_id = instance.request_spec_id
+                JOIN ingestion_runs AS run ON run.run_id = instance.run_id
+                JOIN request_attempts AS attempt ON attempt.attempt_id = ?
+                JOIN attempt_acquisition_records AS acquisition
+                  ON acquisition.attempt_id = attempt.attempt_id
+                JOIN batch_context_requests AS context_request
+                  ON context_request.request_instance_id = instance.request_instance_id
+                JOIN batch_contexts AS context
+                  ON context.batch_context_id = context_request.batch_context_id
+                JOIN batch_context_processing_contracts AS contract
+                  ON contract.batch_context_id = context.batch_context_id
+                LEFT JOIN dataset_policy_status AS active
+                  ON active.provider = spec.provider AND active.dataset = spec.dataset
+                WHERE instance.request_instance_id = ?
+                """,
+                (
+                    str(request.identity.attempt_id),
+                    str(request.identity.request_instance_id),
+                ),
+            ).fetchone()
+            if row is None:
+                raise ExecutionStateConflictError(
+                    "semantic no-op lacks durable acquisition and processing context"
+                )
+            if (
+                str(row["request_spec_id"]) != request.specification.request_spec_id
+                or str(row["request_spec_hash"]) != request.specification.request_spec_hash
+                or str(row["specification_json"]) != request.specification.canonical_json
+                or str(row["authorization_hash"]) != authorization_hash
+                or str(row["authorization_json"])
+                != _canonical_json(request.acquisition_authorization)
+                or str(row["processing_signature_hash"]) != signature_hash
+                or str(row["processing_signature_json"])
+                != _canonical_json(request.processing_signature)
+                or str(row["batch_context_id"]) != request.batch_context_id
+                or str(row["policy_snapshot_id"])
+                != deterministic_policy_snapshot_id(
+                    request.acquisition_authorization.request.policy_snapshot
+                )
+                or str(row["active_status"]) != DatasetPolicyStatus.ACTIVE.value
+                or str(row["active_policy_snapshot_id"]) != str(row["policy_snapshot_id"])
+                or str(row["active_retention_mode"])
+                in {RetentionMode.PROHIBITED.value, RetentionMode.EPHEMERAL.value}
+                or row["active_unavailable_at"] is not None
+                or (
+                    row["active_expires_at"] is not None
+                    and _parse_utc(str(row["active_expires_at"])) <= committed
+                )
+            ):
+                raise ExecutionIntegrityError(
+                    "semantic no-op proof differs from current durable policy/context"
+                )
+            expectation = connection.execute(
+                """
+                SELECT 1 FROM batch_publication_expectation_requests
+                WHERE request_instance_id = ?
+                """,
+                (str(request.identity.request_instance_id),),
+            ).fetchone()
+            if expectation is not None:
+                raise ExecutionStateConflictError(
+                    "semantic no-op must commit before publication preparation"
+                )
+            for canonical_batch_id in supporting_batch_ids:
+                support = connection.execute(
+                    """
+                    SELECT batch.state, batch.policy_snapshot_id, spec.provider, spec.dataset,
+                           contract.processing_signature_hash,
+                           count(file.relative_path) AS file_count
+                    FROM canonical_batches AS batch
+                    JOIN batch_contexts AS context
+                      ON context.batch_context_id = batch.batch_context_id
+                    JOIN request_specs AS spec ON spec.request_spec_id = context.request_spec_id
+                    JOIN batch_context_processing_contracts AS contract
+                      ON contract.batch_context_id = context.batch_context_id
+                    LEFT JOIN canonical_files AS file
+                      ON file.canonical_batch_id = batch.canonical_batch_id
+                    WHERE batch.canonical_batch_id = ?
+                    GROUP BY batch.canonical_batch_id
+                    """,
+                    (canonical_batch_id,),
+                ).fetchone()
+                if support is None or (
+                    str(support["state"]) != "VERIFIED"
+                    or str(support["policy_snapshot_id"]) != str(row["policy_snapshot_id"])
+                    or (str(support["provider"]), str(support["dataset"]))
+                    != (request.specification.provider, request.specification.dataset)
+                    or str(support["processing_signature_hash"]) != signature_hash
+                    or int(support["file_count"]) <= 0
+                ):
+                    raise ExecutionIntegrityError(
+                        "semantic no-op support is not VERIFIED under current exact policy"
+                    )
+            existing = connection.execute(
+                "SELECT * FROM semantic_noop_commits WHERE request_instance_id = ?",
+                (str(request.identity.request_instance_id),),
+            ).fetchone()
+            columns = (
+                "request_instance_id",
+                "attempt_id",
+                "request_spec_id",
+                "batch_context_id",
+                "policy_snapshot_id",
+                "acquisition_authorization_hash",
+                "processing_signature_hash",
+                "semantic_duplicate_count",
+                "duplicate_observations_json",
+                "duplicate_observations_hash",
+                "proof_hash",
+            )
+            values = (
+                str(request.identity.request_instance_id),
+                str(request.identity.attempt_id),
+                request.specification.request_spec_id,
+                request.batch_context_id,
+                str(row["policy_snapshot_id"]),
+                authorization_hash,
+                signature_hash,
+                duplicate_count,
+                observations_json,
+                observations_hash,
+                proof_hash,
+            )
+            replayed = existing is not None
+            if existing is None:
+                connection.execute(
+                    f"INSERT INTO semantic_noop_commits({', '.join(columns)}, "
+                    "lease_owner_id, lease_generation, committed_at) "
+                    f"VALUES ({', '.join('?' for _ in columns)}, ?, ?, ?)",
+                    (*values, lease.owner_id, lease.generation, _format_utc(committed)),
+                )
+                connection.executemany(
+                    """
+                    INSERT INTO semantic_noop_supporting_batches(
+                        request_instance_id, canonical_batch_id
+                    ) VALUES (?, ?)
+                    """,
+                    tuple(
+                        (str(request.identity.request_instance_id), canonical_batch_id)
+                        for canonical_batch_id in supporting_batch_ids
+                    ),
+                )
+            elif _row_tuple(existing, columns) != values:
+                raise ExecutionIdentityCollisionError(
+                    "semantic no-op request collides with a different proof"
+                )
+            durable_support = tuple(
+                str(value["canonical_batch_id"])
+                for value in connection.execute(
+                    """
+                    SELECT canonical_batch_id FROM semantic_noop_supporting_batches
+                    WHERE request_instance_id = ? ORDER BY canonical_batch_id
+                    """,
+                    (str(request.identity.request_instance_id),),
+                ).fetchall()
+            )
+            if durable_support != supporting_batch_ids:
+                raise ExecutionIdentityCollisionError(
+                    "semantic no-op supporting batch proof differs"
+                )
+            attempt_status = str(acquisition["attempt_status"])
+            if attempt_status == "RAW_COMPLETE":
+                connection.execute(
+                    """
+                    UPDATE request_attempts SET status = 'SUCCESS', completed_at = ?
+                    WHERE attempt_id = ? AND status = 'RAW_COMPLETE'
+                    """,
+                    (_format_utc(committed), str(request.identity.attempt_id)),
+                )
+            elif attempt_status != "SUCCESS":
+                raise ExecutionStateConflictError(
+                    "semantic no-op requires successful complete raw acquisition"
+                )
+            request_status = RequestInstanceStatus(str(row["request_status"]))
+            if request_status is RequestInstanceStatus.RAW_COMPLETE:
+                connection.execute(
+                    """
+                    UPDATE request_instances SET status = 'PROCESSING'
+                    WHERE request_instance_id = ? AND status = 'RAW_COMPLETE'
+                    """,
+                    (str(request.identity.request_instance_id),),
+                )
+                request_status = RequestInstanceStatus.PROCESSING
+            if request_status is RequestInstanceStatus.PROCESSING:
+                connection.execute(
+                    """
+                    UPDATE request_instances SET status = 'SUCCESS', completed_at = ?
+                    WHERE request_instance_id = ? AND status = 'PROCESSING'
+                    """,
+                    (_format_utc(committed), str(request.identity.request_instance_id)),
+                )
+            elif request_status is not RequestInstanceStatus.SUCCESS:
+                raise ExecutionStateConflictError(
+                    "semantic no-op request has incompatible terminal state"
+                )
+            if existing is not None:
+                committed = _parse_utc(str(existing["committed_at"]))
+            run_id = UUID(str(row["run_id"]))
+        return SemanticNoOpCommitResult(
+            run_id=run_id,
+            request_instance_id=request.identity.request_instance_id,
+            attempt_id=request.identity.attempt_id,
+            semantic_duplicate_count=duplicate_count,
+            supporting_batch_ids=supporting_batch_ids,
+            committed_at=committed,
+            replayed=replayed,
+        )
+
     def fail_processing_request(
         self,
         lease: WriterLease,
@@ -1691,14 +2640,18 @@ class IngestionExecutionRepository:
         code: str,
         sanitized_message: str,
         completed_at: datetime | None = None,
+        blocking_gaps: Sequence[GapFinding] = (),
     ) -> TerminalFailureResult:
         """Terminate an all-blocked or failed processing path without publishing a batch."""
 
         if terminal_status not in {
+            RequestInstanceStatus.PARTIAL,
             RequestInstanceStatus.FAILED,
             RequestInstanceStatus.BLOCKED,
         }:
-            raise ValueError("non-publication processing outcome must be FAILED or BLOCKED")
+            raise ValueError(
+                "non-publication processing outcome must be PARTIAL, FAILED, or BLOCKED"
+            )
         if not re.fullmatch(_SAFE_CODE, category) or not re.fullmatch(_SAFE_CODE, code):
             raise ValueError("failure category/code must be sanitized stable identifiers")
         if (
@@ -1713,6 +2666,9 @@ class IngestionExecutionRepository:
             if completed_at is None
             else _as_utc(completed_at, label="completed_at")
         )
+        ordered_gaps = tuple(sorted(blocking_gaps, key=lambda gap: gap.gap_id))
+        if len({gap.gap_id for gap in ordered_gaps}) != len(ordered_gaps):
+            raise ValueError("processing failure contains duplicate gap identities")
         error_id = "error_v1_" + _hash_json(
             {
                 "attempt_id": str(identity.attempt_id),
@@ -1725,11 +2681,90 @@ class IngestionExecutionRepository:
         with self._store._leased_transaction(lease) as connection:
             acquisition = self._require_completed_acquisition(connection, identity)
             request = connection.execute(
-                "SELECT * FROM request_instances WHERE request_instance_id = ?",
+                """
+                SELECT instance.*, spec.specification_json
+                FROM request_instances AS instance
+                JOIN request_specs AS spec
+                  ON spec.request_spec_id = instance.request_spec_id
+                WHERE instance.request_instance_id = ?
+                """,
                 (str(identity.request_instance_id),),
             ).fetchone()
             if request is None:
                 raise ExecutionStateConflictError("processing request is not cataloged")
+            specification_document = json.loads(str(request["specification_json"]))
+            if (
+                not isinstance(specification_document, dict)
+                or specification_document.get("kind") != "request-specification"
+            ):
+                raise ExecutionIntegrityError("bounded request specification is malformed")
+            specification = RequestSpecification.model_validate(
+                specification_document.get("payload")
+            )
+            if specification.canonical_json != str(request["specification_json"]):
+                raise ExecutionIntegrityError("bounded request specification is non-canonical")
+            stream_ids = {stream.stream_id for stream in specification.stream_keys()}
+            request_id = str(identity.request_instance_id)
+            for gap in ordered_gaps:
+                if (
+                    gap.stream_id not in stream_ids
+                    or gap.start != specification.start
+                    or gap.end != specification.end
+                    or gap.gap_type.value != "INTEGRITY"
+                    or gap.status.value != "OPEN"
+                    or not gap.blocking
+                    or gap.resolved_at is not None
+                    or gap.canonical_batch_id is not None
+                    or gap.request_instance_id != request_id
+                ):
+                    raise ExecutionIntegrityError(
+                        "processing failure gap does not match the exact bounded request"
+                    )
+                existing_gap = connection.execute(
+                    "SELECT * FROM gaps WHERE gap_id = ?",
+                    (gap.gap_id,),
+                ).fetchone()
+                gap_values = (
+                    gap.gap_id,
+                    gap.stream_id,
+                    _format_utc(gap.start),
+                    _format_utc(gap.end),
+                    gap.gap_type.value,
+                    gap.status.value,
+                    1,
+                    _format_utc(gap.detected_at),
+                    None,
+                    request_id,
+                    None,
+                )
+                gap_columns = (
+                    "gap_id",
+                    "stream_id",
+                    "interval_start",
+                    "interval_end",
+                    "gap_type",
+                    "status",
+                    "blocking",
+                    "detected_at",
+                    "resolved_at",
+                    "request_instance_id",
+                    "canonical_batch_id",
+                )
+                if existing_gap is None:
+                    connection.execute(
+                        f"INSERT INTO gaps({', '.join(gap_columns)}) "
+                        f"VALUES ({', '.join('?' for _ in gap_columns)})",
+                        gap_values,
+                    )
+                elif _row_tuple(existing_gap, gap_columns) != gap_values:
+                    raise ExecutionIdentityCollisionError(
+                        "processing failure gap collides with different durable facts"
+                    )
+                self._invalidate_overlapping_watermark(
+                    connection,
+                    gap=gap,
+                    invalidated_at=completed,
+                )
             run_id = str(request["run_id"])
             existing_error = connection.execute(
                 "SELECT * FROM errors WHERE error_id = ?",
@@ -1826,6 +2861,111 @@ class IngestionExecutionRepository:
             error_id=error_id,
             completed_at=completed,
             replayed=replayed,
+        )
+
+    @classmethod
+    def _upsert_terminal_gaps(
+        cls,
+        connection: sqlite3.Connection,
+        *,
+        identity: AttemptIdentity,
+        specification: RequestSpecification,
+        gaps: Sequence[GapFinding],
+        expected_gap_type: GapType,
+        completed_at: datetime,
+        require_all_streams: bool,
+    ) -> None:
+        ordered = tuple(sorted(gaps, key=lambda gap: gap.gap_id))
+        if not ordered or len({gap.gap_id for gap in ordered}) != len(ordered):
+            raise ExecutionIntegrityError("terminal gaps must be present and uniquely identified")
+        stream_ids = {stream.stream_id for stream in specification.stream_keys()}
+        if require_all_streams and {gap.stream_id for gap in ordered} != stream_ids:
+            raise ExecutionIntegrityError("terminal gaps do not cover every exact request stream")
+        request_id = str(identity.request_instance_id)
+        for gap in ordered:
+            if (
+                gap.stream_id not in stream_ids
+                or gap.start != specification.start
+                or gap.end != specification.end
+                or gap.gap_type is not expected_gap_type
+                or gap.status is not GapStatus.OPEN
+                or not gap.blocking
+                or gap.resolved_at is not None
+                or gap.canonical_batch_id is not None
+                or gap.request_instance_id != request_id
+            ):
+                raise ExecutionIntegrityError(
+                    "terminal gap does not match the exact bounded request"
+                )
+            existing = connection.execute(
+                "SELECT * FROM gaps WHERE gap_id = ?",
+                (gap.gap_id,),
+            ).fetchone()
+            values = (
+                gap.gap_id,
+                gap.stream_id,
+                _format_utc(gap.start),
+                _format_utc(gap.end),
+                gap.gap_type.value,
+                gap.status.value,
+                1,
+                _format_utc(gap.detected_at),
+                None,
+                request_id,
+                None,
+            )
+            columns = (
+                "gap_id",
+                "stream_id",
+                "interval_start",
+                "interval_end",
+                "gap_type",
+                "status",
+                "blocking",
+                "detected_at",
+                "resolved_at",
+                "request_instance_id",
+                "canonical_batch_id",
+            )
+            if existing is None:
+                connection.execute(
+                    f"INSERT INTO gaps({', '.join(columns)}) "
+                    f"VALUES ({', '.join('?' for _ in columns)})",
+                    values,
+                )
+            elif _row_tuple(existing, columns) != values:
+                raise ExecutionIdentityCollisionError(
+                    "terminal gap collides with different durable facts"
+                )
+            cls._invalidate_overlapping_watermark(
+                connection,
+                gap=gap,
+                invalidated_at=completed_at,
+            )
+
+    @staticmethod
+    def _invalidate_overlapping_watermark(
+        connection: sqlite3.Connection,
+        *,
+        gap: GapFinding,
+        invalidated_at: datetime,
+    ) -> None:
+        connection.execute(
+            """
+            UPDATE watermarks
+            SET verification_state = 'INVALID', invalidated_at = ?
+            WHERE stream_id = ?
+              AND verification_state = 'VERIFIED'
+              AND invalidated_at IS NULL
+              AND coverage_start < ?
+              AND exclusive_frontier > ?
+            """,
+            (
+                _format_utc(invalidated_at),
+                gap.stream_id,
+                _format_utc(gap.end),
+                _format_utc(gap.start),
+            ),
         )
 
     def _verify_publication_files(
@@ -2228,6 +3368,7 @@ class IngestionExecutionRepository:
         *,
         policy_snapshot_id: str,
         authorization_hash: str,
+        rebound_at: datetime,
     ) -> None:
         manifest = request.manifest
         outcomes = {value.stream_id: value for value in manifest.streams}
@@ -2291,13 +3432,78 @@ class IngestionExecutionRepository:
                 raise ExecutionIntegrityError("durable coverage projection is unavailable")
             first_origin = durable["first_origin"]
             last_origin = durable["last_origin"]
-            if first_origin is not None and (
-                str(first_origin) != str(last_origin)
-                or _parse_utc(str(first_origin)) != next(iter(origins))
-            ):
-                raise ExecutionIntegrityError(
-                    "coverage_start is authoritative and cannot be rebased"
-                )
+            incoming_origin = next(iter(origins))
+            if first_origin is not None:
+                if str(first_origin) != str(last_origin):
+                    raise ExecutionIntegrityError(
+                        "durable coverage contains conflicting authoritative origins"
+                    )
+                durable_origin = _parse_utc(str(first_origin))
+                if incoming_origin > durable_origin:
+                    raise ExecutionIntegrityError(
+                        "coverage origin cannot move forward and discard verified history"
+                    )
+                if incoming_origin < durable_origin:
+                    request_provenance = connection.execute(
+                        """
+                        SELECT intent, run_id FROM request_instances
+                        WHERE request_instance_id = ?
+                        """,
+                        (str(request.request_instance_id),),
+                    ).fetchone()
+                    if (
+                        request_provenance is None
+                        or str(request_provenance["intent"]) != "BACKFILL"
+                        or min(segment.start for segment in stream_segments)
+                        != incoming_origin
+                        or stream_id
+                        not in {
+                            watermark.stream_id
+                            for watermark in request.coverage.watermarks
+                        }
+                    ):
+                        raise ExecutionIntegrityError(
+                            "coverage origin rebase requires an earlier verified backfill"
+                        )
+                    rebind_id = "origin_rebind_v1_" + _hash_json(
+                        {
+                            "stream_id": stream_id,
+                            "source_coverage_start": _format_utc(durable_origin),
+                            "target_coverage_start": _format_utc(incoming_origin),
+                            "request_instance_id": str(request.request_instance_id),
+                            "canonical_batch_id": manifest.canonical_batch_id,
+                        }
+                    )
+                    connection.execute(
+                        """
+                        INSERT INTO coverage_origin_rebindings(
+                            rebind_id, stream_id, source_coverage_start,
+                            target_coverage_start, run_id, request_instance_id,
+                            canonical_batch_id, rebound_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            rebind_id,
+                            stream_id,
+                            _format_utc(durable_origin),
+                            _format_utc(incoming_origin),
+                            str(request_provenance["run_id"]),
+                            str(request.request_instance_id),
+                            manifest.canonical_batch_id,
+                            _format_utc(rebound_at),
+                        ),
+                    )
+                    connection.execute(
+                        """
+                        UPDATE coverage_segments SET coverage_start = ?
+                        WHERE stream_id = ? AND coverage_start = ?
+                        """,
+                        (
+                            _format_utc(incoming_origin),
+                            stream_id,
+                            _format_utc(durable_origin),
+                        ),
+                    )
             expected_generation = (
                 1 if durable["latest_generation"] is None else int(durable["latest_generation"]) + 1
             )
@@ -3233,7 +4439,10 @@ class IngestionExecutionRepository:
         manifest_sha256: str,
         manifest_bytes: int,
         verified_at: datetime,
+        requested_state: str = "VERIFIED",
     ) -> bool:
+        if requested_state not in {"PRESENT", "VERIFIED"}:
+            raise ValueError("raw artifact catalog state must be PRESENT or VERIFIED")
         values = (
             identity.artifact_id,
             f"request_spec_v1_{identity.request_spec_hash}",
@@ -3246,8 +4455,8 @@ class IngestionExecutionRepository:
             published.payload_relative_path,
             published.manifest_relative_path,
             _format_utc(published.first_persisted_at),
-            _format_utc(verified_at),
-            "VERIFIED",
+            _format_utc(verified_at) if requested_state == "VERIFIED" else None,
+            requested_state,
         )
         columns = (
             "artifact_id",
@@ -3275,10 +4484,24 @@ class IngestionExecutionRepository:
                 f"VALUES ({', '.join('?' for _ in columns)})",
                 values,
             )
-        elif _row_tuple(row, (*columns[:11], "state")) != (*values[:11], "VERIFIED"):
-            raise ExecutionIdentityCollisionError(
-                "raw artifact ID collides with different immutable catalog metadata"
-            )
+        else:
+            if _row_tuple(row, columns[:11]) != values[:11]:
+                raise ExecutionIdentityCollisionError(
+                    "raw artifact ID collides with different immutable catalog metadata"
+                )
+            current_state = str(row["state"])
+            if current_state in {"INVALID", "PURGED"}:
+                raise ExecutionStateConflictError(
+                    "invalid or purged raw artifact cannot be adopted by acquisition"
+                )
+            if current_state == "PRESENT" and requested_state == "VERIFIED":
+                connection.execute(
+                    """
+                    UPDATE raw_artifacts SET state = 'VERIFIED', verified_at = ?
+                    WHERE artifact_id = ? AND state = 'PRESENT'
+                    """,
+                    (_format_utc(verified_at), identity.artifact_id),
+                )
         manifest_values = (
             identity.artifact_id,
             manifest_sha256,
@@ -3424,7 +4647,10 @@ class IngestionExecutionRepository:
 
 
 __all__ = [
+    "AttemptFailureResult",
+    "AttemptFailureStatus",
     "CatalogedRawArtifact",
+    "CatalogedRawOrphan",
     "CoverageCommit",
     "DurableAcquisition",
     "DurableAttempt",
@@ -3438,9 +4664,14 @@ __all__ = [
     "IngestionExecutionRepository",
     "PreparedBatch",
     "PreparedPublicationRecord",
+    "ProviderDispatchClaim",
+    "ProviderDispatchLimitExceededError",
     "PublicationCommitRequest",
     "PublicationCommitResult",
     "PublicationCommitSource",
     "RawReplayRecord",
+    "SemanticNoOpCommitRequest",
+    "SemanticNoOpCommitResult",
+    "SemanticNoOpObservationProof",
     "TerminalFailureResult",
 ]

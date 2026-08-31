@@ -19,16 +19,18 @@ terms.
 | Evidence reference | `alpaca-support-ticket-342496` |
 | Last verified | `2026-08-29` |
 
-The full evidence is deliberately excluded from Git. Its intended location under the future
-external private data root is:
+The full evidence is deliberately excluded from Git. The Phase 2 root initializer creates this
+private locator under the configured external data root:
 
 ```text
 governance/evidence/alpaca/ticket-342496/
 ```
 
-That private location may contain the original correspondence and any sensitive metadata needed
-to establish provenance. Screenshots, full email text, personal addresses, message headers,
-attachments, and other ticket data must not be copied into this repository.
+The initializer creates only an empty directory; it neither fabricates nor proves archival of the
+evidence. The operator must place the actual original correspondence and any provenance metadata
+there, following the [private operator procedure](../../operations/living-ingestion.md). Screenshots,
+full email text, personal addresses, message headers, attachments, and other ticket data must not
+be copied into this repository.
 
 ## Rights recorded from the response
 
@@ -70,14 +72,15 @@ applies. Aggregated or derived outputs require their own policy decision before 
 | News | No active entry | Fail closed before request or persistence until dataset-specific evidence is approved. |
 | Any other Alpaca dataset | No active entry | Fail closed until rights are classified from dataset-specific evidence. |
 
-`DURABLE_AUTHORIZED` applies only to the historical SIP US stock-bar row above and is an input to
-the future retention-aware dataset policy. `UNVERIFIED / PENDING` is an evidence/policy status, not
-a retention grant. This record alone does not implement enforcement, storage, ingestion,
-watermarking, or purge behavior.
+`DURABLE_AUTHORIZED` applies only to the historical SIP US stock-bar row above and is encoded by
+the exact active Phase 2 retention policy. `UNVERIFIED / PENDING` is an evidence/policy status, not
+a retention grant. This record alone does not grant runtime capabilities: code enforcement,
+`private_research`, a validated external root, and the strict age/finalization gate must all agree.
 
-The future policy entry must encode the 15-minute restriction as a machine-enforced minimum
-observation age for backfill, incremental update, and repair. Real-time or unexpectedly younger
-data must not be retained merely because it arrives through a historical endpoint.
+The implemented policy encodes the 15-minute restriction plus a conservative finalization buffer
+as a machine-enforced minimum observation age for backfill, incremental update, and repair.
+Real-time or unexpectedly younger data is rejected before durable raw or quarantine persistence,
+even when it arrives through a historical endpoint.
 
 ## Caveats and review triggers
 
@@ -92,6 +95,7 @@ materially:
 - the provider, entitlement, subscription, dataset, or delivery mode changes; or
 - Alpaca's applicable agreements or market-data terms change.
 
-The private evidence locator should be validated when the external data root is provisioned. Until
-the Phase 2 policy enforcement is implemented and tested, this file remains an approved design and
-governance input rather than proof that the running pipeline enforces these restrictions.
+The private evidence locator is validated with the external root. At this offline checkpoint, the
+repository does not assert that the actual correspondence has been placed there or that controlled
+live acceptance has occurred. This file remains a redacted governance input, not the evidence
+itself and not proof of live provider behavior.

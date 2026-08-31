@@ -194,3 +194,58 @@ def test_phase2_rejects_every_alternative_writer_lease_name(
 
 def test_operational_public_api_has_no_unfenced_generic_mutator() -> None:
     assert not hasattr(OperationalStateStore, "transaction")
+
+
+def test_narrow_or_disjoint_snapshot_does_not_stale_a_broader_current_domain(
+    store: OperationalStateStore,
+    lease: WriterLease,
+) -> None:
+    broad = CalendarSnapshot.create(
+        library_name="synthetic-calendar",
+        library_version="broad",
+        tzdata_version="2026a",
+        calendar_name="XNYS",
+        timezone_name="America/New_York",
+        range_start=date(2025, 7, 2),
+        range_end=date(2026, 1, 3),
+        generated_at=_NOW,
+        sessions=(
+            _snapshot().sessions[0],
+            CalendarSession(
+                session_date=date(2026, 1, 2),
+                open_utc=datetime(2026, 1, 2, 14, 30, tzinfo=UTC),
+                close_utc=datetime(2026, 1, 2, 21, 0, tzinfo=UTC),
+            ),
+        ),
+    )
+    narrow = _snapshot(generated_at=_NOW + timedelta(seconds=1))
+    disjoint = CalendarSnapshot.create(
+        library_name="synthetic-calendar",
+        library_version="disjoint",
+        tzdata_version="2026a",
+        calendar_name="XNYS",
+        timezone_name="America/New_York",
+        range_start=date(2026, 1, 2),
+        range_end=date(2026, 1, 3),
+        generated_at=_NOW + timedelta(seconds=2),
+        sessions=(broad.sessions[1],),
+    )
+    repository = CalendarSnapshotRepository(store)
+    broad_id = repository.persist(lease, broad)
+
+    narrow_result = repository.persist_reconciling(lease, narrow)
+    disjoint_result = repository.persist_reconciling(lease, disjoint)
+
+    assert narrow_result.stale_snapshot_ids == ()
+    assert disjoint_result.stale_snapshot_ids == ()
+    with store.read_only_connection() as connection:
+        states = connection.execute(
+            """
+            SELECT calendar_snapshot_id, state FROM calendar_snapshots
+            WHERE calendar_snapshot_id IN (?, ?, ?)
+            ORDER BY calendar_snapshot_id
+            """,
+            (broad_id, narrow_result.snapshot_id, disjoint_result.snapshot_id),
+        ).fetchall()
+    assert len(states) == 3
+    assert {str(row["state"]) for row in states} == {"CURRENT"}

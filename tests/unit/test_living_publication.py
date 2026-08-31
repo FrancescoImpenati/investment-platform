@@ -389,7 +389,7 @@ def test_raw_streaming_publication_is_content_identified_and_exact_replay_is_noo
         "page_relation": "root",
         "request_spec_hash": specification.request_spec_hash,
     }
-    assert not (root.root / "operational").exists()
+    assert not any((root.root / "operational").iterdir())
     assert PublicationRecoveryInspector(root).inspect_staging() == ()
 
 
@@ -412,7 +412,7 @@ def test_raw_authorization_must_match_exact_streamed_bytes_and_denial_cleans_can
             first_persisted_at=_INGESTED_AT,
         )
 
-    assert not (root.root / "raw").exists()
+    assert not any(path.is_file() for path in (root.root / "raw").rglob("*"))
     assert PublicationRecoveryInspector(root).inspect_staging() == ()
 
 
@@ -566,7 +566,7 @@ def test_canonical_batch_is_manifest_last_atomic_verified_and_exact_replay_is_no
     assert manifest["fixed_ingested_at"] == _INGESTED_AT.isoformat().replace("+00:00", "Z")
     assert manifest["manifest_created_at"] == _MANIFEST_AT.isoformat().replace("+00:00", "Z")
     assert manifest["row_count"] == 2
-    assert not (root.root / "operational").exists()
+    assert not any((root.root / "operational").iterdir())
     inspection = PublicationRecoveryInspector(root).inspect_published_batch(
         specification.provider,
         specification.dataset,
@@ -623,7 +623,7 @@ def test_canonical_requires_immutable_raw_input_first(
             acquisition,
         )
 
-    assert not (root.root / "normalized").exists()
+    assert not any(path.is_file() for path in (root.root / "normalized").rglob("*"))
 
 
 def test_canonical_rejects_wrong_schema_and_volatile_ingested_at(
@@ -834,7 +834,7 @@ def test_raw_authorization_binds_the_exact_stored_representation(
             first_persisted_at=_INGESTED_AT,
         )
 
-    assert not (root.root / "raw").exists()
+    assert not any(path.is_file() for path in (root.root / "raw").rglob("*"))
     assert not (root.root / "staging" / "raw-artifacts").exists()
 
 
@@ -856,7 +856,7 @@ def test_canonical_authorization_binds_full_ordered_raw_identities(
             mismatched,
         )
 
-    assert not (root.root / "normalized").exists()
+    assert not any(path.is_file() for path in (root.root / "normalized").rglob("*"))
 
 
 def test_all_blocked_streams_require_codes_and_skip_canonical_publication(
@@ -886,7 +886,7 @@ def test_all_blocked_streams_require_codes_and_skip_canonical_publication(
     )
 
     assert result is None
-    assert not (root.root / "normalized").exists()
+    assert not any(path.is_file() for path in (root.root / "normalized").rglob("*"))
     with pytest.raises(ValueError, match="validation code"):
         CanonicalStreamOutcome(
             stream=stream,

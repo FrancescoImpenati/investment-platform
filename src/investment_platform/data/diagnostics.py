@@ -42,9 +42,19 @@ from investment_platform.data.storage.living_raw import (
     raw_artifact_relative_directory,
     verify_raw_artifact_directory,
 )
+from investment_platform.data.storage.quarantine import (
+    QuarantineArtifactManifest,
+    quarantine_artifact_relative_directory,
+    verify_quarantine_artifact_directory,
+)
 from investment_platform.data.storage.recovery import (
     PublicationRecoveryInspector,
     RecoveryInspectionState,
+)
+from investment_platform.data.storage.transport_spool import (
+    TransportSpoolInspectionState,
+    TransportSpoolIntegrityError,
+    TransportSpoolStore,
 )
 from investment_platform.data_root import PrivateDataRoot, PrivateDataRootError
 
@@ -56,6 +66,11 @@ _RAW_DIRECTORY = re.compile(
 _CANONICAL_DIRECTORY = re.compile(
     r"normalized/price_bars/provider=[a-z0-9][a-z0-9._-]{0,127}/"
     r"dataset=[a-z0-9][a-z0-9._-]{0,127}/batches/batch=[0-9a-f]{32}\Z"
+)
+_QUARANTINE_DIRECTORY = re.compile(
+    r"quarantine/provider=[a-z0-9][a-z0-9._-]{0,127}/"
+    r"dataset=[a-z0-9][a-z0-9._-]{0,127}/artifacts/"
+    r"artifact=quarantine_v1_[0-9a-f]{64}\Z"
 )
 _DURABLE_MODES: Final = frozenset(
     {
@@ -124,6 +139,37 @@ class DatasetPolicySummary(_FrozenDiagnosticModel):
     retention_mode: str | None
 
 
+class StreamStatusSummary(_FrozenDiagnosticModel):
+    """One sanitized stream's durable coverage frontier and open-gap state."""
+
+    stream_id: str
+    provider: str
+    dataset: str
+    instrument_id: UUID
+    timeframe: str
+    session: str
+    adjustment: str
+    coverage_start: datetime | None
+    coverage_end: datetime | None
+    watermark_frontier: datetime | None
+    watermark_state: str | None
+    open_gap_count: int = Field(ge=0)
+
+    @field_validator(
+        "coverage_start",
+        "coverage_end",
+        "watermark_frontier",
+        mode="after",
+    )
+    @classmethod
+    def normalize_times(cls, value: datetime | None) -> datetime | None:
+        if value is None:
+            return None
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("stream status timestamps must be timezone-aware")
+        return value.astimezone(UTC)
+
+
 class OperationalStatusSnapshot(_FrozenDiagnosticModel):
     """Small scheduler/control-panel snapshot without private observations or paths."""
 
@@ -138,10 +184,12 @@ class OperationalStatusSnapshot(_FrozenDiagnosticModel):
     canonical_batch_count: int = Field(ge=0)
     parquet_part_count: int = Field(ge=0)
     canonical_row_count: int = Field(ge=0)
+    quarantine_artifact_count: int = Field(ge=0)
     active_writer_lease: bool
     latest_run: LatestRunSummary | None
     latest_error: LatestErrorSummary | None
     dataset_policies: tuple[DatasetPolicySummary, ...]
+    streams: tuple[StreamStatusSummary, ...]
 
 
 class Phase2VerificationReport(_FrozenDiagnosticModel):
@@ -266,7 +314,9 @@ class Phase2OperationalDiagnostics:
                        ON batch.canonical_batch_id = file.canonical_batch_id
                      WHERE batch.state IN ('PUBLISHED', 'VERIFIED')) AS part_count,
                     (SELECT coalesce(sum(row_count), 0) FROM canonical_batches
-                     WHERE state IN ('PUBLISHED', 'VERIFIED')) AS row_count
+                     WHERE state IN ('PUBLISHED', 'VERIFIED')) AS row_count,
+                    (SELECT count(*) FROM quarantine_artifacts
+                     WHERE state = 'VERIFIED') AS quarantine_count
                 """
             ).fetchone()
             if counts is None:
@@ -290,6 +340,33 @@ class Phase2OperationalDiagnostics:
                 """
                 SELECT provider, dataset, status, retention_mode
                 FROM dataset_policy_status ORDER BY provider, dataset
+                """
+            ).fetchall()
+            stream_rows = connection.execute(
+                """
+                WITH retained_coverage AS (
+                    SELECT stream_id, min(interval_start) AS coverage_start,
+                           max(interval_end) AS coverage_end
+                    FROM coverage_segments
+                    WHERE retained = 1 AND verification_state = 'VERIFIED'
+                    GROUP BY stream_id
+                ), open_gaps AS (
+                    SELECT stream_id, count(*) AS gap_count
+                    FROM gaps WHERE status IN ('OPEN', 'REPAIRING')
+                    GROUP BY stream_id
+                )
+                SELECT stream.stream_id, stream.provider, stream.dataset,
+                       stream.instrument_id, stream.timeframe, stream.session,
+                       stream.adjustment, coverage.coverage_start, coverage.coverage_end,
+                       watermark.exclusive_frontier, watermark.verification_state,
+                       coalesce(gap.gap_count, 0) AS gap_count
+                FROM stream_keys AS stream
+                LEFT JOIN retained_coverage AS coverage
+                  ON coverage.stream_id = stream.stream_id
+                LEFT JOIN open_gaps AS gap ON gap.stream_id = stream.stream_id
+                LEFT JOIN watermarks AS watermark ON watermark.stream_id = stream.stream_id
+                ORDER BY stream.provider, stream.dataset, stream.instrument_id,
+                         stream.timeframe, stream.session, stream.adjustment
                 """
             ).fetchall()
 
@@ -323,6 +400,35 @@ class Phase2OperationalDiagnostics:
             )
             for row in policy_rows
         )
+        streams = tuple(
+            StreamStatusSummary(
+                stream_id=_safe_output(row["stream_id"]),
+                provider=_safe_output(row["provider"]),
+                dataset=_safe_output(row["dataset"]),
+                instrument_id=UUID(str(row["instrument_id"])),
+                timeframe=_safe_output(row["timeframe"]),
+                session=_safe_output(row["session"]),
+                adjustment=_safe_output(row["adjustment"]),
+                coverage_start=(
+                    None if row["coverage_start"] is None else _parse_utc(row["coverage_start"])
+                ),
+                coverage_end=(
+                    None if row["coverage_end"] is None else _parse_utc(row["coverage_end"])
+                ),
+                watermark_frontier=(
+                    None
+                    if row["exclusive_frontier"] is None
+                    else _parse_utc(row["exclusive_frontier"])
+                ),
+                watermark_state=(
+                    None
+                    if row["verification_state"] is None
+                    else _safe_output(row["verification_state"])
+                ),
+                open_gap_count=int(row["gap_count"]),
+            )
+            for row in stream_rows
+        )
         return OperationalStatusSnapshot(
             root_valid=True,
             sqlite_healthy=sqlite_status.healthy,
@@ -335,10 +441,12 @@ class Phase2OperationalDiagnostics:
             canonical_batch_count=int(counts["batch_count"]),
             parquet_part_count=int(counts["part_count"]),
             canonical_row_count=int(counts["row_count"]),
+            quarantine_artifact_count=int(counts["quarantine_count"]),
             active_writer_lease=self._store.get_writer_lease() is not None,
             latest_run=latest_run,
             latest_error=latest_error,
             dataset_policies=policies,
+            streams=streams,
         )
 
     def verify(self) -> Phase2VerificationReport:
@@ -349,6 +457,7 @@ class Phase2OperationalDiagnostics:
             self._verify_sqlite(),
             self._verify_raw_catalog(),
             self._verify_canonical_catalog(),
+            self._verify_quarantine_catalog(),
             self._verify_staging(),
             self._verify_orphans(),
             self._verify_watermarks(),
@@ -413,7 +522,19 @@ class Phase2OperationalDiagnostics:
                     SELECT artifact.*, spec.provider, spec.dataset, spec.request_spec_hash,
                            manifest.manifest_content_sha256,
                            manifest.manifest_byte_count,
-                           manifest.manifest_schema_version
+                           manifest.manifest_schema_version,
+                           (SELECT count(*) FROM attempt_artifact_observations AS observed
+                            WHERE observed.artifact_id = artifact.artifact_id)
+                               AS attempt_reference_count,
+                           (SELECT count(*) FROM acquisition_artifacts AS acquired
+                            WHERE acquired.artifact_id = artifact.artifact_id)
+                               AS acquisition_reference_count,
+                           (SELECT count(*) FROM raw_replay_provenance AS replay
+                            WHERE replay.artifact_id = artifact.artifact_id)
+                               AS replay_reference_count,
+                           (SELECT count(*) FROM batch_context_artifacts AS context_artifact
+                            WHERE context_artifact.artifact_id = artifact.artifact_id)
+                               AS canonical_context_reference_count
                     FROM raw_artifacts AS artifact
                     JOIN request_specs AS spec
                       ON spec.request_spec_id = artifact.request_spec_id
@@ -470,9 +591,32 @@ class Phase2OperationalDiagnostics:
                     or int(row["manifest_schema_version"]) != manifest.schema_version
                 ):
                     issues.append("RAW_MANIFEST_CHECKSUM_MISMATCH")
-            if str(row["state"]) != "VERIFIED":
+            state = str(row["state"])
+            if state == "PRESENT":
+                # A crash after immutable rename but before catalog commit can
+                # leave authorized, byte-verified raw evidence without retrieval
+                # provenance.  It is retained and purge-visible, but may never
+                # support an attempt, acquisition, replay, canonical batch, or
+                # coverage proof unless a later exact response adopts it.
+                reference_count = sum(
+                    int(row[column])
+                    for column in (
+                        "attempt_reference_count",
+                        "acquisition_reference_count",
+                        "replay_reference_count",
+                        "canonical_context_reference_count",
+                    )
+                )
+                if reference_count:
+                    issues.append("RAW_PRESENT_REFERENCED")
+            elif state != "VERIFIED":
                 issues.append("RAW_NOT_VERIFIED")
-        except (OSError, PrivateDataRootError, PublicationError, ValueError):
+        except (
+            OSError,
+            PrivateDataRootError,
+            PublicationError,
+            ValueError,
+        ):
             issues.append("RAW_FILE_OR_MANIFEST_INVALID")
         return tuple(issues)
 
@@ -613,6 +757,102 @@ class Phase2OperationalDiagnostics:
         )
         return actual == expected
 
+    def _verify_quarantine_catalog(self) -> DiagnosticCheck:
+        """Verify metadata-only findings without returning validation codes or private paths."""
+
+        issues: list[str] = []
+        issue_count = 0
+        checked_count = 0
+        try:
+            with self._store.read_only_connection() as connection:
+                rows = connection.execute(
+                    """
+                    SELECT artifact.*, request.request_spec_hash,
+                           status.status AS policy_status,
+                           status.unavailable_at,
+                           snapshot.provider AS snapshot_provider,
+                           snapshot.dataset AS snapshot_dataset
+                    FROM quarantine_artifacts AS artifact
+                    JOIN request_specs AS request
+                      ON request.request_spec_id = artifact.request_spec_id
+                    LEFT JOIN dataset_policy_status AS status
+                      ON status.provider = artifact.provider
+                     AND status.dataset = artifact.dataset
+                    JOIN policy_snapshots AS snapshot
+                      ON snapshot.policy_snapshot_id = artifact.policy_snapshot_id
+                    WHERE artifact.state <> 'PURGED'
+                    ORDER BY artifact.quarantine_artifact_id
+                    """
+                ).fetchall()
+            checked_count = len(rows)
+            for row in rows:
+                row_issues = self._verify_one_quarantine(row)
+                if row_issues:
+                    issue_count += 1
+                    issues.extend(row_issues)
+        except (OSError, PrivateDataRootError, PublicationError, sqlite3.DatabaseError, ValueError):
+            issue_count += 1
+            issues.append("QUARANTINE_CATALOG_CHECK_FAILED")
+        return _check(
+            "QUARANTINE_CATALOG_CONTENT",
+            checked_count=checked_count,
+            issue_count=issue_count,
+            issue_codes=issues,
+        )
+
+    def _verify_one_quarantine(self, row: sqlite3.Row) -> tuple[str, ...]:
+        issues: list[str] = []
+        try:
+            expected_directory = quarantine_artifact_relative_directory(
+                str(row["provider"]),
+                str(row["dataset"]),
+                str(row["quarantine_artifact_id"]),
+            )
+            if PurePosixPath(str(row["relative_path"])) != expected_directory:
+                return ("QUARANTINE_CATALOG_PATH_MISMATCH",)
+            directory = _managed_path(self._data_root, self._root_id, expected_directory)
+            manifest = verify_quarantine_artifact_directory(
+                directory,
+                data_root=self._data_root,
+                root_id=self._root_id,
+            )
+            if not self._quarantine_manifest_matches_row(manifest, row):
+                issues.append("QUARANTINE_MANIFEST_CATALOG_MISMATCH")
+            manifest_hash, manifest_bytes = file_integrity(directory / "manifest.json")
+            if manifest_hash != str(row["manifest_content_sha256"]) or manifest_bytes != int(
+                row["manifest_byte_count"]
+            ):
+                issues.append("QUARANTINE_MANIFEST_CHECKSUM_MISMATCH")
+            if str(row["state"]) != "VERIFIED" or row["invalidated_at"] is not None:
+                issues.append("QUARANTINE_NOT_VERIFIED")
+            if (
+                str(row["policy_status"]) != DatasetPolicyStatus.ACTIVE.value
+                or row["unavailable_at"] is not None
+                or (str(row["snapshot_provider"]), str(row["snapshot_dataset"]))
+                != (str(row["provider"]), str(row["dataset"]))
+            ):
+                issues.append("QUARANTINE_POLICY_INVALID")
+            policy = self._catalog.lookup(str(row["provider"]), str(row["dataset"]))
+            if not policy.normalized.quarantine_allowed:
+                issues.append("QUARANTINE_POLICY_DENIED")
+        except (OSError, DatasetPolicyDenied, PrivateDataRootError, PublicationError, ValueError):
+            issues.append("QUARANTINE_FILE_OR_MANIFEST_INVALID")
+        return tuple(issues)
+
+    @staticmethod
+    def _quarantine_manifest_matches_row(
+        manifest: QuarantineArtifactManifest,
+        row: sqlite3.Row,
+    ) -> bool:
+        return (
+            manifest.quarantine_artifact_id == str(row["quarantine_artifact_id"])
+            and manifest.provider == str(row["provider"])
+            and manifest.dataset == str(row["dataset"])
+            and manifest.request_specification.request_spec_id == str(row["request_spec_id"])
+            and manifest.request_specification.request_spec_hash == str(row["request_spec_hash"])
+            and manifest.batch_context.batch_context_id == str(row["batch_context_id"])
+        )
+
     def _verify_staging(self) -> DiagnosticCheck:
         try:
             inspections = PublicationRecoveryInspector(self._data_root).inspect_staging()
@@ -623,7 +863,46 @@ class Phase2OperationalDiagnostics:
                 issue_count=1,
                 issue_codes=("STAGING_INSPECTION_FAILED",),
             )
-        if not inspections:
+        quarantine_count = 0
+        quarantine_invalid = False
+        try:
+            quarantine_staging = _managed_path(
+                self._data_root, self._root_id, "staging/quarantine-artifacts"
+            )
+            if quarantine_staging.exists():
+                candidates = tuple(quarantine_staging.iterdir())
+                quarantine_count = len(candidates)
+                for candidate in candidates:
+                    relative = candidate.relative_to(self._data_root.root)
+                    checked = _managed_path(self._data_root, self._root_id, relative)
+                    if checked != candidate or not candidate.is_dir():
+                        quarantine_invalid = True
+                        break
+                    tuple(iter_safe_regular_files(candidate))
+        except (OSError, PrivateDataRootError, PublicationError, ValueError):
+            quarantine_invalid = True
+            quarantine_count = max(1, quarantine_count)
+        transport_count = 0
+        transport_invalid = False
+        try:
+            transport_inspections = TransportSpoolStore(
+                self._data_root
+            ).inspect_transient_attempts()
+            transport_count = len(transport_inspections)
+            transport_invalid = any(
+                inspection.state is TransportSpoolInspectionState.INVALID
+                for inspection in transport_inspections
+            )
+        except (
+            OSError,
+            PrivateDataRootError,
+            PublicationError,
+            TransportSpoolIntegrityError,
+            ValueError,
+        ):
+            transport_invalid = True
+            transport_count = 1
+        if not inspections and quarantine_count == 0 and transport_count == 0:
             return _check("STAGING_STATE", checked_count=0)
         invalid = sum(
             inspection.state is RecoveryInspectionState.INVALID for inspection in inspections
@@ -631,12 +910,20 @@ class Phase2OperationalDiagnostics:
         issue_codes = {"STAGING_RECOVERY_REQUIRED"}
         if invalid:
             issue_codes.add("INVALID_STAGING_ENTRY")
+        if quarantine_count:
+            issue_codes.add("QUARANTINE_STAGING_RECOVERY_REQUIRED")
+        if quarantine_invalid:
+            issue_codes.add("INVALID_QUARANTINE_STAGING_ENTRY")
+        if transport_count:
+            issue_codes.add("TRANSPORT_STAGING_RECOVERY_REQUIRED")
+        if transport_invalid:
+            issue_codes.add("INVALID_TRANSPORT_STAGING_ENTRY")
         return _check(
             "STAGING_STATE",
-            checked_count=len(inspections),
-            issue_count=len(inspections),
+            checked_count=len(inspections) + quarantine_count + transport_count,
+            issue_count=len(inspections) + quarantine_count + transport_count,
             issue_codes=issue_codes,
-            warning=invalid == 0,
+            warning=invalid == 0 and not quarantine_invalid and not transport_invalid,
         )
 
     def _verify_orphans(self) -> DiagnosticCheck:
@@ -649,9 +936,17 @@ class Phase2OperationalDiagnostics:
             canonical_physical, canonical_layout_issues = self._physical_publications(
                 "normalized", _CANONICAL_DIRECTORY
             )
+            quarantine_physical, quarantine_layout_issues = self._physical_publications(
+                "quarantine", _QUARANTINE_DIRECTORY
+            )
             issues.extend(raw_layout_issues)
             issues.extend(canonical_layout_issues)
-            issue_count += len(raw_layout_issues) + len(canonical_layout_issues)
+            issues.extend(quarantine_layout_issues)
+            issue_count += (
+                len(raw_layout_issues)
+                + len(canonical_layout_issues)
+                + len(quarantine_layout_issues)
+            )
             with self._store.read_only_connection() as connection:
                 raw_catalog = {
                     PurePosixPath(str(row[0])).parent.as_posix()
@@ -665,7 +960,16 @@ class Phase2OperationalDiagnostics:
                         "SELECT relative_path FROM canonical_batches WHERE state <> 'PURGED'"
                     ).fetchall()
                 }
-            checked_count = len(raw_physical) + len(canonical_physical)
+                quarantine_catalog = {
+                    str(row[0])
+                    for row in connection.execute(
+                        """
+                        SELECT relative_path FROM quarantine_artifacts
+                        WHERE state <> 'PURGED'
+                        """
+                    ).fetchall()
+                }
+            checked_count = len(raw_physical) + len(canonical_physical) + len(quarantine_physical)
             for relative in sorted(raw_physical - raw_catalog):
                 issue_count += 1
                 directory = _managed_path(self._data_root, self._root_id, relative)
@@ -688,7 +992,24 @@ class Phase2OperationalDiagnostics:
                     issues.append("INVALID_UNCATALOGED_CANONICAL")
                 else:
                     warnings.append("UNCATALOGED_CANONICAL_PUBLICATION")
-            missing = (raw_catalog - raw_physical) | (canonical_catalog - canonical_physical)
+            for relative in sorted(quarantine_physical - quarantine_catalog):
+                issue_count += 1
+                directory = _managed_path(self._data_root, self._root_id, relative)
+                try:
+                    verify_quarantine_artifact_directory(
+                        directory,
+                        data_root=self._data_root,
+                        root_id=self._root_id,
+                    )
+                except (OSError, PublicationError, ValueError):
+                    issues.append("INVALID_UNCATALOGED_QUARANTINE")
+                else:
+                    warnings.append("UNCATALOGED_QUARANTINE_PUBLICATION")
+            missing = (
+                (raw_catalog - raw_physical)
+                | (canonical_catalog - canonical_physical)
+                | (quarantine_catalog - quarantine_physical)
+            )
             if missing:
                 issue_count += len(missing)
                 issues.append("CATALOGED_PUBLICATION_ABSENT")
@@ -825,42 +1146,82 @@ class Phase2OperationalDiagnostics:
                 str(watermark["calendar_snapshot_id"]),
             ),
         ).fetchall()
-        slots, calendar_valid = self._watermark_slots(connection, watermark, start, frontier)
+        supporting_segments = tuple(segment for segment in segments if bool(segment["exact_proof"]))
+        if not supporting_segments:
+            issues.append("WATERMARK_HAS_NO_ELIGIBLE_SUPPORT")
+            issues.append("WATERMARK_FRONTIER_NOT_CONTIGUOUS")
+            return tuple(issues)
+        origins = tuple(
+            sorted({_parse_utc(segment["coverage_start"]) for segment in supporting_segments})
+        )
+        authoritative_start = origins[0]
+        if len(origins) != 1:
+            issues.append("COVERAGE_ORIGIN_INCONSISTENT")
+        if start != authoritative_start:
+            issues.append("WATERMARK_COVERAGE_START_MISMATCH")
+        # Reconstruct over every currently retained proof, not merely the
+        # watermark's claimed prefix.  Including the claimed frontier lets an
+        # over-advanced row fail at its first unsupported calendar slot; using
+        # the furthest retained segment exposes a row tampered backward.
+        domain_end = max(
+            frontier,
+            *(_parse_utc(segment["interval_end"]) for segment in supporting_segments),
+        )
+        slots, calendar_valid = self._watermark_slots(
+            connection,
+            watermark,
+            authoritative_start,
+            domain_end,
+        )
         if not calendar_valid:
             issues.append("CALENDAR_SLOT_CONTRACT_INVALID")
         if not slots:
             issues.append("WATERMARK_HAS_NO_ELIGIBLE_SUPPORT")
             return tuple(issues)
+        active_gaps = connection.execute(
+            """
+            SELECT gap_id, interval_start, interval_end FROM gaps
+            WHERE stream_id = ? AND blocking = 1 AND status IN ('OPEN', 'REPAIRING')
+            ORDER BY interval_start, interval_end, gap_id
+            """,
+            (str(watermark["stream_id"]),),
+        ).fetchall()
+        parsed_gaps = tuple(
+            (_parse_utc(gap["interval_start"]), _parse_utc(gap["interval_end"]))
+            for gap in active_gaps
+        )
+        if int(watermark["blocking_gap_count"]) != len(active_gaps):
+            issues.append("BLOCKING_GAP_COUNT_MISMATCH")
         covered: list[tuple[datetime, datetime, date, set[str]]] = []
         for slot_start, slot_end, session_date in slots:
+            if any(
+                gap_start < slot_end and gap_end > slot_start for gap_start, gap_end in parsed_gaps
+            ):
+                break
             supports = {
                 str(segment["canonical_batch_id"])
-                for segment in segments
-                if bool(segment["exact_proof"])
-                and _parse_utc(segment["interval_start"]) <= slot_start
+                for segment in supporting_segments
+                if _parse_utc(segment["interval_start"]) <= slot_start
                 and _parse_utc(segment["interval_end"]) >= slot_end
             }
             if not supports:
-                issues.append("WATERMARK_FRONTIER_NOT_CONTIGUOUS")
                 break
             covered.append((slot_start, slot_end, session_date, supports))
-        if covered:
+        if not covered:
+            issues.append("WATERMARK_FRONTIER_NOT_CONTIGUOUS")
+        else:
+            reconstructed_frontier = (
+                domain_end if len(covered) == len(slots) else slots[len(covered)][0]
+            )
+            if frontier != reconstructed_frontier:
+                issues.append("WATERMARK_FRONTIER_MISMATCH")
             if str(watermark["last_verified_session"]) != covered[-1][2].isoformat():
                 issues.append("LAST_VERIFIED_SESSION_MISMATCH")
             if str(watermark["last_batch_id"]) not in covered[-1][3]:
                 issues.append("LAST_BATCH_DOES_NOT_SUPPORT_FRONTIER")
-        active_gaps = connection.execute(
-            """
-            SELECT interval_start, interval_end FROM gaps
-            WHERE stream_id = ? AND blocking = 1 AND status IN ('OPEN', 'REPAIRING')
-            """,
-            (str(watermark["stream_id"]),),
-        ).fetchall()
         if any(
-            _parse_utc(gap["interval_start"]) < slot_end
-            and _parse_utc(gap["interval_end"]) > slot_start
-            for gap in active_gaps
-            for slot_start, slot_end, _, _ in covered
+            gap_start < frontier and gap_end > authoritative_start
+            for gap_start, gap_end in parsed_gaps
         ):
             issues.append("BLOCKING_GAP_BEFORE_FRONTIER")
         return tuple(issues)
@@ -1013,6 +1374,13 @@ class Phase2OperationalDiagnostics:
             """
         ).fetchall():
             values.add((str(row[0]), str(row[1]), RetentionLayer.NORMALIZED))
+        for row in connection.execute(
+            """
+            SELECT DISTINCT provider, dataset FROM quarantine_artifacts
+            WHERE state <> 'PURGED'
+            """
+        ).fetchall():
+            values.add((str(row[0]), str(row[1]), RetentionLayer.NORMALIZED))
         for table in ("coverage_segments", "watermarks"):
             condition = (
                 "record.retained = 1 AND record.verification_state = 'VERIFIED'"
@@ -1064,4 +1432,5 @@ __all__ = [
     "OperationalStatusSnapshot",
     "Phase2OperationalDiagnostics",
     "Phase2VerificationReport",
+    "StreamStatusSummary",
 ]
