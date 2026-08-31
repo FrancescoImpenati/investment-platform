@@ -4,6 +4,10 @@
 **Target version:** 0.1.0
 **Last review:** 2026-08-17
 
+> **Document lineage:** This file remains the historical implementation contract for Phase 0.
+> Phase 1 is implemented and approved. The designed, not-yet-implemented Phase 2 contract is
+> [PLAN_PHASE_2.md](PLAN_PHASE_2.md).
+
 ## 1. Outcome
 
 Build a Python-first, local-first modular-monolith foundation that demonstrates:
@@ -311,7 +315,8 @@ without creating code placeholders:
 - dataset-specific cadence;
 - an updateable daily/5-minute dashboard rather than static manual snapshots;
 - deterministic threshold evaluation before optional AI interpretation;
-- a future operational store, likely PostgreSQL, only when mutable transactional state exists.
+- a future operational store—PostgreSQL was the Phase 0 hypothesis—only when mutable transactional
+  state exists. Phase 2 later selected local SQLite in ADR 0008.
 
 Do not create `IngestionState`, watermark, scheduler, planner, operational-store, Market State,
 checkpoint, dashboard, or AI implementation in Phase 0.
@@ -391,6 +396,7 @@ H. 5–10 learning notes.
 - forecasting, strategies, backtesting, broker integration, paper/live trading;
 - Docker, cloud deployment, microservices, queues, or Kubernetes.
 
-The next roadmap step remains the provider bake-off on 10–20 securities using Massive, one second
-provider selected at that time, and yfinance only as a sanity check. This review does not add or
-renumber phases.
+At Phase 0 acceptance, the next roadmap step was the provider bake-off on 10–20 securities using
+Massive, one second provider selected at that time, and yfinance only as a sanity check. That
+historical next step is now complete; the current next implementation contract is
+`PLAN_PHASE_2.md`. This lineage update does not add or renumber phases.

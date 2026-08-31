@@ -4,13 +4,14 @@ Investment Intelligence Platform is a Python-first, local-first foundation for c
 validating, storing, and analyzing market data. The long-term goal is a daily research system that
 combines deterministic quantitative analytics with later, clearly separated AI interpretation.
 
-The approved Phase 0 foundation is frozen. **Phase 1 — Provider Bake-off** is a final review
-candidate on its feature branch. It is not an investment product, a live trading system, or a
-production market-data ingestion service.
+Phase 0 and **Phase 1 — Provider Bake-off** are implemented and approved. Phase 2 living ingestion
+is designed and planned, but no Phase 2 operational database, watermark, CLI, scheduler, backfill,
+or durable live workflow is implemented yet. This is not an investment product or live trading
+system.
 
 ## Current status
 
-### Approved Phase 0 foundation
+### Implemented and approved
 
 - a typed domain foundation for instruments, universes, price bars, corporate actions, provenance,
   and parameterized feature definitions;
@@ -19,10 +20,7 @@ production market-data ingestion service.
 - append-safe raw artifacts with manifests, checksums, and batch collision protection;
 - a canonical Polars representation, vectorized quality flags, partitioned Parquet storage, and
   in-memory DuckDB queries;
-- tests, locked Python tooling, CI, architecture documentation, and durable repository guidance.
-
-### Phase 1 review candidate
-
+- tests, locked Python tooling, CI, architecture documentation, and durable repository guidance;
 - bounded standard-library HTTP adapters for Massive, Alpaca, and Twelve Data, with no provider
   SDKs;
 - explicit Alpaca SIP/IEX source identity and no implicit feed fallback;
@@ -30,7 +28,8 @@ production market-data ingestion service.
 - a pairwise quality harness that preserves raw-batch provenance and does not average or select
   conflicting provider values;
 - an intentional 16-security experiment design, sanitized synthetic fixtures, fully offline
-  deterministic tests, and an opt-in ephemeral live runner.
+  deterministic tests, and an opt-in ephemeral live runner;
+- approved post-Phase 1 Databento research, with no adapter or persistent Databento data.
 
 Minimal transient access preflights succeeded for Alpaca historical SIP, Twelve Data Basic, and
 Massive. The complete bounded bar pipeline and comparison ran ephemerally for Alpaca SIP versus
@@ -42,17 +41,19 @@ upgraded: `/splits` and `/dividends` are unavailable on Basic, so actions were a
 asymmetrically. See the [provider quality report](docs/research/provider_quality_report.md) for the
 measured evidence and dataset-specific recommendation.
 
-Later phases may add:
+### Designed for Phase 2, not implemented
 
-- backfill, incremental update, repair/reconciliation, and persistent ingestion watermarks;
-- calendar-aware completeness checks for holidays, DST, and early closes;
-- deterministic feature computation, Market State, checkpoints, alerts, and an updateable
-  dashboard;
-- forecasting, strategies, backtesting, AI-assisted interpretation, and—much later—paper trading
-  and broker integration.
+- physically external private data root with a sentinel and fail-closed path validation;
+- explicit test, ci, development, private_research, and demo profiles;
+- retention-aware exact provider/dataset policy;
+- SQLite operational state for runs, requests, coverage, gaps, errors, and watermarks;
+- crash-safe canonical batch publication and recovery;
+- backfill, incremental update, repair, status, and verify commands;
+- a maintained US exchange calendar and eventual external scheduler invocation.
 
-PostgreSQL, schedulers, production ingestion orchestration, dashboards, agents, and trading
-integrations are outside Phase 1.
+See the [Phase 2 design](docs/architecture/phase-2-living-ingestion.md) and
+[implementation plan](PLAN_PHASE_2.md). Feature execution, Market State, dashboards, agents,
+strategies, backtesting engines, brokers, and trading integrations remain future work.
 
 ## Architecture
 
@@ -69,11 +70,12 @@ Provider
 ```
 
 Parquet is authoritative for analytical datasets such as normalized market bars and future feature
-history; it is not the source of truth for every future kind of application state. Mutable state
-such as watermarks, job attempts, alerts, portfolios, or orders may later belong in a transactional
-store. DuckDB remains an in-process analytical engine over Parquet in Phase 0.
+history; it is not the source of truth for every kind of application state. The accepted Phase 2
+design assigns mutable ingestion state to local SQLite while DuckDB remains an in-process query
+engine over verified Parquet. This separation is designed, not yet implemented.
 
-See the [Design Document](docs/architecture/design-v0.1.md),
+See the [Phase 0 Design Document](docs/architecture/design-v0.1.md),
+[Phase 2 design](docs/architecture/phase-2-living-ingestion.md),
 [architecture decisions](docs/architecture/adr/), and
 [storage layout](docs/data/storage-layout.md) for the durable design.
 
@@ -94,6 +96,7 @@ Run the complete local verification suite:
 
 ```bash
 uv lock --check
+uv sync --locked --all-groups
 uv run --locked ruff format --check .
 uv run --locked ruff check .
 uv run --locked mypy src tests
@@ -101,10 +104,10 @@ uv run --locked pytest
 uv build
 ```
 
-Normal tests and CI require no API credentials or network. Opt-in live Phase 1 work reads
-`MASSIVE_API_KEY`, `APCA_API_KEY_ID`, `APCA_API_SECRET_KEY`, and `TWELVE_DATA_API_KEY` from the
-process environment. `.env.example` contains empty names for local setup, but the application does
-not load `.env` files; secrets must never be committed or printed.
+Normal tests and CI require no API credentials or network. The existing opt-in live Phase 1 runner
+reads `MASSIVE_API_KEY`, `APCA_API_KEY_ID`, `APCA_API_SECRET_KEY`, and `TWELVE_DATA_API_KEY` from
+the process environment. `.env.example` contains empty names for local setup, but the application
+does not load `.env` files; secrets must never be committed or printed.
 
 ## Repository layout
 
@@ -114,18 +117,21 @@ tests/                     Unit and integration tests
 data/sample/               Synthetic or explicitly redistributable examples only
 docs/architecture/         Design document and ADRs
 docs/data/                 Storage and data-contract documentation
+docs/governance/           Redacted public governance records
 docs/research/             Provider selection, frozen design, and empirical evidence
 PLAN.md                    Phase 0 implementation contract
+PLAN_PHASE_2.md            Phase 2 implementation contract; implementation not started
 AGENTS.md                  Root-wide repository instructions for Codex
 ```
 
-The foundation provides ignored local paths such as `data/raw/` and `data/normalized/`, but a
-technical storage path is not permission to retain licensed data. When durable retention is
-ambiguous but temporary private processing is permitted, Phase 1 may use an external temporary
-data root for the complete raw-to-query pipeline and delete it at run end. A provider agreement
-that restricts the required non-display processing still stops that provider's run. The bake-off
-report evaluates a physically external private data root and durable provider-specific retention
-rules as Phase 2 prerequisites.
+The existing foundation accepts caller-supplied roots and the Phase 1 runner proved an external
+temporary root with cleanup. Phase 2 now designs a mandatory, absolute, dedicated private root
+outside Git with a platform sentinel, but that guard is not implemented yet. The full Alpaca
+support evidence will live only under that private root; the repository contains only the
+[redacted rights record](docs/governance/data-rights/alpaca-historical-sip.md).
+
+Ignored repository-local paths remain a secondary accident barrier. They are not the Phase 2
+security boundary and do not grant permission to retain data.
 
 ## Data, secrets, and licensing
 
@@ -141,11 +147,12 @@ should not be assumed to be open for reuse or redistribution.
 
 ## Roadmap
 
-Phase 0 establishes testable contracts and local analytical storage. Phase 1 follows the bounded
-[provider bake-off design](docs/research/provider_bakeoff_design.md) and records progress in the
-[provider quality report](docs/research/provider_quality_report.md). Later phases add incremental
-ingestion and trading-calendar semantics, deterministic analytics and Market State, then
-checkpoints/dashboard capabilities, and only afterward AI interpretation and strategy work.
+Phase 0 established testable contracts and local analytical storage. Phase 1 completed the bounded
+[provider bake-off](docs/research/provider_quality_report.md), and the approved
+[Databento evaluation](docs/research/databento-evaluation.md) remains a separate research
+checkpoint. Phase 2 is the designed next implementation: a retention-aware living historical
+store. Deterministic analytics and Market State follow only after Phase 2; checkpoints/dashboard,
+AI interpretation, and strategy work remain later.
 
 ## Disclaimer
 
