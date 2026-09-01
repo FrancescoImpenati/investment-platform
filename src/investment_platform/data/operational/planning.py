@@ -1322,16 +1322,20 @@ class IngestionPlanRepository:
             request.max_calls_per_request,
             _execution_limits_hash(request),
         )
-        if limits is None or tuple(
-            limits[column]
-            for column in (
-                "max_pages",
-                "max_calls",
-                "max_pages_per_request",
-                "max_calls_per_request",
-                "limits_hash",
+        if (
+            limits is None
+            or tuple(
+                limits[column]
+                for column in (
+                    "max_pages",
+                    "max_calls",
+                    "max_pages_per_request",
+                    "max_calls_per_request",
+                    "limits_hash",
+                )
             )
-        ) != expected_limits:
+            != expected_limits
+        ):
             raise PlanIdentityCollisionError("request execution limits collide with replay")
 
         streams = connection.execute(
@@ -1395,10 +1399,14 @@ class IngestionPlanRepository:
                     max_calls=max_calls,
                 ),
             )
-            if request_limit is None or tuple(
-                request_limit[column]
-                for column in ("run_id", "max_pages", "max_calls", "limits_hash")
-            ) != expected_request_limit:
+            if (
+                request_limit is None
+                or tuple(
+                    request_limit[column]
+                    for column in ("run_id", "max_pages", "max_calls", "limits_hash")
+                )
+                != expected_request_limit
+            ):
                 raise PlanIdentityCollisionError("request dispatch limits collide with replay")
             self._persist_request_spec(
                 connection,

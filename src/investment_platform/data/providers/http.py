@@ -6,12 +6,20 @@ from collections.abc import Iterator, Mapping
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass, field
 from email.message import Message
+from ssl import TLSVersion, create_default_context
 from time import perf_counter
 from types import MappingProxyType
 from typing import IO, Protocol, runtime_checkable
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlsplit, urlunsplit
-from urllib.request import HTTPRedirectHandler, OpenerDirector, Request, build_opener
+from urllib.request import (
+    BaseHandler,
+    HTTPRedirectHandler,
+    HTTPSHandler,
+    OpenerDirector,
+    Request,
+    build_opener,
+)
 from uuid import UUID
 
 from investment_platform.data.provenance import BytesRawPayload, RawPayload
@@ -261,13 +269,19 @@ class SpoolingUrllibHttpTransport:
         *,
         maximum_response_bytes: int = 64 * 1024 * 1024,
         spool_store: TransportSpoolStore | None = None,
+        tls_maximum_version: TLSVersion | None = None,
     ) -> None:
         if maximum_response_bytes <= 0:
             raise ValueError("maximum_response_bytes must be positive")
         self._maximum_response_bytes = maximum_response_bytes
         self._spool_store = spool_store or TransportSpoolStore(data_root)
         self._redirect_handler = _RejectRedirectHandler()
-        self._opener: OpenerDirector = build_opener(self._redirect_handler)
+        handlers: list[BaseHandler] = [self._redirect_handler]
+        if tls_maximum_version is not None:
+            context = create_default_context()
+            context.maximum_version = tls_maximum_version
+            handlers.append(HTTPSHandler(context=context))
+        self._opener: OpenerDirector = build_opener(*handlers)
         self._active_spool: AttemptTransportSpool | None = None
 
     @contextmanager

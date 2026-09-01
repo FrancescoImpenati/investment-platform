@@ -517,9 +517,7 @@ class RawAcquisitionService:
                     next(iterator)
                 except StopIteration:
                     break
-                raise RawAcquisitionError(
-                    "provider yielded a page after pagination termination"
-                )
+                raise RawAcquisitionError("provider yielded a page after pagination termination")
             if before_dispatch is not None:
                 before_dispatch(page_ordinal)
             try:

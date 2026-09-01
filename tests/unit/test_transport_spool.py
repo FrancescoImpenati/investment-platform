@@ -4,8 +4,9 @@ from __future__ import annotations
 
 from email.message import Message
 from pathlib import Path
+from ssl import SSLContext, TLSVersion
 from typing import Self, cast
-from urllib.request import OpenerDirector, Request
+from urllib.request import BaseHandler, HTTPSHandler, OpenerDirector, Request
 from uuid import UUID, uuid4
 
 import pytest
@@ -261,3 +262,16 @@ def test_spooling_http_response_is_file_backed_only_inside_attempt(tmp_path: Pat
         response.raw_payload.open_binary() as reader,
     ):
         reader.read(1)
+
+
+def test_spooling_transport_applies_explicit_tls_maximum(tmp_path: Path) -> None:
+    transport = SpoolingUrllibHttpTransport(
+        _root(tmp_path),
+        tls_maximum_version=TLSVersion.TLSv1_2,
+    )
+
+    handlers = cast(list[BaseHandler], vars(transport._opener)["handlers"])
+    handler = next(value for value in handlers if isinstance(value, HTTPSHandler))
+    context = cast(SSLContext, vars(handler)["_context"])
+
+    assert context.maximum_version is TLSVersion.TLSv1_2

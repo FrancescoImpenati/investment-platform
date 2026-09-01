@@ -21,6 +21,7 @@ from decimal import Decimal
 from enum import StrEnum
 from math import isfinite
 from pathlib import Path
+from ssl import TLSVersion
 from typing import Final
 from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo
@@ -425,23 +426,17 @@ class LivingIngestionService:
                         tuple(sorted(stream.stream_id for stream in request.streams)),
                         detected_at=self._now(),
                     )
-                    if any(
-                        result.state is not CanonicalLossState.HEALTHY
-                        for result in reconciled
-                    ):
+                    if any(result.state is not CanonicalLossState.HEALTHY for result in reconciled):
                         raise LivingIngestionIncomplete("INTEGRITY_REPAIR_REQUIRED")
                     proofs = self._restart_reader.load_optional_stream_proofs(
                         tuple(sorted(stream.stream_id for stream in request.streams))
                     )
                 except RestartProjectionIntegrityError as error:
-                    raise LivingIngestionIncomplete(
-                        "INTEGRITY_REPAIR_REQUIRED"
-                    ) from error
+                    raise LivingIngestionIncomplete("INTEGRITY_REPAIR_REQUIRED") from error
                 if proofs is None:
                     raise LivingIngestionIncomplete("NO_COVERAGE_ORIGIN")
                 if any(
-                    gap.gap_type is GapType.INTEGRITY and gap.actively_blocks
-                    for gap in proofs.gaps
+                    gap.gap_type is GapType.INTEGRITY and gap.actively_blocks for gap in proofs.gaps
                 ):
                     raise LivingIngestionIncomplete("INTEGRITY_REPAIR_REQUIRED")
             calendar_snapshot_id = self._calendar_repository.persist(
@@ -1757,7 +1752,10 @@ class _ProductionCommandRunner(IngestionCommandRunner):
                 if provider_required:
                     provider = AlpacaProvider.from_environment(
                         feed=AlpacaFeed.SIP,
-                        transport=SpoolingUrllibHttpTransport(self._data_root),
+                        transport=SpoolingUrllibHttpTransport(
+                            self._data_root,
+                            tls_maximum_version=TLSVersion.TLSv1_2,
+                        ),
                     )
                 service = LivingIngestionService(
                     data_root=self._data_root,
@@ -1893,7 +1891,10 @@ class _ProductionCommandRunner(IngestionCommandRunner):
                 store=store,
                 provider=AlpacaProvider.from_environment(
                     feed=AlpacaFeed.SIP,
-                    transport=SpoolingUrllibHttpTransport(self._data_root),
+                    transport=SpoolingUrllibHttpTransport(
+                        self._data_root,
+                        tls_maximum_version=TLSVersion.TLSv1_2,
+                    ),
                 ),
                 policy_enforcer=enforcer,
             )

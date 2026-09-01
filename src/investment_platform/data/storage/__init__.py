@@ -37,13 +37,6 @@ from investment_platform.data.storage.market_bars import (
     empty_price_bar_frame,
     price_bars_to_frame,
 )
-from investment_platform.data.storage.raw import (
-    BatchCollisionError,
-    RawArtifact,
-    RawBatchStore,
-    RawStorageError,
-    replay_raw_artifact,
-)
 from investment_platform.data.storage.quarantine import (
     PublishedQuarantineArtifact,
     QuarantineArtifactManifest,
@@ -51,6 +44,13 @@ from investment_platform.data.storage.quarantine import (
     deterministic_quarantine_artifact_id,
     quarantine_artifact_relative_directory,
     verify_quarantine_artifact_directory,
+)
+from investment_platform.data.storage.raw import (
+    BatchCollisionError,
+    RawArtifact,
+    RawBatchStore,
+    RawStorageError,
+    replay_raw_artifact,
 )
 from investment_platform.data.storage.recovery import (
     PublicationRecoveryInspector,
@@ -82,6 +82,8 @@ __all__ = [
     "PublishedCanonicalBatch",
     "PublishedQuarantineArtifact",
     "PublishedRawArtifact",
+    "QuarantineArtifactManifest",
+    "QuarantineArtifactPublisher",
     "RawArtifact",
     "RawArtifactManifest",
     "RawArtifactPublisher",
@@ -89,17 +91,15 @@ __all__ = [
     "RawPayloadManifest",
     "RawProvenanceBinding",
     "RawStorageError",
-    "QuarantineArtifactManifest",
-    "QuarantineArtifactPublisher",
     "RecoveryArtifactKind",
     "RecoveryInspection",
     "RecoveryInspectionState",
     "StreamPublicationOutcome",
-    "empty_price_bar_frame",
     "deterministic_quarantine_artifact_id",
+    "empty_price_bar_frame",
     "price_bars_to_frame",
-    "raw_artifact_relative_directory",
     "quarantine_artifact_relative_directory",
+    "raw_artifact_relative_directory",
     "replay_raw_artifact",
     "verify_canonical_batch_directory",
     "verify_quarantine_artifact_directory",

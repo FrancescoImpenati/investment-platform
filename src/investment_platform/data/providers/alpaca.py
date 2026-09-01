@@ -190,9 +190,7 @@ def _provider_bar_query_bounds(request: BarRequest) -> tuple[datetime, datetime]
     if request.timeframe is not Timeframe.ONE_DAY:
         return request.start, request.end
     first_session_date = request.start.astimezone(_NEW_YORK).date()
-    last_session_date = (request.end - timedelta(microseconds=1)).astimezone(
-        _NEW_YORK
-    ).date()
+    last_session_date = (request.end - timedelta(microseconds=1)).astimezone(_NEW_YORK).date()
     provider_start = datetime.combine(
         first_session_date,
         time.min,

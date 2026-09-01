@@ -4,6 +4,7 @@ Acquisition and processing are intentionally imported from their concrete
 submodules.  Keeping this package initializer storage-independent prevents the
 storage/identity boundary from acquiring an import cycle.
 """
+
 from investment_platform.data.ingestion.coverage import (
     PHASE2_VERIFIED_EMPTY_SEMANTICS,
     CoverageDomainError,
