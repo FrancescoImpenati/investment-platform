@@ -10,8 +10,9 @@
   through its offline control plane, approved AAPL M6 acceptance, and capped AAPL/MSFT/ORLY/NEE M7
   live exercise. The failed ORLY daily stream remained isolated without durable advancement or a
   false `VERIFIED_EMPTY`; intermittent transport on the tested host route and the private evidence
-  archive remain open. The final local quality and security/data audit are green; the pull request,
-  Linux CI confirmation, and Phase 2 approval are pending. Never
+  archive remain open. The final local quality, security/data audit, and Linux CI are green in
+  pull request 3. Phase 2 implementation is complete on the feature branch; review and merge
+  approval remain pending. Never
   describe external scheduling, Phase 3, or other Planned/Future behavior as Implemented.
 - Phase 2 implementation is limited to the contract in `PLAN_PHASE_2.md`, initially Alpaca
   historical SIP US stock bars at `1d` and `5m` after the dataset's strict historical-age gate. Do

@@ -1,6 +1,6 @@
 # Phase 2 Implementation Plan — Living Data Ingestion
 
-- **Status:** Implementation, bounded M6/M7 acceptance, local quality/audit complete; PR/CI pending
+- **Status:** Implementation complete; PR 3 open and Linux CI green; review/merge pending
 - **Date:** 2026-08-31
 - **Status updated:** 2026-09-01
 - **Design:** [Phase 2 — Living Data Ingestion](docs/architecture/phase-2-living-ingestion.md)
@@ -25,8 +25,8 @@ tests and CI remain synthetic, offline, credential-free, and isolated from priva
 This plan is the Phase 2 implementation contract. PLAN.md remains the historical Phase 0 contract.
 The source and synthetic test suite implement the control plane described below. Controlled AAPL
 acceptance and a maximum-four-instrument M7 rollout have exercised it with private Alpaca data.
-This status does not mark the contract approved: the pull request and Linux CI confirmation remain
-required, and Phase 3 is not authorized.
+This status does not mark the contract merged or approved: pull request 3 is open with green Linux
+CI, while review and merge remain separate decisions. Phase 3 is not authorized.
 
 ## 2. Frozen design decisions
 

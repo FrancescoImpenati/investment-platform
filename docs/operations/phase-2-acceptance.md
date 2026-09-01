@@ -5,8 +5,9 @@
 - **Capped multi-instrument live exercise (M7):** COMPLETE WITH CONTAINED PARTIAL FAILURE
 - **Final local quality:** COMPLETE
 - **Final security/data/diff audit:** COMPLETE
-- **Pull request / Linux CI:** PENDING
-- **Phase 2 completion / approval:** PENDING
+- **Pull request / Linux CI:** PR 3 OPEN / GREEN
+- **Phase 2 implementation:** COMPLETE
+- **Phase 2 review / merge approval:** PENDING
 - **Phase 3:** NOT STARTED
 - **Last review:** 2026-09-01
 
@@ -147,9 +148,11 @@ as passes:
 5. `test_database_cannot_be_redirected_outside_the_validated_root`.
 
 Their security intent has not been weakened and the tests were not changed to bypass the host
-restriction. Execution through GitHub Actions on Linux, including an exact explanation of any
-Linux skips, is still pending and must be recorded only after the push and pull-request workflows
-actually complete.
+restriction. GitHub Actions on Ubuntu collected the same 723 items and reported 712 passed plus 11
+skipped in 63.89 seconds. Those 11 skips are exactly the Windows-junction-only cases; the five
+ordinary symlink tests above have no Linux skip condition and therefore executed and passed. Both
+the `push` and `pull_request` workflows completed successfully on the corrected implementation
+commit.
 
 ## Final local quality gate
 
@@ -159,6 +162,11 @@ reported 718 passed plus the five Windows symlink skips above in 353.98 seconds.
 identified formatting and import/export ordering left by earlier checkpoints; Ruff corrected only
 those mechanical issues. The first isolated package-build attempt then hit transient PyPI DNS
 resolution, and the unchanged `uv build` command passed once name resolution recovered.
+
+The first pull-request workflow found one real cross-platform typing defect: Linux typeshed does
+not expose `ctypes.WinDLL` even though the guarded code executes only on Windows. The lookup now
+fails closed when unavailable; focused Ruff, mypy, and data-root tests passed locally, and the next
+Linux `push` and `pull_request` workflows were green without weakening any symlink test.
 
 The one final security/data/diff audit found no credential values, private-root literal, private
 evidence, operational database, licensed payload, or non-sample market-data artifact in tracked or
@@ -172,8 +180,9 @@ contains no CI change, Phase 3 subsystem, or forbidden infrastructure.
 The Phase 2 implementation now provides the private-root boundary, exact retention enforcement,
 raw-first immutable persistence, verified Parquet publication, SQLite control plane, independent
 coverage/watermarks, backfill/update/no-op/repair/restart, and sanitized status/verification needed
-for a later Phase 3 decision. Coherent commits, push, pull request, and both CI trigger results
-remain pending at this record revision.
+for a later Phase 3 decision. The coherent commits are pushed, pull request 3 is open, and both CI
+trigger results are green. Review and an explicit merge decision remain outside this implementation
+task.
 
 The private evidence archive and intermittent transport on the tested host route remain open
 issues. No scheduler is activated, no merge has occurred, and Phase 3 has not started.

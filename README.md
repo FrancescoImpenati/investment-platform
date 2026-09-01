@@ -9,9 +9,9 @@ design is implemented through its offline control plane and bounded live accepta
 AAPL backfill, update, no-op, repair, restart, status, and verification, while M7 executed a
 four-instrument maximum mini rollout using only AAPL, MSFT, ORLY, and NEE. One ORLY daily stream
 remains cleanly failed with no false data advancement after intermittent provider transport
-failures. The final local quality and security/data audit are green; the pull request, Linux CI
-confirmation, and Phase 2 approval are still pending. This is not an investment product or live
-trading system.
+failures. The final local quality, security/data audit, and Linux CI are green in pull request 3.
+Phase 2 implementation is complete on the feature branch; review and merge approval remain
+pending. This is not an investment product or live trading system.
 
 ## Current status
 
@@ -65,9 +65,9 @@ measured evidence and dataset-specific recommendation.
   from the failed ORLY daily stream, which was not promoted to `VERIFIED_EMPTY`.
 - the final local quality gate, including 723 collected tests, package build, and diff check.
 
-### Remaining before Phase 2 approval
+### Remaining before Phase 2 merge approval
 
-- Phase 2 pull request and push plus pull-request CI confirmation;
+- review of the open Phase 2 pull request and an explicit merge decision;
 - manual archival of the private Alpaca correspondence, whose status remains
   `pending_manual_archive` without invented evidence;
 - resolution or explicit acceptance of intermittent transport on the tested host route affecting
@@ -98,7 +98,7 @@ Parquet is authoritative for analytical datasets such as normalized market bars 
 history; it is not the source of truth for every kind of application state. Phase 2 assigns mutable
 ingestion state to local SQLite while DuckDB remains an in-process query engine over cataloged,
 verified Parquet. M6 and the bounded M7 rollout exercised this separation with private live data;
-the local quality gate is green and Linux CI confirmation remains pending.
+the local quality gate and Linux CI are green.
 
 See the [Phase 0 Design Document](docs/architecture/design-v0.1.md),
 [Phase 2 design](docs/architecture/phase-2-living-ingestion.md),
@@ -184,8 +184,8 @@ Phase 0 established testable contracts and local analytical storage. Phase 1 com
 [Databento evaluation](docs/research/databento-evaluation.md) remains a separate research
 checkpoint. Phase 2 is the active retention-aware living historical-store implementation. Its
 offline control plane, AAPL acceptance, and bounded four-instrument mini rollout are complete on
-the phase branch; the local quality gate is green, while the pull request, CI, and approval remain
-open.
+the phase branch; local quality and CI are green in the open pull request, while review and merge
+approval remain open.
 Deterministic analytics and Market State follow only after a separate Phase 3 decision;
 checkpoints/dashboard, AI interpretation, and strategy work remain later.
 

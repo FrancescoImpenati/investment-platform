@@ -1,6 +1,6 @@
 # Phase 2 — Living Data Ingestion
 
-- **Status:** Implemented through bounded M6/M7 acceptance; local quality/audit green; PR/CI pending
+- **Status:** Implemented; local quality/audit and PR 3 Linux CI green; review/merge pending
 - **Date:** 2026-09-01
 - **Baseline:** main at 76e3ffd, including approved Phase 0, Phase 1, and Databento research
 - **Implementation contract:** [PLAN_PHASE_2.md](../../PLAN_PHASE_2.md)
@@ -140,8 +140,8 @@ completed controlled AAPL backfill, restart, update, no-op, repair, status, and 
 then exercised at most AAPL, MSFT, ORLY, and NEE: successful streams advanced independently while
 the transport-failed ORLY daily stream created no raw or canonical artifact, coverage, or watermark
 and was never classified `VERIFIED_EMPTY`. The correspondence archive remains
-`pending_manual_archive`; the local quality gate is green, while the pull request, Linux CI, and
-Phase 2 approval remain pending.
+`pending_manual_archive`; the local quality gate and Linux CI are green in pull request 3, while
+review and merge approval remain pending.
 No scheduler is activated, and Phase 3 has not started.
 
 ## 4. Architectural invariants
@@ -1246,13 +1246,13 @@ data. It does not authorize a backtesting engine in Phase 2.
 
 ## 25. Readiness verdict
 
-**PHASE 2 IMPLEMENTATION READY FOR FINAL QUALITY AND PR REVIEW**
+**PHASE 2 IMPLEMENTATION COMPLETE — READY FOR REVIEW**
 
 The approved design, offline safety contracts, AAPL acceptance, and bounded four-instrument rollout
 have been exercised without expanding into later analytical or product phases. The ORLY daily
 transport failure remained isolated and did not create false durable truth. Phase 2 is not yet
-approved: the evidence archive remains pending and the pull request plus Linux CI confirmation are
-still required. This is not authorization to start Phase 3.
+approved or merged: the evidence archive remains pending and pull request 3 still requires review
+and an explicit merge decision. This is not authorization to start Phase 3.
 
 ## 26. Learning notes
 
