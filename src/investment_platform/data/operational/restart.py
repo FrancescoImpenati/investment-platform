@@ -684,9 +684,7 @@ class RestartProjectionReader:
                     max_calls=allocated_calls,
                 )
             ):
-                raise RestartProjectionIntegrityError(
-                    "request dispatch limits are inconsistent"
-                )
+                raise RestartProjectionIntegrityError("request dispatch limits are inconsistent")
             status = RequestInstanceStatus(str(request_row["instance_status"]))
             attempts = self._load_attempts(
                 connection,
@@ -2092,17 +2090,22 @@ class RestartProjectionReader:
             and segment.start < watermark.exclusive_frontier
             and segment.end > watermark.coverage_start
         )
+        eligible_slots = calendar.expected_slots(stream.timeframe)
         slots = tuple(
             slot
-            for slot in calendar.expected_slots(stream.timeframe)
+            for slot in eligible_slots
             if watermark.coverage_start <= slot.start_utc
             and slot.end_utc <= watermark.exclusive_frontier
+        )
+        frontier_is_eligible_boundary = bool(slots) and (
+            slots[-1].end_utc == watermark.exclusive_frontier
+            or any(slot.start_utc == watermark.exclusive_frontier for slot in eligible_slots)
         )
         if (
             not supporting
             or not slots
             or slots[0].start_utc != watermark.coverage_start
-            or slots[-1].end_utc != watermark.exclusive_frontier
+            or not frontier_is_eligible_boundary
             or watermark.last_batch_id not in {segment.canonical_batch_id for segment in supporting}
             or any(
                 not any(

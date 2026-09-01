@@ -404,12 +404,8 @@ def test_daily_backfill_query_watermark_and_reopen_are_durable(tmp_path: Path) -
                 "SELECT coverage_start, exclusive_frontier FROM watermarks"
             ).fetchone()
         assert watermark is not None
-        assert watermark[0] == _OPEN.isoformat(timespec="microseconds").replace(
-            "+00:00", "Z"
-        )
-        assert watermark[1] == _CLOSE.isoformat(timespec="microseconds").replace(
-            "+00:00", "Z"
-        )
+        assert watermark[0] == _OPEN.isoformat(timespec="microseconds").replace("+00:00", "Z")
+        assert watermark[1] == _CLOSE.isoformat(timespec="microseconds").replace("+00:00", "Z")
 
     with OperationalStateStore.open(root, clock=clock) as reopened_store:
         restarted = LivingIngestionService(
@@ -424,6 +420,127 @@ def test_daily_backfill_query_watermark_and_reopen_are_durable(tmp_path: Path) -
             lease_owner_id=f"daily-reopen-{uuid4()}",
         )
         assert restarted.resume(_RUN_1) == completed
+
+
+def test_disjoint_daily_publication_materializes_inter_batch_gap(tmp_path: Path) -> None:
+    root = _private_root(tmp_path)
+    clock = MutableClock(_NOW)
+    session_dates = tuple(date(2026, 8, day) for day in range(24, 28))
+    opens = tuple(
+        datetime.combine(session_date, datetime.min.time(), tzinfo=UTC)
+        + timedelta(hours=13, minutes=30)
+        for session_date in session_dates
+    )
+    closes = tuple(value + timedelta(hours=6, minutes=30) for value in opens)
+    provider_timestamps = tuple(
+        datetime.combine(session_date, datetime.min.time(), tzinfo=UTC) + timedelta(hours=4)
+        for session_date in session_dates
+    )
+    calendar = CalendarSnapshot.create(
+        library_name="synthetic-calendar",
+        library_version="1",
+        tzdata_version="synthetic",
+        calendar_name="XNYS",
+        timezone_name="America/New_York",
+        range_start=session_dates[0],
+        range_end=session_dates[-1] + timedelta(days=1),
+        generated_at=_NOW,
+        sessions=tuple(
+            CalendarSession(
+                session_date=session_date,
+                open_utc=session_open,
+                close_utc=session_close,
+            )
+            for session_date, session_open, session_close in zip(
+                session_dates,
+                opens,
+                closes,
+                strict=True,
+            )
+        ),
+    )
+
+    with OperationalStateStore.open(root, clock=clock) as store:
+        initial, _ = _service(root, store, clock, [_payload(*provider_timestamps[:2])])
+        first = initial.run(
+            replace(
+                _request(
+                    run_id=_RUN_1,
+                    intent=IngestionIntent.BACKFILL,
+                    start=opens[0],
+                    end=closes[1],
+                    timeframe=Timeframe.ONE_DAY,
+                ),
+                calendar_snapshot=calendar,
+            )
+        )
+        assert first.status is IngestionRunStatus.SUCCESS
+        with store.read_only_connection() as connection:
+            first_watermark = connection.execute("SELECT generation FROM watermarks").fetchone()
+        assert first_watermark is not None
+
+        extension, _ = _service(root, store, clock, [_payload(provider_timestamps[3])])
+        partial = extension.run(
+            replace(
+                _request(
+                    run_id=_RUN_2,
+                    intent=IngestionIntent.BACKFILL,
+                    start=opens[3],
+                    end=closes[3],
+                    timeframe=Timeframe.ONE_DAY,
+                ),
+                calendar_snapshot=calendar,
+            )
+        )
+
+        assert partial.status is IngestionRunStatus.PARTIAL
+        assert partial.open_gap_count == 1
+        with store.read_only_connection() as connection:
+            coverage_end = connection.execute(
+                "SELECT max(interval_end) FROM coverage_segments"
+            ).fetchone()[0]
+            gaps = connection.execute(
+                """
+                SELECT interval_start, interval_end, gap_type, status, blocking
+                FROM gaps WHERE status IN ('OPEN', 'REPAIRING')
+                """
+            ).fetchall()
+            watermark = connection.execute(
+                """
+                SELECT exclusive_frontier, generation, last_verified_session,
+                       blocking_gap_count
+                FROM watermarks
+                """
+            ).fetchone()
+        assert coverage_end == closes[3].isoformat(timespec="microseconds").replace("+00:00", "Z")
+        assert len(gaps) == 1
+        assert tuple(gaps[0]) == (
+            opens[2].isoformat(timespec="microseconds").replace("+00:00", "Z"),
+            closes[2].isoformat(timespec="microseconds").replace("+00:00", "Z"),
+            "EXPECTED_OBSERVATION",
+            "OPEN",
+            1,
+        )
+        assert watermark is not None
+        assert watermark[0] == opens[2].isoformat(timespec="microseconds").replace("+00:00", "Z")
+        assert int(watermark[1]) == int(first_watermark[0]) + 1
+        assert watermark[2] == session_dates[1].isoformat()
+        assert int(watermark[3]) == 1
+        assert Phase2OperationalDiagnostics(root, store, clock=clock).verify().healthy
+
+    with OperationalStateStore.open(root, clock=clock) as reopened_store:
+        reopened = LivingIngestionService(
+            data_root=root,
+            store=reopened_store,
+            provider=None,
+            policy_enforcer=RetentionPolicyEnforcer(
+                RetentionPolicyCatalog.load_default(),
+                clock=clock,
+            ),
+            clock=clock,
+            lease_owner_id=f"daily-gap-reopen-{uuid4()}",
+        )
+        assert reopened.resume(_RUN_2) == partial
 
 
 def test_earlier_backfill_rebases_origin_without_moving_frontier_backward(
@@ -486,18 +603,14 @@ def test_earlier_backfill_rebases_origin_without_moving_frontier_backward(
         assert rebindings[0][0] == (_OPEN + timedelta(minutes=10)).isoformat(
             timespec="microseconds"
         ).replace("+00:00", "Z")
-        assert rebindings[0][1] == _OPEN.isoformat(timespec="microseconds").replace(
-            "+00:00", "Z"
-        )
+        assert rebindings[0][1] == _OPEN.isoformat(timespec="microseconds").replace("+00:00", "Z")
         assert rebindings[0][2] == str(_RUN_2)
 
         reopened = earlier.resume(_RUN_2)
         assert reopened.status is IngestionRunStatus.SUCCESS
         with store.read_only_connection() as connection:
             assert (
-                connection.execute(
-                    "SELECT count(*) FROM coverage_origin_rebindings"
-                ).fetchone()[0]
+                connection.execute("SELECT count(*) FROM coverage_origin_rebindings").fetchone()[0]
                 == 1
             )
 
@@ -543,6 +656,7 @@ def test_gap_repair_restores_contiguous_coverage(tmp_path: Path) -> None:
         assert len(repair_transport.requests) == 1
         query = dict(repair_transport.requests[0].query)
         assert query["start"] == "2025-07-02T13:35:00.000000Z"
+        assert Phase2OperationalDiagnostics(root, store, clock=clock).verify().healthy
 
 
 def test_provider_refresh_identical_values_commits_semantic_noop_and_restarts(
@@ -870,9 +984,12 @@ def test_cli_raw_replay_reconciles_and_repairs_canonical_loss_in_one_invocation(
         OperationalStateStore.open(root, clock=clock) as store,
         store.read_only_connection() as connection,
     ):
-        assert connection.execute(
-            "SELECT count(*) FROM raw_replay_operations WHERE status = 'SUCCESS'"
-        ).fetchone()[0] == 1
+        assert (
+            connection.execute(
+                "SELECT count(*) FROM raw_replay_operations WHERE status = 'SUCCESS'"
+            ).fetchone()[0]
+            == 1
+        )
         assert connection.execute("SELECT count(*) FROM request_attempts").fetchone()[0] == 1
 
 
@@ -1235,9 +1352,7 @@ def test_raw_post_rename_crash_adopts_exact_retry_with_current_provenance(
         assert result.status is IngestionRunStatus.SUCCESS
         assert len(transport.requests) == 1
         with store.read_only_connection() as connection:
-            raw = connection.execute(
-                "SELECT state FROM raw_artifacts"
-            ).fetchall()
+            raw = connection.execute("SELECT state FROM raw_artifacts").fetchall()
             provenance_count = connection.execute(
                 "SELECT count(*) FROM raw_replay_provenance"
             ).fetchone()[0]
@@ -1290,22 +1405,15 @@ def test_raw_post_rename_crash_catalogs_changed_response_orphan_without_fake_pro
         assert next(row[2] for row in raw if row[1] == "VERIFIED") == 1
         verification = Phase2OperationalDiagnostics(root, store).verify()
         raw_check = next(
-            check
-            for check in verification.checks
-            if check.code == "RAW_CATALOG_CONTENT"
+            check for check in verification.checks if check.code == "RAW_CATALOG_CONTENT"
         )
         orphan_check = next(
-            check
-            for check in verification.checks
-            if check.code == "PUBLISHED_ORPHANS"
+            check for check in verification.checks if check.code == "PUBLISHED_ORPHANS"
         )
         assert verification.healthy
         assert raw_check.status is DiagnosticStatus.PASS
         assert "UNCATALOGED_RAW_PUBLICATION" not in orphan_check.issue_codes
-        assert (
-            Phase2OperationalDiagnostics(root, store).status().stored_raw_artifact_count
-            == 2
-        )
+        assert Phase2OperationalDiagnostics(root, store).status().stored_raw_artifact_count == 2
 
         present_artifact_id = next(str(row[0]) for row in raw if row[1] == "PRESENT")
         with store._transaction() as connection:

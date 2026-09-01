@@ -65,8 +65,10 @@ hash from the saved file with an operating-system or trusted hashing tool and ve
 copy. Never invent an email, PDF, hash, timestamp, header, attachment, or personal datum. Do not
 move any of those files or the private manifest into Git.
 
-An empty locator does not block offline software tests, but it keeps the controlled live
-acceptance gate closed. Do not report the evidence as archived until the files are genuinely
+By default, an empty locator does not block offline software tests but keeps the controlled live
+acceptance gate closed. The explicitly approved AAPL-only M6 acceptance is the sole scoped
+exception: it may record `pending_manual_archive`, but does not authorize the 16-security rollout
+or any broader live use. Do not report the evidence as archived until the files are genuinely
 present and their hashes have been checked.
 
 ## 4. Manual control plane

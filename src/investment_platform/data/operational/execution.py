@@ -840,15 +840,18 @@ class IngestionExecutionRepository:
                     raise ProviderDispatchLimitExceededError(
                         "durable request provider-dispatch ceiling is exhausted"
                     )
-                dispatch_ordinal = int(
-                    connection.execute(
-                        """
+                dispatch_ordinal = (
+                    int(
+                        connection.execute(
+                            """
                         SELECT count(*) FROM ingestion_dispatch_claims
                         WHERE attempt_id = ?
                         """,
-                        (str(identity.attempt_id),),
-                    ).fetchone()[0]
-                ) + 1
+                            (str(identity.attempt_id),),
+                        ).fetchone()[0]
+                    )
+                    + 1
+                )
                 claim_id = _provider_dispatch_claim_id(
                     identity,
                     dispatch_ordinal=dispatch_ordinal,
@@ -1093,9 +1096,7 @@ class IngestionExecutionRepository:
                     ),
                 )
             if not will_retry and blocking_gaps:
-                specification = _parse_request_specification(
-                    str(row["specification_json"])
-                )
+                specification = _parse_request_specification(str(row["specification_json"]))
                 self._upsert_terminal_gaps(
                     connection,
                     identity=identity,
@@ -3454,13 +3455,9 @@ class IngestionExecutionRepository:
                     if (
                         request_provenance is None
                         or str(request_provenance["intent"]) != "BACKFILL"
-                        or min(segment.start for segment in stream_segments)
-                        != incoming_origin
+                        or min(segment.start for segment in stream_segments) != incoming_origin
                         or stream_id
-                        not in {
-                            watermark.stream_id
-                            for watermark in request.coverage.watermarks
-                        }
+                        not in {watermark.stream_id for watermark in request.coverage.watermarks}
                     ):
                         raise ExecutionIntegrityError(
                             "coverage origin rebase requires an earlier verified backfill"
@@ -3734,6 +3731,101 @@ class IngestionExecutionRepository:
                         "reused coverage fact has different immutable proof semantics"
                     )
 
+    @staticmethod
+    def _is_verified_internal_expected_gap(
+        connection: sqlite3.Connection,
+        request: PublicationCommitRequest,
+        gap: GapFinding,
+    ) -> bool:
+        """Validate a newly discovered eligible hole between durable segments.
+
+        The deterministic coverage builder may discover a slot outside the
+        current bounded request only when this publication forms one side of a
+        retained, verified coverage hull.  Keep this exception narrower than
+        the general request-bound rule: exact calendar slots, no existing
+        support, and verified coverage on both sides are all required.
+        """
+
+        outcome = next(
+            (
+                candidate
+                for candidate in request.manifest.streams
+                if candidate.stream_id == gap.stream_id
+            ),
+            None,
+        )
+        if (
+            outcome is None
+            or outcome.outcome is not StreamPublicationOutcome.PUBLISHABLE
+            or gap.gap_type is not GapType.EXPECTED_OBSERVATION
+            or gap.status is not GapStatus.OPEN
+            or not gap.blocking
+            or not (gap.end <= outcome.request_start or gap.start >= outcome.request_end)
+        ):
+            return False
+
+        intersecting_slots = tuple(
+            slot
+            for slot in request.manifest.calendar_snapshot.expected_slots(outcome.stream.timeframe)
+            if slot.start_utc < gap.end and slot.end_utc > gap.start
+        )
+        if (
+            not intersecting_slots
+            or intersecting_slots[0].start_utc != gap.start
+            or intersecting_slots[-1].end_utc != gap.end
+            or any(
+                slot.start_utc < gap.start or slot.end_utc > gap.end for slot in intersecting_slots
+            )
+        ):
+            return False
+
+        rows = connection.execute(
+            """
+            SELECT coverage.interval_start, coverage.interval_end,
+                   coverage.canonical_batch_id
+            FROM coverage_segments AS coverage
+            JOIN coverage_request_proofs AS proof USING (coverage_id)
+            JOIN canonical_batches AS batch USING (canonical_batch_id)
+            WHERE coverage.stream_id = ?
+              AND coverage.calendar_snapshot_id = ?
+              AND coverage.policy_snapshot_id = ?
+              AND coverage.classification = 'OBSERVED'
+              AND coverage.verification_state = 'VERIFIED'
+              AND coverage.retained = 1
+              AND coverage.invalidated_at IS NULL
+              AND coverage.request_completed = 1
+              AND coverage.pagination_verified = 1
+              AND proof.terminal_page_verified = 1
+              AND proof.canonical_batch_verified = 1
+              AND proof.relational_provenance_verified = 1
+              AND batch.state = 'VERIFIED'
+            """,
+            (
+                gap.stream_id,
+                request.coverage.calendar_snapshot_id,
+                request.coverage.policy_snapshot_id,
+            ),
+        ).fetchall()
+        bounds = tuple(
+            (
+                _parse_utc(str(row["interval_start"])),
+                _parse_utc(str(row["interval_end"])),
+                str(row["canonical_batch_id"]),
+            )
+            for row in rows
+        )
+        if (
+            not any(end <= gap.start for _, end, _ in bounds)
+            or not any(start >= gap.end for start, _, _ in bounds)
+            or not any(batch_id == request.manifest.canonical_batch_id for _, _, batch_id in bounds)
+        ):
+            return False
+        return not any(
+            start <= slot.start_utc and end >= slot.end_utc
+            for slot in intersecting_slots
+            for start, end, _ in bounds
+        )
+
     def _persist_gaps(
         self,
         connection: sqlite3.Connection,
@@ -3754,7 +3846,12 @@ class IngestionExecutionRepository:
             if existing is None:
                 if gap.request_instance_id not in {None, current_request_id}:
                     raise ExecutionIntegrityError("new gap points at a different request instance")
-                if gap.start < outcome.request_start or gap.end > outcome.request_end:
+                outside_request = gap.start < outcome.request_start or gap.end > outcome.request_end
+                if outside_request and not self._is_verified_internal_expected_gap(
+                    connection,
+                    request,
+                    gap,
+                ):
                     raise ExecutionIntegrityError(
                         "new gap exceeds the current bounded stream request"
                     )
@@ -4001,6 +4098,10 @@ class IngestionExecutionRepository:
                 raise ExecutionIntegrityError(
                     "watermark predates the changing batch coverage proof"
                 )
+            existing = connection.execute(
+                "SELECT * FROM watermarks WHERE stream_id = ?",
+                (watermark.stream_id,),
+            ).fetchone()
             origins = connection.execute(
                 """
                 SELECT DISTINCT coverage_start FROM coverage_segments
@@ -4012,17 +4113,38 @@ class IngestionExecutionRepository:
                 raise ExecutionIntegrityError(
                     "watermark rebases or lacks the authoritative coverage origin"
                 )
+            current_run_id = str(
+                connection.execute(
+                    """
+                    SELECT run_id FROM request_instances WHERE request_instance_id = ?
+                    """,
+                    (str(request.request_instance_id),),
+                ).fetchone()[0]
+            )
+            extends_existing_frontier_with_retained_evidence = (
+                existing is not None
+                and str(existing["verification_state"]) == "VERIFIED"
+                and existing["invalidated_at"] is None
+                and _parse_utc(str(existing["coverage_start"])) == watermark.coverage_start
+                and _parse_utc(str(existing["exclusive_frontier"])) <= watermark.exclusive_frontier
+                and str(existing["calendar_snapshot_id"]) == watermark.calendar_snapshot_id
+                and str(existing["policy_snapshot_id"]) == watermark.policy_snapshot_id
+                and str(existing["last_batch_id"]) == watermark.last_batch_id
+                and str(existing["last_verified_session"])
+                == watermark.last_verified_session.isoformat()
+                and int(existing["blocking_gap_count"]) != watermark.blocking_gap_count
+            )
+            current_publication_provenance = (
+                watermark.last_run_id == current_run_id
+                and watermark.last_batch_id == request.manifest.canonical_batch_id
+            )
+            retained_frontier_provenance = (
+                extends_existing_frontier_with_retained_evidence
+                and existing is not None
+                and watermark.last_run_id == str(existing["last_run_id"])
+            )
             if (
-                watermark.last_run_id
-                != str(
-                    connection.execute(
-                        """
-                        SELECT run_id FROM request_instances WHERE request_instance_id = ?
-                        """,
-                        (str(request.request_instance_id),),
-                    ).fetchone()[0]
-                )
-                or watermark.last_batch_id != request.manifest.canonical_batch_id
+                not (current_publication_provenance or retained_frontier_provenance)
                 or watermark.policy_snapshot_id != policy_snapshot_id
                 or watermark.calendar_snapshot_id != request.coverage.calendar_snapshot_id
             ):
@@ -4055,7 +4177,7 @@ class IngestionExecutionRepository:
                 """,
                 (
                     watermark.stream_id,
-                    request.manifest.canonical_batch_id,
+                    watermark.last_batch_id,
                     _format_utc(watermark.exclusive_frontier),
                     _format_utc(watermark.coverage_start),
                 ),
@@ -4094,10 +4216,6 @@ class IngestionExecutionRepository:
                 "computed_at",
                 "invalidated_at",
             )
-            existing = connection.execute(
-                "SELECT * FROM watermarks WHERE stream_id = ?",
-                (watermark.stream_id,),
-            ).fetchone()
             if existing is None:
                 if watermark.generation != 1:
                     raise ExecutionStateConflictError("first watermark generation must be one")

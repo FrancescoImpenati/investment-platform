@@ -1,7 +1,7 @@
 # Phase 2 acceptance record
 
 - **Offline implementation:** IMPLEMENTED
-- **Controlled live acceptance:** PENDING
+- **Controlled AAPL live acceptance (M6):** COMPLETE
 - **Phase 2 completion / approval:** PENDING
 - **Phase 3:** NOT STARTED
 - **Last review:** 2026-09-01
@@ -52,27 +52,40 @@ coverage grows.
 a successfully completed bounded request, complete verified pagination, correct interval, no
 incomplete rate-limit/error state, and sufficiently demonstrated provider omission semantics.
 
-## Live acceptance still pending
+## Controlled AAPL live acceptance (M6)
 
-No real Alpaca payload was persisted for this offline record. The following required results are
-therefore deliberately not claimed:
+The controlled live run used only Alpaca historical SIP US stock bars for AAPL, RTH, unadjusted,
+under `private_research`. All requested sessions were closed, beyond the strict historical-age gate
+and finalization buffer. Provider payloads and canonical observations remain exclusively under the
+validated external private root.
 
-- AAPL 1d and 5m durable backfill under the validated private root;
-- post-process restart with unchanged SQLite coverage/watermark and readable Parquet;
-- live incremental extension followed by a provider-call-free identical update;
-- live bounded gap repair with provenance preservation;
-- progression to the frozen Phase 1 sample of 16 securities;
-- activation of an external scheduler;
-- final Phase 2 pull request and CI review.
+| Check | Sanitized result |
+| --- | --- |
+| Initial backfill | 1d session on 2026-08-24; complete 5m session on 2026-08-24 |
+| Incremental extension | 1d coverage extended to 2026-08-25 without reacquiring prior coverage |
+| Identical update | Meaningful no-op; zero provider calls and zero new raw/Parquet artifacts |
+| Controlled discontinuity | Disjoint 1d targets exposed the missing 2026-08-26 session as one blocking gap |
+| Repair | One bounded `MISSING_ONLY` request for 2026-08-26; gap resolved with provenance retained |
+| Final 1d state | Five sessions, coverage `[2026-08-24T13:30Z, 2026-08-28T20:00Z)`, VERIFIED watermark at the exclusive end |
+| Final 5m state | One complete session, 78 current rows, coverage and VERIFIED watermark ending 2026-08-24T20:00Z |
+| Durable artifacts | Six raw artifacts, six canonical batches and six Parquet parts |
+| Current analytical view | 83 rows total: five 1d and 78 5m |
+| Provider budget used | Six provider dispatches, below the approved ceiling of 20 |
+| Restart | New process validated the sentinel, reopened SQLite and read all current Parquet rows through DuckDB without a provider call |
+| Final status/verify | SQLite schema 11 healthy; zero open gaps, zero quarantine findings, zero unexpected orphans; every verification check passed |
 
-The live gate requires an explicit `private_research` process, a safe initialized external root,
-the actual ticket evidence in its private locator, and Alpaca credentials present without printing
-their values. Until that gate and the controlled sequence pass, Phase 2 is incomplete and no Phase
-3 work is authorized.
+The live sequence found and fixed two real boundary defects. Disjoint verified batches now
+materialize a calendar-eligible internal gap without moving the watermark across it, including
+restart-safe handling of exchange-closed `NOT_APPLICABLE` intervals. Verification also accepts the
+approved last-changing-batch provenance when a repair batch fills an internal gap and unlocks
+already-persisted later coverage.
 
-## Offline-to-live handoff
+The private Alpaca evidence locator exists, but its archive status remains
+`pending_manual_archive`; no email or support evidence was fabricated. This did not block the
+explicitly approved small M6 acceptance.
 
-Use the [living-ingestion operator guide](living-ingestion.md) to initialize the root and place the
-real private evidence. Then execute the approved AAPL progression with small bounded request
-budgets, running `status` and `verify` at each step. Record only aggregate, non-substitutive results
-in this public document; licensed artifacts and complete evidence remain private.
+## Remaining Phase 2 work
+
+M6 does not complete Phase 2. The controlled Phase 1 sample rollout, final hardening/quality gate,
+documentation review, pull request and CI review remain pending in M7. No 16-security rollout,
+pull request, merge, scheduler activation or Phase 3 work was performed here.

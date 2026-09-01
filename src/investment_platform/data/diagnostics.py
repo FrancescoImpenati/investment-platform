@@ -1217,7 +1217,10 @@ class Phase2OperationalDiagnostics:
                 issues.append("WATERMARK_FRONTIER_MISMATCH")
             if str(watermark["last_verified_session"]) != covered[-1][2].isoformat():
                 issues.append("LAST_VERIFIED_SESSION_MISMATCH")
-            if str(watermark["last_batch_id"]) not in covered[-1][3]:
+            supporting_batch_ids = {
+                batch_id for _, _, _, supports in covered for batch_id in supports
+            }
+            if str(watermark["last_batch_id"]) not in supporting_batch_ids:
                 issues.append("LAST_BATCH_DOES_NOT_SUPPORT_FRONTIER")
         if any(
             gap_start < frontier and gap_end > authoritative_start

@@ -26,6 +26,7 @@ from investment_platform.data.ingestion.coverage import (
     GapStatus,
     GapType,
     MaterializedWatermark,
+    MissingSlotReason,
     WatermarkChangeContext,
     materialize_watermark,
     reconstruct_frontier,
@@ -643,15 +644,105 @@ def build_publication_coverage_commit(
         raise CoverageCommitBuildError(
             "a filesystem publication must contribute at least one observed coverage segment"
         )
-    terminal_state = _terminal_state(manifest, changed_gaps)
-    ordered_segments = tuple(
+    provisional_segments = tuple(
         sorted(
-            (
-                segment.model_copy(update={"request_terminal_state": terminal_state})
-                for segment in segments
-            ),
+            segments,
             key=lambda value: value.coverage_id,
         )
+    )
+    all_segments = tuple(existing_segments) + tuple(
+        segment for segment in provisional_segments if segment.coverage_id not in existing_by_id
+    )
+    all_gaps = _replace_gaps(existing_gaps, changed_gaps)
+
+    # A bounded publication can extend the verified coverage hull beyond an
+    # earlier contiguous frontier.  Reconstructing over the complete durable
+    # hull is what reveals an eligible slot between two retained segments; the
+    # current request's own eligible-slot list cannot contain that inter-batch
+    # hole.  Only materialize NO_VALID_COVERAGE slots with verified support on
+    # both sides, so an initial/later target boundary never becomes a gap merely
+    # because it is outside this request.
+    for outcome in manifest.streams:
+        if outcome.outcome is not StreamPublicationOutcome.PUBLISHABLE:
+            continue
+        stream = outcome.stream
+        stream_segments = tuple(
+            segment for segment in all_segments if segment.stream_id == stream.stream_id
+        )
+        stream_gaps = tuple(gap for gap in all_gaps if gap.stream_id == stream.stream_id)
+        evaluation = reconstruct_frontier(
+            stream=stream,
+            calendar_snapshot=manifest.calendar_snapshot,
+            calendar_snapshot_id=calendar_snapshot_id,
+            policy=policy,
+            policy_snapshot_id=policy_snapshot_id,
+            runtime_status=runtime_status,
+            coverage_start=origin,
+            domain_end=domain_end,
+            coverage=stream_segments,
+            gaps=stream_gaps,
+            evaluated_at=now,
+        )
+        uncovered_without_finding = {
+            (uncovered.slot.start_utc, uncovered.slot.end_utc)
+            for uncovered in evaluation.uncovered_slots
+            if uncovered.reason is MissingSlotReason.NO_VALID_COVERAGE
+        }
+        domain_slots = tuple(
+            slot
+            for slot in manifest.calendar_snapshot.expected_slots(stream.timeframe)
+            if slot.start_utc >= origin and slot.end_utc <= domain_end
+        )
+        supported = tuple(
+            any(
+                _existing_segment_supports_slot(
+                    segment,
+                    stream_id=stream.stream_id,
+                    start=slot.start_utc,
+                    end=slot.end_utc,
+                    calendar_snapshot_id=calendar_snapshot_id,
+                    calendar_snapshot_checksum=manifest.calendar_snapshot.checksum,
+                    policy_snapshot_id=policy_snapshot_id,
+                )
+                for segment in stream_segments
+            )
+            for slot in domain_slots
+        )
+        internal_missing = [
+            index
+            for index, slot in enumerate(domain_slots)
+            if (slot.start_utc, slot.end_utc) in uncovered_without_finding
+            and any(supported[:index])
+            and any(supported[index + 1 :])
+        ]
+        for first, last in _contiguous_runs(internal_missing):
+            start = domain_slots[first].start_utc
+            end = domain_slots[last].end_utc
+            identifier = _gap_id(
+                stream_id=stream.stream_id,
+                start=start,
+                end=end,
+                gap_type=GapType.EXPECTED_OBSERVATION,
+                episode_id=str(request_instance_id),
+            )
+            changed_gaps.append(
+                GapFinding(
+                    gap_id=identifier,
+                    stream_id=stream.stream_id,
+                    start=start,
+                    end=end,
+                    gap_type=GapType.EXPECTED_OBSERVATION,
+                    status=GapStatus.OPEN,
+                    blocking=True,
+                    detected_at=now,
+                    request_instance_id=str(request_instance_id),
+                )
+            )
+
+    terminal_state = _terminal_state(manifest, changed_gaps)
+    ordered_segments = tuple(
+        segment.model_copy(update={"request_terminal_state": terminal_state})
+        for segment in provisional_segments
     )
     all_segments = tuple(existing_segments) + tuple(
         segment for segment in ordered_segments if segment.coverage_id not in existing_by_id
@@ -681,16 +772,39 @@ def build_publication_coverage_commit(
             evaluated_at=now,
         )
         watermark_candidate = evaluation.candidate
-        if (
-            watermark_candidate is None
-            or manifest.canonical_batch_id not in watermark_candidate.supporting_batch_ids
-        ):
+        if watermark_candidate is None:
             continue
         existing = existing_watermark_by_stream.get(stream.stream_id)
+        current_batch_supports_frontier = (
+            manifest.canonical_batch_id in watermark_candidate.supporting_batch_ids
+        )
+        retains_existing_frontier = (
+            existing is not None
+            and existing.verification_state is CoverageVerificationState.VERIFIED
+            and existing.invalidated_at is None
+            and existing.coverage_start == watermark_candidate.coverage_start
+            and existing.exclusive_frontier <= watermark_candidate.exclusive_frontier
+            and existing.calendar_snapshot_id == calendar_snapshot_id
+            and existing.policy_snapshot_id == policy_snapshot_id
+            and existing.last_verified_session == watermark_candidate.last_verified_session
+            and existing.last_batch_id in watermark_candidate.supporting_batch_ids
+        )
+        if not current_batch_supports_frontier and not retains_existing_frontier:
+            continue
+        committed_candidate = watermark_candidate
+        context_run_id = str(run_id)
+        context_batch_id = manifest.canonical_batch_id
+        if not current_batch_supports_frontier:
+            if existing is None:  # pragma: no cover - narrowed by the proof above
+                raise CoverageCommitBuildError(
+                    "watermark evidence refresh lacks its durable predecessor"
+                )
+            context_run_id = existing.last_run_id
+            context_batch_id = existing.last_batch_id
         if (
             existing is not None
             and existing.verification_state is CoverageVerificationState.VERIFIED
-            and watermark_candidate.exclusive_frontier < existing.exclusive_frontier
+            and committed_candidate.exclusive_frontier < existing.exclusive_frontier
         ):
             # A newly discovered blocking gap is an invalidation event, not a
             # verified watermark that moves backward.  The operational commit
@@ -699,19 +813,21 @@ def build_publication_coverage_commit(
         if (
             existing is not None
             and existing.verification_state is CoverageVerificationState.VERIFIED
-            and existing.exclusive_frontier == watermark_candidate.exclusive_frontier
-            and existing.coverage_start == watermark_candidate.coverage_start
+            and existing.exclusive_frontier == committed_candidate.exclusive_frontier
+            and existing.coverage_start == committed_candidate.coverage_start
             and existing.calendar_snapshot_id == calendar_snapshot_id
             and existing.policy_snapshot_id == policy_snapshot_id
+            and existing.last_verified_session == committed_candidate.last_verified_session
+            and existing.blocking_gap_count == committed_candidate.blocking_gap_count
         ):
             continue
         watermarks.append(
             materialize_watermark(
-                watermark_candidate,
+                committed_candidate,
                 WatermarkChangeContext(
                     generation=1 if existing is None else existing.generation + 1,
-                    last_run_id=str(run_id),
-                    last_batch_id=manifest.canonical_batch_id,
+                    last_run_id=context_run_id,
+                    last_batch_id=context_batch_id,
                     computed_at=now,
                 ),
             )
