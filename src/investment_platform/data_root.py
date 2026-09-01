@@ -149,7 +149,10 @@ def _reject_windows_remote_drive(path: Path) -> None:
         return
     import ctypes
 
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    win_dll = getattr(ctypes, "WinDLL", None)
+    if win_dll is None:
+        raise UnsafePrivateDataRootError("Windows drive inspection is unavailable")
+    kernel32 = win_dll("kernel32", use_last_error=True)
     get_drive_type = kernel32.GetDriveTypeW
     get_drive_type.argtypes = [ctypes.c_wchar_p]
     get_drive_type.restype = ctypes.c_uint
