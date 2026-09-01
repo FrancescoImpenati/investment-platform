@@ -1,6 +1,6 @@
 # Living ingestion operator guide
 
-- **Status:** Offline control plane implemented; live operation and scheduling not activated
+- **Status:** Control plane and bounded M6/M7 live acceptance exercised; scheduling not activated
 - **Last review:** 2026-09-01
 
 This guide operates the approved Phase 2 control plane. It does not authorize a dataset, replace
@@ -66,10 +66,10 @@ copy. Never invent an email, PDF, hash, timestamp, header, attachment, or person
 move any of those files or the private manifest into Git.
 
 By default, an empty locator does not block offline software tests but keeps the controlled live
-acceptance gate closed. The explicitly approved AAPL-only M6 acceptance is the sole scoped
-exception: it may record `pending_manual_archive`, but does not authorize the 16-security rollout
-or any broader live use. Do not report the evidence as archived until the files are genuinely
-present and their hashes have been checked.
+acceptance gate closed. M6 AAPL and the M7 mini rollout capped at AAPL, MSFT, ORLY, and NEE were
+explicit scoped exceptions: they may retain `pending_manual_archive`, but do not authorize a
+larger rollout, scheduler activation, or any broader live use. Do not report the evidence as
+archived until the files are genuinely present and their hashes have been checked.
 
 ## 4. Manual control plane
 
@@ -141,8 +141,9 @@ advance a watermark manually.
 
 ## 6. External scheduler templates — not activated
 
-These are handoff templates only. Do not register or enable a schedule until manual AAPL and
-bounded-sample live acceptance are complete.
+These are handoff templates only. M6/M7 acceptance does not activate a schedule. Do not register or
+enable one without a separate explicit decision after Linux CI and resolution or
+acceptance of the remaining intermittent transport issue on the tested host route.
 
 ### Windows Task Scheduler
 
@@ -183,7 +184,10 @@ The first authorized live scope is only Alpaca historical SIP US stock bars at 1
 strictly older than 15 minutes plus the policy's finalization buffer. Options, crypto, real-time,
 news, and all unlisted Alpaca datasets fail closed.
 
-Before any live request, verify without printing values that the two Alpaca variables exist, the
-explicit profile is `private_research`, the root is initialized and external, and the actual
-ticket evidence is present in its private locator. If any item is absent, stop before provider
-construction. The current offline checkpoint deliberately stops at this gate.
+Before any future live request, verify without printing values that the two Alpaca variables exist,
+the explicit profile is `private_research`, the root is initialized and external, and the actual
+ticket evidence is present in its private locator. If the evidence is still absent, stop unless a
+new explicit, narrowly scoped exception has been approved; the M6/M7 exception does not carry
+forward. Never copy raw `status` output into a public record without redacting its absolute private
+root path. The current checkpoint authorizes no scheduler or rollout beyond the four M7
+instruments.

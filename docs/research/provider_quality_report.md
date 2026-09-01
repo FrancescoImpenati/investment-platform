@@ -14,7 +14,8 @@
 > [the redacted Alpaca rights record](../governance/data-rights/alpaca-historical-sip.md).
 > Historical statements below that call Alpaca retention ambiguous remain accurate as of the
 > 2026-08-24 bake-off and are intentionally not rewritten. The new evidence is an input to the
-> designed, not-yet-implemented Phase 2 retention policy.
+> now-implemented Phase 2 retention policy. Phase 2 implementation and acceptance status is owned
+> by its plan and sanitized acceptance record, not by this historical Phase 1 report.
 
 ## Scope and methodology
 

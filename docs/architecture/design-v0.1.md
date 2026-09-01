@@ -5,7 +5,8 @@
 **Scope:** long-term architecture and Phase 0 foundation boundaries
 
 > **Document lineage:** This document remains the Phase 0 architecture baseline. Phase 0 and
-> Phase 1 are implemented and approved. Phase 2 is designed, but not implemented, in
+> Phase 1 are implemented and approved. Phase 2 is implemented through bounded M6/M7 acceptance;
+> its final quality, PR, CI, and approval status is recorded in
 > [Phase 2 — Living Data Ingestion](phase-2-living-ingestion.md). Where its accepted ADRs refine a
 > future hypothesis in this document, the newer ADR governs Phase 2.
 
@@ -299,6 +300,6 @@ retry/rate limiting, complete trading calendar, production provider, normalizati
 feature executor, Market State, checkpoint engine, dashboard, agents, strategies, backtesting, or
 execution.
 
-The provider bake-off and the separate Databento research are now complete. The next implementation
-contract is Phase 2 living ingestion; this lineage update does not renumber the roadmap or imply
-that Phase 2 code exists.
+The provider bake-off and the separate Databento research are complete. The subsequent Phase 2
+living-ingestion contract is implemented through its bounded M6/M7 checkpoint. This lineage update
+does not renumber the roadmap or authorize Phase 3.

@@ -1,6 +1,6 @@
 # Phase 2 — Living Data Ingestion
 
-- **Status:** Design approved; offline implementation checkpoint present; live acceptance pending
+- **Status:** Implemented through bounded M6/M7 acceptance; local quality/audit green; PR/CI pending
 - **Date:** 2026-09-01
 - **Baseline:** main at 76e3ffd, including approved Phase 0, Phase 1, and Databento research
 - **Implementation contract:** [PLAN_PHASE_2.md](../../PLAN_PHASE_2.md)
@@ -113,7 +113,7 @@ spool large pages directly to the private root.
 At that baseline the Parquet store published the files of a multi-part batch individually and
 discovered files by glob. An abrupt process crash could therefore leave a partial batch visible.
 
-### 3.4 Implemented in the current offline checkpoint
+### 3.4 Implemented in the current checkpoint
 
 The Phase 2 source and synthetic test suite now implement:
 
@@ -135,9 +135,14 @@ The Phase 2 source and synthetic test suite now implement:
 - offline synthetic integration and fault-injection tests covering restart, incremental no-op,
   gap repair, raw replay, orphan adoption, pacing, publication failures, and integrity loss.
 
-No real Alpaca payload has been persisted by this checkpoint. The private root/evidence gate,
-controlled AAPL and 16-security acceptance, external scheduler activation, final Phase 2 pull
-request, and Phase 2 approval remain pending. Phase 3 has not started.
+Private Alpaca payloads have now been persisted only below the validated external root. M6
+completed controlled AAPL backfill, restart, update, no-op, repair, status, and verification. M7
+then exercised at most AAPL, MSFT, ORLY, and NEE: successful streams advanced independently while
+the transport-failed ORLY daily stream created no raw or canonical artifact, coverage, or watermark
+and was never classified `VERIFIED_EMPTY`. The correspondence archive remains
+`pending_manual_archive`; the local quality gate is green, while the pull request, Linux CI, and
+Phase 2 approval remain pending.
+No scheduler is activated, and Phase 3 has not started.
 
 ## 4. Architectural invariants
 
@@ -1065,7 +1070,7 @@ required to make the store living.
 
 ## 19. Manual CLI and external scheduling
 
-The offline checkpoint implements a small standard-library command-line entry point with these
+The current checkpoint implements a small standard-library command-line entry point with these
 command families:
 
 ~~~text
@@ -1073,6 +1078,7 @@ investment-platform data-root init
 investment-platform backfill
 investment-platform update
 investment-platform repair
+investment-platform resume
 investment-platform status
 investment-platform verify
 investment-platform retention enforce
@@ -1084,9 +1090,9 @@ sanitized counts, intervals, gaps, state, and IDs without market-data values or 
 
 update accepts all configuration from the explicit profile, process environment, policy catalog,
 and non-secret arguments. Scheduler command templates are documented in the
-[operator guide](../operations/living-ingestion.md), but no schedule is activated. Only after
-manual live acceptance may the same command be invoked by Windows Task Scheduler, cron, or another
-external scheduler.
+[operator guide](../operations/living-ingestion.md), but no schedule is activated. Activation
+requires a separate explicit decision after Linux CI and resolution or acceptance
+of the remaining intermittent transport issue on the tested host route.
 
 Phase 2 does not introduce Celery, Redis, Kafka, a daemon, a queue, a cloud orchestrator, or an
 internal scheduler.
@@ -1106,18 +1112,20 @@ The provider architecture remains dataset-specific, not one global winner:
 The controlled live progression is:
 
 1. synthetic offline tests;
-2. one security and a small historical window;
-3. the frozen Phase 1 sample of 16 securities;
-4. a deliberately bounded larger subset;
-5. full current S&P 500 only after all prior acceptance gates.
+2. one security and a small historical window: AAPL in M6;
+3. an M7 mini rollout capped at AAPL, MSFT, ORLY, and NEE;
+4. a deliberately bounded larger subset only after a separate decision;
+5. full current S&P 500 only after separately approved prior acceptance gates.
 
-No real download occurred in the offline checkpoint. Controlled live acceptance must estimate and
-confirm each request before expanding scope.
+The historical Phase 1 bake-off used 16 securities, but that sample was not replayed as persistent
+Phase 2 acceptance. Every M6/M7 live request was bounded and budgeted before dispatch; no expansion
+beyond the four named instruments is authorized by this checkpoint.
 
 ## 21. Acceptance design
 
-The [sanitized acceptance record](../operations/phase-2-acceptance.md) distinguishes the implemented
-offline checkpoint from the still-pending controlled live progression.
+The [sanitized acceptance record](../operations/phase-2-acceptance.md) distinguishes the offline
+implementation, completed AAPL M6 acceptance, and bounded M7 rollout from the still-pending final
+quality, pull-request, and CI gates.
 
 ### 21.1 Environment isolation
 
@@ -1184,8 +1192,9 @@ Fault injection proves:
 ## 22. Implementation milestones and current status
 
 Milestones are internal ordering within Phase 2, not new official phases. Items 1–10 are
-implemented and exercised offline with synthetic data; item 11 is pending, and item 12 is
-documented but deliberately not activated:
+implemented and exercised offline with synthetic data and, where applicable, bounded live data.
+Item 11 has been exercised through the approved four-instrument cap with one cleanly contained
+transport failure; item 12 is documented but deliberately not activated:
 
 1. environment capability matrix and configuration hierarchy;
 2. external root initialization, sentinel, path guards, and safe staging;
@@ -1194,25 +1203,25 @@ documented but deliberately not activated:
 5. maintained trading-calendar adapter and versioned snapshots;
 6. stream/request/artifact/batch/observation identities and bounded planner;
 7. atomic canonical batch publication, catalog-driven queries, recovery, and fault injection;
-8. manual synthetic and one-security backfill;
+8. manual synthetic and controlled one-security live backfill;
 9. incremental update, no-op, status, and verify;
 10. repair/revision handling and retention invalidation/purge;
-11. **Pending:** progressive 1 -> 16 -> larger-subset live acceptance;
+11. **Exercised:** AAPL M6 followed by the capped AAPL/MSFT/ORLY/NEE M7 rollout;
 12. **Documentation only:** external scheduler invocation after manual reliability.
 
 PLAN_PHASE_2.md owns the detailed deliverables and gates.
 
 ## 23. Open questions
 
-There are no unresolved architectural questions that block starting the narrow Alpaca SIP
-implementation.
+There are no unresolved architectural questions in the narrow Alpaca SIP implementation.
 
-The following are pre-live gates, not design blockers:
+The following are operational limits or follow-ups, not reasons to expand the architecture:
 
-- choose and initialize the actual external private-root path;
-- place the complete ticket evidence at the documented private location;
-- calibrate Alpaca request partition size and conservative finalization buffer with the
-  one-security acceptance;
+- replace `pending_manual_archive` only after the actual ticket files and private checksum manifest
+  genuinely exist;
+- resolve or explicitly accept the intermittent transport behavior on the tested host route that
+  left ORLY daily failed after bounded attempts;
+- do not infer empty-data semantics from that transport failure or its four open gap records;
 - activate no Twelve Data durable stream until its exact dataset policy and subscription status
   are recorded.
 
@@ -1237,13 +1246,13 @@ data. It does not authorize a backtesting engine in Phase 2.
 
 ## 25. Readiness verdict
 
-**OFFLINE IMPLEMENTATION READY FOR CONTROLLED LIVE ACCEPTANCE**
+**PHASE 2 IMPLEMENTATION READY FOR FINAL QUALITY AND PR REVIEW**
 
-The approved design has been implemented through its synthetic/offline gates without expanding
-into later analytical or product phases. The dependency gate and offline safety contracts are
-resolved. Phase 2 is not complete: a safe initialized external root with the actual private
-evidence, controlled Alpaca SIP acceptance, final quality review, pull request, and CI confirmation
-are still required. This is not authorization to start Phase 3.
+The approved design, offline safety contracts, AAPL acceptance, and bounded four-instrument rollout
+have been exercised without expanding into later analytical or product phases. The ORLY daily
+transport failure remained isolated and did not create false durable truth. Phase 2 is not yet
+approved: the evidence archive remains pending and the pull request plus Linux CI confirmation are
+still required. This is not authorization to start Phase 3.
 
 ## 26. Learning notes
 

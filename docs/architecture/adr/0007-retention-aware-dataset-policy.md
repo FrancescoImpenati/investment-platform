@@ -3,7 +3,7 @@
 - **Status:** Accepted
 - **Date:** 2026-08-31
 - **Phase:** 2 — Living Data Ingestion
-- **Implementation status:** Planned for Phase 2
+- **Implementation status:** Implemented in Phase 2
 
 ## Context
 

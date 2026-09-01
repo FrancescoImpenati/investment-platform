@@ -18,6 +18,8 @@ terms.
 | Primary dataset classification | `DURABLE_AUTHORIZED` |
 | Evidence reference | `alpaca-support-ticket-342496` |
 | Last verified | `2026-08-29` |
+| Private archive state | `pending_manual_archive` |
+| Archive state checked | `2026-09-01` |
 
 The full evidence is deliberately excluded from Git. The Phase 2 root initializer creates this
 private locator under the configured external data root:
@@ -95,7 +97,9 @@ materially:
 - the provider, entitlement, subscription, dataset, or delivery mode changes; or
 - Alpaca's applicable agreements or market-data terms change.
 
-The private evidence locator is validated with the external root. At this offline checkpoint, the
-repository does not assert that the actual correspondence has been placed there or that controlled
-live acceptance has occurred. This file remains a redacted governance input, not the evidence
-itself and not proof of live provider behavior.
+The private evidence locator is validated with the external root. At the M7 review it contained no
+manually saved correspondence and no checksum manifest, only the non-evidentiary operational status
+marker. The archive therefore remains `pending_manual_archive`; no evidence was invented. M6 AAPL
+and the capped M7 mini rollout occurred under explicit scoped approval despite that pending archive.
+This file remains a redacted governance input, not the evidence itself and not proof of live
+provider behavior.

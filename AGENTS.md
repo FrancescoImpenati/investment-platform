@@ -6,11 +6,13 @@
   research.
 - Preserve the dependency direction: data -> deterministic analytics -> Market State -> optional
   AI interpretation -> strategy -> execution.
-- Phase 0 and Phase 1 are implemented and approved. The approved Phase 2 design now has an offline
-  implementation checkpoint: the control plane and synthetic acceptance behavior are implemented,
-  while controlled Alpaca persistence, final review, the pull request, and Phase 2 approval remain
-  pending. Never describe pending live acceptance, external scheduling, or Planned/Future behavior
-  as Implemented.
+- Phase 0 and Phase 1 are implemented and approved. The approved Phase 2 design is implemented
+  through its offline control plane, approved AAPL M6 acceptance, and capped AAPL/MSFT/ORLY/NEE M7
+  live exercise. The failed ORLY daily stream remained isolated without durable advancement or a
+  false `VERIFIED_EMPTY`; intermittent transport on the tested host route and the private evidence
+  archive remain open. The final local quality and security/data audit are green; the pull request,
+  Linux CI confirmation, and Phase 2 approval are pending. Never
+  describe external scheduling, Phase 3, or other Planned/Future behavior as Implemented.
 - Phase 2 implementation is limited to the contract in `PLAN_PHASE_2.md`, initially Alpaca
   historical SIP US stock bars at `1d` and `5m` after the dataset's strict historical-age gate. Do
   not add new provider adapters, internal schedulers, feature execution, dashboards, agents,

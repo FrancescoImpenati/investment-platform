@@ -5,8 +5,8 @@
 **Last review:** 2026-08-17
 
 > **Document lineage:** This file remains the historical implementation contract for Phase 0.
-> Phase 1 is implemented and approved. The designed, not-yet-implemented Phase 2 contract is
-> [PLAN_PHASE_2.md](PLAN_PHASE_2.md).
+> Phase 1 is implemented and approved. Phase 2 is implemented through bounded M6/M7 acceptance,
+> with final quality, PR, CI, and approval status owned by [PLAN_PHASE_2.md](PLAN_PHASE_2.md).
 
 ## 1. Outcome
 

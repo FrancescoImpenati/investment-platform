@@ -1,6 +1,6 @@
 # Phase 2 Implementation Plan — Living Data Ingestion
 
-- **Status:** Active implementation contract; offline checkpoint implemented; live acceptance pending
+- **Status:** Implementation, bounded M6/M7 acceptance, local quality/audit complete; PR/CI pending
 - **Date:** 2026-08-31
 - **Status updated:** 2026-09-01
 - **Design:** [Phase 2 — Living Data Ingestion](docs/architecture/phase-2-living-ingestion.md)
@@ -23,9 +23,10 @@ The first live implementation is Alpaca historical SIP US stock bars for 1d and 
 tests and CI remain synthetic, offline, credential-free, and isolated from private data.
 
 This plan is the Phase 2 implementation contract. PLAN.md remains the historical Phase 0 contract.
-The source and synthetic test suite now implement the offline control plane described below. This
-status does not mark the contract complete: controlled Alpaca acceptance, final review, the pull
-request, and CI confirmation remain required, and Phase 3 is not authorized.
+The source and synthetic test suite implement the control plane described below. Controlled AAPL
+acceptance and a maximum-four-instrument M7 rollout have exercised it with private Alpaca data.
+This status does not mark the contract approved: the pull request and Linux CI confirmation remain
+required, and Phase 3 is not authorized.
 
 ## 2. Frozen design decisions
 
@@ -469,9 +470,10 @@ policy-permitted quarantine.
 1. Synthetic fake provider.
 2. One Alpaca security with a small, approved historical interval.
 3. Restart and verify.
-4. Frozen Phase 1 sample of 16 only after one-security acceptance.
+4. Bounded M7 mini rollout using at most AAPL, MSFT, ORLY, and NEE after one-security acceptance.
 
-No automated full-universe expansion.
+The historical Phase 1 bake-off used a frozen sample of 16, but M7 deliberately did not replay that
+sample. No automated full-universe expansion is authorized.
 
 ## 13. Milestone 10 — Incremental update
 
@@ -549,7 +551,8 @@ No automated full-universe expansion.
 ### Live gates
 
 - Confirm private root and sentinel.
-- Confirm full Alpaca evidence is present under the private governance locator.
+- Confirm full Alpaca evidence is present under the private governance locator, or record the
+  explicit scoped M6/M7 exception and keep `pending_manual_archive` without inventing evidence.
 - Confirm policy hash and exact historical SIP dataset.
 - Confirm every requested bar is beyond the strict >15-minute policy boundary and finalization
   buffer.
@@ -559,11 +562,14 @@ No automated full-universe expansion.
 
 ### Progression
 
-1. One security.
-2. Frozen 16-security sample.
-3. Deliberately selected larger subset.
+1. One security: AAPL M6 acceptance.
+2. M7 mini rollout capped at AAPL, MSFT, ORLY, and NEE.
+3. Deliberately selected larger subset only after a separate acceptance decision.
 4. Full current S&P 500 only after a separate acceptance decision based on cost, storage,
    performance, gaps, and repair evidence.
+
+The implemented Phase 2 acceptance stops at item 2. The earlier 16-security Phase 1 experiment is
+historical provider-research evidence, not a required persistent M7 rollout.
 
 ### Scheduler handoff
 

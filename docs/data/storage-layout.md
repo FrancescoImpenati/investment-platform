@@ -1,6 +1,6 @@
 # Data storage layout
 
-- **Status:** Phase 0–1 primitives and Phase 2 offline private-runtime layout implemented; live acceptance pending
+- **Status:** Phase 0–2 private-runtime layout implemented; bounded M6/M7 live acceptance exercised
 - **Last review:** 2026-09-01
 
 This document owns the physical and logical storage contract. It distinguishes existing storage
@@ -14,17 +14,18 @@ behavior or permission to retain a dataset.
 | Provider-native raw evidence | Payload plus JSON manifest | Implemented primitive |
 | Canonical price bars | Parquet | Implemented primitive |
 | Analytical queries | In-memory DuckDB over Parquet | Implemented |
-| Durable ingestion workflow using those stores | Raw plus verified canonical batches | Implemented offline; live acceptance pending |
-| Operational state | SQLite | Implemented offline |
-| Retention catalog/enforcement | Exact provider-by-dataset policy | Implemented offline |
+| Durable ingestion workflow using those stores | Raw plus verified canonical batches | Implemented; bounded M6/M7 live exercise |
+| Operational state | SQLite | Implemented and restart-verified with bounded live state |
+| Retention catalog/enforcement | Exact provider-by-dataset policy | Implemented and exercised live for Alpaca SIP bars |
 | Curated/adjusted datasets | Parquet | Future |
 | Deterministic feature history | Parquet | Future |
 
 The original RawBatchStore and ParquetBarStore still support bounded foundation use. The Phase 1
 live runner used them only under an external temporary directory that was deleted. The Phase 2
 control plane now owns a validated external root, SQLite operational database, immutable canonical
-batch catalog, coverage, and derived watermarks; those components have only synthetic/offline
-acceptance so far.
+batch catalog, coverage, and derived watermarks. Those components have synthetic coverage plus M6
+AAPL and capped four-instrument M7 live exercise. Licensed bytes and operational state remain only
+under the private root.
 
 Parquet is authoritative for analytical observations. SQLite coordinates mutable ingestion state
 without copying OHLCV values. DuckDB queries cataloged, verified Parquet in-process.
