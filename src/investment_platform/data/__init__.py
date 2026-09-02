@@ -1,5 +1,14 @@
 """Canonical market-data, provenance, and time contracts."""
 
+from investment_platform.data.calendar import (
+    CalendarSession,
+    CalendarSessionChange,
+    CalendarSnapshot,
+    CalendarSnapshotDiff,
+    ExpectedCalendarSlot,
+    TradingCalendar,
+    XNYSCalendar,
+)
 from investment_platform.data.models import (
     AdjustmentState,
     BarQualityFlag,
@@ -25,9 +34,14 @@ __all__ = [
     "AdjustmentState",
     "BarQualityFlag",
     "BytesRawPayload",
+    "CalendarSession",
+    "CalendarSessionChange",
+    "CalendarSnapshot",
+    "CalendarSnapshotDiff",
     "CorporateAction",
     "DataSource",
     "DividendAction",
+    "ExpectedCalendarSlot",
     "FileRawPayload",
     "LicenseClassification",
     "PriceBar",
@@ -37,5 +51,7 @@ __all__ = [
     "SplitAction",
     "TickerChangeAction",
     "Timeframe",
+    "TradingCalendar",
     "TradingSession",
+    "XNYSCalendar",
 ]

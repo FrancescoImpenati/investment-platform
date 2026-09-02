@@ -1,8 +1,14 @@
 # Investment Intelligence Platform — Design Document v0.1
 
 **Status:** Phase 0 implemented and verified
-**Last review:** 2026-08-17
+**Last review:** 2026-08-31
 **Scope:** long-term architecture and Phase 0 foundation boundaries
+
+> **Document lineage:** This document remains the Phase 0 architecture baseline. Phase 0 and
+> Phase 1 are implemented and approved. Phase 2 is implemented through bounded M6/M7 acceptance;
+> its final quality, PR, CI, and approval status is recorded in
+> [Phase 2 — Living Data Ingestion](phase-2-living-ingestion.md). Where its accepted ADRs refine a
+> future hypothesis in this document, the newer ADR governs Phase 2.
 
 ## 1. Purpose
 
@@ -185,9 +191,10 @@ competing copy of canonical market data.
 
 ### 6.4 Future operational/application store
 
-Mutable, transactional state has different requirements. A later phase may introduce a relational
-store—likely PostgreSQL—for watermarks, jobs, retries, checkpoints, alerts, application
-configuration, portfolio state, orders, executions, or users.
+Mutable, transactional state has different requirements. This Phase 0 document anticipated a
+relational store, then considered PostgreSQL likely. Phase 2 now selects SQLite for its local,
+single-user ingestion state in [ADR 0008](adr/0008-sqlite-operational-state-store.md). PostgreSQL
+remains a future option only if deployment or concurrency requirements materially change.
 
 **Problem to avoid:** forcing analytical time series and mutable workflow/application state into a
 single storage technology merely to preserve a prototype decision.
@@ -293,5 +300,6 @@ retry/rate limiting, complete trading calendar, production provider, normalizati
 feature executor, Market State, checkpoint engine, dashboard, agents, strategies, backtesting, or
 execution.
 
-The next roadmap step remains the previously planned provider bake-off; this review does not create
-a new phase or renumber the roadmap.
+The provider bake-off and the separate Databento research are complete. The subsequent Phase 2
+living-ingestion contract is implemented through its bounded M6/M7 checkpoint. This lineage update
+does not renumber the roadmap or authorize Phase 3.

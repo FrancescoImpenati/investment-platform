@@ -11,11 +11,11 @@ from typing import cast
 from uuid import UUID, uuid4
 
 from investment_platform.data.provenance import (
-    BytesRawPayload,
     DataSource,
     JsonScalar,
     RawBatch,
     RawBatchMetadata,
+    RawPayload,
 )
 from investment_platform.data.providers.errors import (
     ProviderAccessDeniedError,
@@ -117,14 +117,44 @@ def parse_json_object(provider: str, dataset: str, content: bytes) -> dict[str, 
     return cast(dict[str, JsonValue], parsed)
 
 
+def parse_json_payload(
+    provider: str,
+    dataset: str,
+    payload: RawPayload,
+) -> dict[str, JsonValue]:
+    """Parse one reopenable JSON payload without first copying it into ``bytes``."""
+
+    try:
+        with payload.open_binary() as reader:
+            parsed = json.load(reader)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ProviderResponseError(provider, dataset, "response is not valid JSON") from error
+    if not isinstance(parsed, dict) or not all(isinstance(key, str) for key in parsed):
+        raise ProviderResponseError(provider, dataset, "response JSON must be an object")
+    return cast(dict[str, JsonValue], parsed)
+
+
+def parse_json_response(
+    provider: str,
+    dataset: str,
+    response: HttpResponse,
+) -> dict[str, JsonValue]:
+    return parse_json_payload(provider, dataset, response.raw_payload)
+
+
 def safe_provider_request_id(response: HttpResponse) -> str | None:
     for header_name in ("x-request-id", "request-id", "apca-request-id"):
         value = response.headers.get(header_name)
         if value is not None and _SAFE_REQUEST_ID.fullmatch(value):
             return value
+    # A request-id convenience field is not worth reparsing a potentially
+    # large file-backed market-data page.  Durable identity comes from the
+    # exact payload checksum, not this optional provider hint.
+    if response.is_file_backed:
+        return None
     try:
-        parsed = json.loads(response.body)
-    except (UnicodeDecodeError, json.JSONDecodeError):
+        parsed = parse_json_response("provider", "request", response)
+    except ProviderResponseError:
         return None
     if not isinstance(parsed, dict):
         return None
@@ -175,7 +205,7 @@ def raw_batch_from_response(
         provider_request_id=safe_provider_request_id(response),
         request_metadata=response_metadata,
     )
-    return RawBatch(metadata=metadata, payload=BytesRawPayload(response.body))
+    return RawBatch(metadata=metadata, payload=response.raw_payload)
 
 
 __all__ = [
@@ -184,6 +214,8 @@ __all__ = [
     "JsonValue",
     "new_batch_id",
     "parse_json_object",
+    "parse_json_payload",
+    "parse_json_response",
     "raw_batch_from_response",
     "require_success",
     "retry_after_seconds",

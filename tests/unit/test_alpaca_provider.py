@@ -150,6 +150,54 @@ def test_alpaca_sip_bars_are_paginated_without_feed_fallback() -> None:
     }
 
 
+@pytest.mark.parametrize(
+    ("start", "end", "wire_start", "wire_end"),
+    (
+        (
+            datetime(2025, 1, 2, 14, 30, tzinfo=UTC),
+            datetime(2025, 1, 2, 21, 0, tzinfo=UTC),
+            "2025-01-02T05:00:00.000000Z",
+            "2025-01-03T04:59:59.999999Z",
+        ),
+        (
+            datetime(2025, 3, 7, 14, 30, tzinfo=UTC),
+            datetime(2025, 3, 10, 20, 0, tzinfo=UTC),
+            "2025-03-07T05:00:00.000000Z",
+            "2025-03-11T03:59:59.999999Z",
+        ),
+    ),
+)
+def test_alpaca_daily_wire_bounds_cover_first_and_last_session_midnights_across_dst(
+    start: datetime,
+    end: datetime,
+    wire_start: str,
+    wire_end: str,
+) -> None:
+    transport = QueueHttpTransport([HttpResponse(200, _fixture("bars_daily_sip.json"))])
+    provider = _provider(transport)
+    request = BarRequest(
+        instruments=(
+            ProviderInstrumentRef(
+                instrument_id=_INSTRUMENT_ID,
+                provider_identifier="XPH1",
+            ),
+        ),
+        timeframe=Timeframe.ONE_DAY,
+        start=start,
+        end=end,
+        session=TradingSession.REGULAR,
+        adjustment_state=AdjustmentState.UNADJUSTED,
+    )
+
+    (batch,) = tuple(provider.get_bars(request))
+
+    query = dict(transport.requests[0].query)
+    assert query["start"] == wire_start
+    assert query["end"] == wire_end
+    assert batch.metadata.request_metadata["start"] == start.isoformat()
+    assert batch.metadata.request_metadata["end_exclusive"] == end.isoformat()
+
+
 def test_alpaca_iex_is_a_separately_labeled_source() -> None:
     transport = QueueHttpTransport([HttpResponse(200, _fixture("bars_5m_sip_page_2.json"))])
     provider = _provider(transport, feed=AlpacaFeed.IEX)

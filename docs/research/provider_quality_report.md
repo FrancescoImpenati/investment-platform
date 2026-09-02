@@ -1,12 +1,21 @@
 # Provider quality report — Phase 1 final empirical evidence
 
-> **Status: BARS-FIRST EMPIRICAL BAKE-OFF COMPLETE; FINAL REVIEW CANDIDATE**
+> **Status: PHASE 1 COMPLETE AND APPROVED**
 >
 > The full empirical comparison is **Alpaca historical SIP versus Twelve Data Basic**. Corporate
 > actions are an asymmetric capability assessment. Massive remains a technically evaluated but
 > licensing-blocked candidate; yfinance remains a sanity source only. No real market-data payload,
 > raw artifact, canonical observation, Parquet part, credential, or provider response is retained
 > in Git.
+
+> **Post-report governance update — 2026-08-29:** Written Alpaca support ticket 342496 resolves the
+> durable-retention gate only for historical SIP US stock bars older than 15 minutes in the private
+> use scope recorded in
+> [the redacted Alpaca rights record](../governance/data-rights/alpaca-historical-sip.md).
+> Historical statements below that call Alpaca retention ambiguous remain accurate as of the
+> 2026-08-24 bake-off and are intentionally not rewritten. The new evidence is an input to the
+> now-implemented Phase 2 retention policy. Phase 2 implementation and acceptance status is owned
+> by its plan and sanitized acceptance record, not by this historical Phase 1 report.
 
 ## Scope and methodology
 

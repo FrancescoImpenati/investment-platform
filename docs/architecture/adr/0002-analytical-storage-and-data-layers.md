@@ -3,6 +3,7 @@
 - **Status:** Accepted
 - **Date:** 2026-08-14
 - **Phase:** 0 — Foundation
+- **Refined by:** ADR 0008 for the Phase 2 operational-store technology
 
 ## Context
 
@@ -19,6 +20,10 @@ analytical data.
 - Use DuckDB in-memory to query Parquet; do not persist a competing DuckDB copy of the same bars.
 - Keep a future operational store separate. A relational database, likely PostgreSQL, may later own
   watermarks, job state, retries, alerts, application configuration, portfolios, orders, or users.
+
+ADR 0008 retains this separation and selects SQLite, rather than PostgreSQL, for the local,
+single-user Phase 2 ingestion state. PostgreSQL remains deferred until topology or concurrency
+requirements justify a server.
 
 Parquet is not declared the source of truth for the entire application.
 
