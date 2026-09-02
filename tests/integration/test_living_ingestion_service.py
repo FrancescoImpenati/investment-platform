@@ -51,7 +51,12 @@ from investment_platform.data.operational.restart import (
 )
 from investment_platform.data.providers import AlpacaCredentials, AlpacaFeed, AlpacaProvider
 from investment_platform.data.providers.http import HttpResponse
-from investment_platform.data.retention import RetentionPolicyCatalog, RetentionPolicyEnforcer
+from investment_platform.data.retention import (
+    DatasetPolicyDenied,
+    DatasetRuntimeStatus,
+    RetentionPolicyCatalog,
+    RetentionPolicyEnforcer,
+)
 from investment_platform.data.storage import CanonicalBatchManifest, PublicationFaultPoint
 from investment_platform.data_root import PrivateDataRoot
 from investment_platform.runtime import RuntimeEnvironment, RuntimeSettings
@@ -68,6 +73,7 @@ _SECOND_INSTRUMENT_ID = UUID("1923431d-8907-4f63-ba11-68182c11f799")
 _RUN_1 = UUID("10000000-0000-4000-8000-000000000001")
 _RUN_2 = UUID("10000000-0000-4000-8000-000000000002")
 _RUN_3 = UUID("10000000-0000-4000-8000-000000000003")
+_RUN_4 = UUID("10000000-0000-4000-8000-000000000004")
 
 
 class InjectedCrash(RuntimeError):
@@ -310,6 +316,83 @@ def test_backfill_incremental_extension_and_second_update_no_op(tmp_path: Path) 
         assert repeated.no_op
         assert repeated.status is IngestionRunStatus.SUCCESS
         assert no_op_transport.requests == []
+
+
+def test_empty_response_records_expected_observation_without_verified_empty(
+    tmp_path: Path,
+) -> None:
+    root = _private_root(tmp_path)
+    clock = MutableClock(_NOW)
+    with OperationalStateStore.open(root, clock=clock) as store:
+        service, transport = _service(root, store, clock, [_payload()])
+
+        result = service.run(_request(run_id=_RUN_1, intent=IngestionIntent.BACKFILL))
+
+        assert result.status is IngestionRunStatus.FAILED
+        assert len(transport.requests) == 1
+        with store.read_only_connection() as connection:
+            gap = connection.execute("SELECT gap_type, status, blocking FROM gaps").fetchone()
+            verified_empty_count = connection.execute(
+                """
+                SELECT count(*) FROM coverage_segments
+                WHERE classification = 'VERIFIED_EMPTY'
+                """
+            ).fetchone()[0]
+            watermark_count = connection.execute("SELECT count(*) FROM watermarks").fetchone()[0]
+        assert gap is not None and tuple(gap) == ("EXPECTED_OBSERVATION", "OPEN", 1)
+        assert verified_empty_count == 0
+        assert watermark_count == 0
+
+
+def test_terminal_gap_at_frontier_reconciles_watermark_without_moving_it(
+    tmp_path: Path,
+) -> None:
+    root = _private_root(tmp_path)
+    clock = MutableClock(_NOW)
+    with OperationalStateStore.open(root, clock=clock) as store:
+        initial, _ = _service(
+            root,
+            store,
+            clock,
+            [_payload(_OPEN, _OPEN + timedelta(minutes=5))],
+        )
+        initial.run(_request(run_id=_RUN_1, intent=IngestionIntent.BACKFILL))
+
+        update, _ = _service(root, store, clock, [_payload()])
+        result = update.run(
+            _request(
+                run_id=_RUN_2,
+                intent=IngestionIntent.UPDATE,
+                end=_OPEN + timedelta(minutes=15),
+            )
+        )
+
+        assert result.status is IngestionRunStatus.FAILED
+        with store.read_only_connection() as connection:
+            gap = connection.execute(
+                "SELECT status, interval_start FROM gaps WHERE status = 'OPEN'"
+            ).fetchone()
+            watermark = connection.execute(
+                "SELECT exclusive_frontier, blocking_gap_count, generation, last_run_id "
+                "FROM watermarks"
+            ).fetchone()
+        assert gap is not None
+        assert gap["interval_start"] == (_OPEN + timedelta(minutes=10)).isoformat(
+            timespec="microseconds"
+        ).replace("+00:00", "Z")
+        assert watermark is not None
+        assert tuple(watermark) == (
+            (_OPEN + timedelta(minutes=10))
+            .isoformat(timespec="microseconds")
+            .replace("+00:00", "Z"),
+            1,
+            2,
+            str(_RUN_2),
+        )
+        assert RestartProjectionReader(store).load_run(_RUN_2).status is IngestionRunStatus.FAILED
+        proofs = RestartProjectionReader(store).load_stream_proofs((_stream().stream_id,))
+        assert proofs.watermarks[0].exclusive_frontier == _OPEN + timedelta(minutes=10)
+        assert proofs.watermarks[0].blocking_gap_count == 1
 
 
 def test_provider_short_page_continues_within_persisted_hard_dispatch_ceiling(
@@ -723,6 +806,87 @@ def test_provider_refresh_identical_values_commits_semantic_noop_and_restarts(
             RestartProjectionReader(store).load_run(_RUN_2)
 
 
+def test_semantic_duplicate_repair_resolves_proven_gap_and_rebuilds_watermark(
+    tmp_path: Path,
+) -> None:
+    root = _private_root(tmp_path)
+    clock = MutableClock(_NOW)
+    with OperationalStateStore.open(root, clock=clock) as store:
+        initial, _ = _service(
+            root,
+            store,
+            clock,
+            [_payload(_OPEN, _OPEN + timedelta(minutes=5))],
+        )
+        initial.run(_request(run_id=_RUN_1, intent=IngestionIntent.BACKFILL))
+
+        blocked, _ = _service(
+            root,
+            store,
+            clock,
+            [_payload(_OPEN, _OPEN)],
+        )
+        failed = blocked.run(
+            _request(
+                run_id=_RUN_2,
+                intent=IngestionIntent.REPAIR,
+                repair_strategy=RepairStrategy.PROVIDER_REFRESH,
+                repair_reason="create a bounded integrity finding",
+            )
+        )
+        assert failed.status is IngestionRunStatus.FAILED
+
+        partial, _ = _service(root, store, clock, [_payload(_OPEN)])
+        incomplete_proof = partial.run(
+            _request(
+                run_id=_RUN_3,
+                intent=IngestionIntent.REPAIR,
+                end=_OPEN + timedelta(minutes=5),
+                repair_strategy=RepairStrategy.PROVIDER_REFRESH,
+                repair_reason="prove only a strict subset of the finding",
+            )
+        )
+        assert incomplete_proof.status is IngestionRunStatus.SUCCESS
+        assert incomplete_proof.canonical_batch_count == 0
+        with store.read_only_connection() as connection:
+            assert connection.execute("SELECT status FROM gaps").fetchone()[0] == "OPEN"
+
+        repair, _ = _service(
+            root,
+            store,
+            clock,
+            [_payload(_OPEN, _OPEN + timedelta(minutes=5))],
+        )
+        repaired = repair.run(
+            _request(
+                run_id=_RUN_4,
+                intent=IngestionIntent.REPAIR,
+                repair_strategy=RepairStrategy.PROVIDER_REFRESH,
+                repair_reason="prove retained values are unchanged",
+            )
+        )
+
+        assert repaired.status is IngestionRunStatus.SUCCESS
+        assert repaired.canonical_batch_count == 0
+        with store.read_only_connection() as connection:
+            gap = connection.execute("SELECT status FROM gaps").fetchone()
+            watermark = connection.execute(
+                "SELECT verification_state, exclusive_frontier, generation FROM watermarks"
+            ).fetchone()
+        assert gap is not None and gap["status"] == "RESOLVED"
+        assert watermark is not None
+        assert tuple(watermark) == (
+            "VERIFIED",
+            (_OPEN + timedelta(minutes=10))
+            .isoformat(timespec="microseconds")
+            .replace("+00:00", "Z"),
+            2,
+        )
+        proofs = RestartProjectionReader(store).load_stream_proofs((_stream().stream_id,))
+        assert proofs.gaps[0].status.value == "RESOLVED"
+        assert proofs.watermarks[0].verification_state.value == "VERIFIED"
+
+
 def test_provider_refresh_mixed_revision_publishes_complete_candidate(tmp_path: Path) -> None:
     root = _private_root(tmp_path)
     clock = MutableClock(_NOW)
@@ -915,6 +1079,10 @@ def test_dedicated_raw_replay_operation_recovers_after_publication_crash_without
         operation = OperationalReplayRepository(store).load_raw_replay_operation(_RUN_2)
         assert operation is not None
         assert operation.status.value == "RUNNING"
+        status = Phase2OperationalDiagnostics(root, store, clock=clock).status()
+        assert status.non_terminal_run_count == 1
+        assert tuple(value.run_id for value in status.non_terminal_runs) == (_RUN_2,)
+        assert status.non_terminal_runs[0].next_action.value == "RESUME"
 
         resumed, resumed_transport = _service(root, store, clock, [])
         result = resumed.resume_raw_replay(_RUN_2)
@@ -1023,6 +1191,202 @@ def test_published_orphan_is_adopted_after_restart_without_provider_call(
         assert result.status is IngestionRunStatus.SUCCESS
         assert result.canonical_batch_count == 1
         assert resumed_transport.requests == []
+
+
+def test_resume_checks_processing_policy_before_loading_retained_raw(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = _private_root(tmp_path)
+    clock = MutableClock(_NOW)
+    with OperationalStateStore.open(root, clock=clock) as store:
+        crashing, _ = _service(
+            root,
+            store,
+            clock,
+            [_payload(_OPEN, _OPEN + timedelta(minutes=5))],
+        )
+
+        def crash(point: LivingIngestionFaultPoint) -> None:
+            if point is LivingIngestionFaultPoint.ACQUISITION_COMPLETED:
+                raise InjectedCrash
+
+        with pytest.raises(InjectedCrash):
+            crashing.run(
+                _request(run_id=_RUN_1, intent=IngestionIntent.BACKFILL),
+                faults=LivingIngestionFaults(service=crash),
+            )
+
+        resumed, resumed_transport = _service(root, store, clock, [])
+        raw_page_loading_attempted = False
+        raw_integrity_read_attempted = False
+        real_raw_page_loader = resumed._raw_processing_pages
+        real_integrity_reader = store._managed_file_matches_catalog
+
+        def fail_raw_page_loading(*_args: object, **_kwargs: object) -> None:
+            nonlocal raw_page_loading_attempted
+            raw_page_loading_attempted = True
+            raise AssertionError("retained raw was loaded before the processing policy gate")
+
+        def fail_raw_integrity_read(*_args: object, **_kwargs: object) -> bool:
+            nonlocal raw_integrity_read_attempted
+            raw_integrity_read_attempted = True
+            raise AssertionError("retained raw was opened before the processing policy gate")
+
+        monkeypatch.setattr(resumed, "_raw_processing_pages", fail_raw_page_loading)
+        monkeypatch.setattr(store, "_managed_file_matches_catalog", fail_raw_integrity_read)
+        catalog = RetentionPolicyCatalog.load_default()
+        runtime_status = DatasetRuntimeStatus.for_policy(
+            catalog.lookup("alpaca", "price_bars_sip"),
+            enabled=False,
+            entitlement_active=True,
+        )
+
+        with pytest.raises(DatasetPolicyDenied, match="disabled"):
+            resumed.resume(_RUN_1, runtime_status=runtime_status)
+
+        assert not raw_page_loading_attempted
+        assert not raw_integrity_read_attempted
+        assert resumed_transport.requests == []
+
+        cli_raw_opened = False
+        cli_processing_gate_called = False
+        real_store_integrity_reader = OperationalStateStore._managed_file_matches_catalog
+        real_authorize_processing = RetentionPolicyEnforcer.authorize_processing
+
+        def fail_cli_raw_open(*_args: object, **_kwargs: object) -> bool:
+            nonlocal cli_raw_opened
+            cli_raw_opened = True
+            raise AssertionError("CLI resume opened retained raw before its policy gate")
+
+        def deny_cli_processing(*_args: object, **_kwargs: object) -> None:
+            nonlocal cli_processing_gate_called
+            cli_processing_gate_called = True
+            raise DatasetPolicyDenied("dataset processing is disabled")
+
+        monkeypatch.setattr(
+            "investment_platform.data.ingestion.service.PrivateDataRoot",
+            lambda _configured_root, _repository_root: root,
+        )
+        monkeypatch.setattr(
+            OperationalStateStore,
+            "_managed_file_matches_catalog",
+            fail_cli_raw_open,
+        )
+        monkeypatch.setattr(
+            RetentionPolicyEnforcer,
+            "authorize_processing",
+            deny_cli_processing,
+        )
+        runner = create_cli_command_runner(
+            RuntimeSettings(
+                environment=RuntimeEnvironment.PRIVATE_RESEARCH,
+                data_root=root.root,
+                environment_was_explicit=True,
+            ),
+            Path(__file__).parents[2],
+        )
+
+        cli_result = runner.resume(_RUN_1)
+
+        assert cli_result.code == "INGESTION_FAILED"
+        assert cli_processing_gate_called
+        assert not cli_raw_opened
+        monkeypatch.setattr(
+            OperationalStateStore,
+            "_managed_file_matches_catalog",
+            real_store_integrity_reader,
+        )
+        monkeypatch.setattr(
+            RetentionPolicyEnforcer,
+            "authorize_processing",
+            real_authorize_processing,
+        )
+        monkeypatch.setattr(
+            "investment_platform.data.ingestion.service.PrivateDataRoot",
+            PrivateDataRoot,
+        )
+
+        monkeypatch.setattr(resumed, "_raw_processing_pages", real_raw_page_loader)
+        monkeypatch.setattr(store, "_managed_file_matches_catalog", real_integrity_reader)
+        assert resumed.resume(_RUN_1).status is IngestionRunStatus.SUCCESS
+
+        raw_integrity_read_attempted = False
+        monkeypatch.setattr(store, "_managed_file_matches_catalog", fail_raw_integrity_read)
+        with pytest.raises(DatasetPolicyDenied, match="disabled"):
+            resumed.reconcile_integrity(
+                (_stream(),),
+                environment=RuntimeEnvironment.PRIVATE_RESEARCH,
+                runtime_status=runtime_status,
+            )
+        assert not raw_integrity_read_attempted
+
+        backfill, backfill_transport = _service(root, store, clock, [])
+        backfill_request = replace(
+            _request(run_id=_RUN_2, intent=IngestionIntent.BACKFILL),
+            runtime_status=runtime_status,
+        )
+        with pytest.raises(DatasetPolicyDenied, match="disabled"):
+            backfill.run(backfill_request)
+        assert not raw_integrity_read_attempted
+        assert backfill_transport.requests == []
+
+        update, update_transport = _service(root, store, clock, [])
+        update_request = replace(
+            _request(
+                run_id=_RUN_3,
+                intent=IngestionIntent.UPDATE,
+                end=_OPEN + timedelta(minutes=15),
+            ),
+            runtime_status=runtime_status,
+        )
+        with pytest.raises(DatasetPolicyDenied, match="disabled"):
+            update.run(update_request)
+        assert not raw_integrity_read_attempted
+        assert update_transport.requests == []
+
+        repair, repair_transport = _service(root, store, clock, [])
+        repair_request = replace(
+            _request(
+                run_id=_RUN_4,
+                intent=IngestionIntent.REPAIR,
+                repair_strategy=RepairStrategy.PROVIDER_REFRESH,
+                repair_reason="synthetic retention-gate repair",
+            ),
+            runtime_status=runtime_status,
+        )
+        with pytest.raises(DatasetPolicyDenied, match="disabled"):
+            repair.run(repair_request)
+        assert not raw_integrity_read_attempted
+        assert repair_transport.requests == []
+
+        monkeypatch.setattr(store, "_managed_file_matches_catalog", real_integrity_reader)
+        projection = RestartProjectionReader(store).load_run(_RUN_1)
+        publication = projection.requests[0].publication
+        assert publication is not None
+        canonical_directory = next((root.root / "normalized").rglob("manifest.json")).parent
+        shutil.rmtree(canonical_directory)
+        loss_lease = store.acquire_writer_lease("test-retention-raw-replay", timedelta(minutes=1))
+        try:
+            OperationalReplayRepository(store).reconcile_canonical_loss(
+                loss_lease,
+                publication.canonical_batch_id,
+                detected_at=clock.value,
+            )
+        finally:
+            store.release_writer_lease(loss_lease)
+
+        raw_integrity_read_attempted = False
+        monkeypatch.setattr(store, "_managed_file_matches_catalog", fail_raw_integrity_read)
+        replay, replay_transport = _service(root, store, clock, [])
+        with pytest.raises(DatasetPolicyDenied, match="disabled"):
+            replay.run_raw_replay(
+                projection.requests[0].specification,
+                operation_id=uuid4(),
+                runtime_status=runtime_status,
+            )
+        assert not raw_integrity_read_attempted
+        assert replay_transport.requests == []
 
 
 def test_completed_run_survives_sqlite_reopen_without_provider_call(tmp_path: Path) -> None:

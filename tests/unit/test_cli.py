@@ -3,13 +3,18 @@
 from __future__ import annotations
 
 import json
+import sqlite3
+import stat
 from datetime import UTC, datetime, timedelta
 from io import StringIO
 from pathlib import Path
+from threading import Event, Thread
+from unittest.mock import Mock
 from uuid import UUID, uuid4
 
 import pytest
 
+import investment_platform.data.operational.store as store_module
 from investment_platform.cli import ExitCode, build_parser, main
 from investment_platform.data.ingestion.commands import (
     IngestionCommandOutcome,
@@ -429,6 +434,9 @@ def test_status_and_verify_use_sanitized_operational_diagnostics(
     initialized_root: Path,
     repository_root: Path,
 ) -> None:
+    root = _temporary_root(initialized_root, repository_root)
+    with OperationalStateStore.open(root):
+        pass
     status_output = StringIO()
     verify_output = StringIO()
 
@@ -459,6 +467,159 @@ def test_status_and_verify_use_sanitized_operational_diagnostics(
     assert verification["healthy"] is True
     assert verification["checks"]
     assert str(initialized_root) not in verify_output.getvalue()
+
+
+def test_status_and_verify_open_only_an_existing_database_in_read_only_mode(
+    tmp_path: Path,
+    repository_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    existing_path = tmp_path / "diagnostic-existing-private-runtime"
+    existing_root = _temporary_root(existing_path, repository_root)
+    existing_root.initialize()
+    with OperationalStateStore.open(existing_root):
+        pass
+    operational_path = existing_path / "operational"
+    database_path = operational_path / "ingestion.sqlite3"
+    database_content = database_path.read_bytes()
+    operational_content = {
+        path.name: path.read_bytes() for path in operational_path.iterdir() if path.is_file()
+    }
+
+    missing_paths = tuple(
+        tmp_path / f"diagnostic-missing-{command}-private-runtime"
+        for command in ("status", "verify")
+    )
+    for missing_path in missing_paths:
+        _temporary_root(missing_path, repository_root).initialize()
+
+    connect_spy = Mock(wraps=sqlite3.connect)
+    wal_setup = Mock(side_effect=AssertionError("diagnostics attempted WAL setup"))
+    migration = Mock(side_effect=AssertionError("diagnostics attempted schema migration"))
+    monkeypatch.setattr("investment_platform.data.operational.store.sqlite3.connect", connect_spy)
+    monkeypatch.setattr(OperationalStateStore, "_enable_wal_mode", wal_setup)
+    monkeypatch.setattr(OperationalStateStore, "_migrate", migration)
+
+    for command in ("status", "verify"):
+        assert (
+            main(
+                [command, "--json"],
+                environ=_environment(existing_path),
+                repository_root=repository_root,
+                data_root_factory=_temporary_root,
+                stdout=StringIO(),
+                stderr=StringIO(),
+            )
+            == ExitCode.SUCCESS
+        )
+
+    for command, missing_path in zip(("status", "verify"), missing_paths, strict=True):
+        errors = StringIO()
+        assert (
+            main(
+                [command, "--json"],
+                environ=_environment(missing_path),
+                repository_root=repository_root,
+                data_root_factory=_temporary_root,
+                stdout=StringIO(),
+                stderr=errors,
+            )
+            == ExitCode.FAILURE
+        )
+        assert json.loads(errors.getvalue()) == {
+            "code": "OPERATIONAL_STATE_ERROR",
+            "outcome": "FAILED",
+        }
+        assert tuple((missing_path / "operational").iterdir()) == ()
+
+    assert database_path.read_bytes() == database_content
+    assert {
+        path.name: path.read_bytes() for path in operational_path.iterdir() if path.is_file()
+    } == operational_content
+    assert not wal_setup.called
+    assert not migration.called
+    assert connect_spy.call_args_list
+    assert all(
+        isinstance(call.args[0], str)
+        and "mode=ro" in call.args[0]
+        and call.kwargs.get("uri") is True
+        for call in connect_spy.call_args_list
+    )
+
+    monkeypatch.undo()
+    race_path = tmp_path / "diagnostic-writer-close-private-runtime"
+    race_root = _temporary_root(race_path, repository_root)
+    race_root.initialize()
+    writer_ready = Event()
+    close_requested = Event()
+    close_started = Event()
+    writer_errors: list[BaseException] = []
+
+    def hold_writer() -> None:
+        try:
+            with OperationalStateStore.open(race_root):
+                writer_ready.set()
+                close_requested.wait()
+                close_started.set()
+        except BaseException as error:
+            writer_errors.append(error)
+
+    writer_thread = Thread(target=hold_writer, name="diagnostic-writer-close")
+    writer_thread.start()
+    original_sidecar_identity = store_module._wal_sidecar_identity
+    close_triggered = False
+    sentinel_mode: int | None = None
+
+    try:
+        assert writer_ready.wait(timeout=10)
+        race_database_path = race_path / "operational" / "ingestion.sqlite3"
+        race_sidecars = tuple(Path(f"{race_database_path}{suffix}") for suffix in ("-wal", "-shm"))
+        sidecar_identity_before = tuple(
+            (path.stat().st_dev, path.stat().st_ino) for path in race_sidecars
+        )
+
+        def close_writer_during_diagnostic_open(
+            path: Path,
+        ) -> store_module._WalSidecarIdentity | None:
+            nonlocal close_triggered
+            identity = original_sidecar_identity(path)
+            if path == race_database_path and identity is not None and not close_triggered:
+                close_triggered = True
+                close_requested.set()
+                assert close_started.wait(timeout=10)
+            return identity
+
+        monkeypatch.setattr(
+            store_module,
+            "_wal_sidecar_identity",
+            close_writer_during_diagnostic_open,
+        )
+        sentinel_mode = race_root.sentinel_path.stat().st_mode
+        race_root.sentinel_path.chmod(stat.S_IRUSR)
+        for command in ("status", "verify"):
+            assert (
+                main(
+                    [command, "--json"],
+                    environ=_environment(race_path),
+                    repository_root=repository_root,
+                    data_root_factory=_temporary_root,
+                    stdout=StringIO(),
+                    stderr=StringIO(),
+                )
+                == ExitCode.SUCCESS
+            )
+    finally:
+        close_requested.set()
+        writer_thread.join(timeout=10)
+        if sentinel_mode is not None:
+            race_root.sentinel_path.chmod(sentinel_mode)
+
+    assert close_triggered
+    assert not writer_thread.is_alive()
+    assert writer_errors == []
+    assert tuple((path.stat().st_dev, path.stat().st_ino) for path in race_sidecars) == (
+        sidecar_identity_before
+    )
 
 
 def test_retention_enforce_runs_one_exact_catalog_driven_subscription_purge(

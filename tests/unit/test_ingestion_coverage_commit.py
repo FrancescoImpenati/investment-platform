@@ -228,7 +228,7 @@ def test_multi_stream_partial_request_updates_streams_independently() -> None:
     assert len(commit.segments) == 1
     assert commit.segments[0].request_terminal_state.value == "PARTIAL"
     assert len(commit.gaps) == 1
-    assert commit.gaps[0].gap_type.value == "INTEGRITY"
+    assert commit.gaps[0].gap_type.value == "EXPECTED_OBSERVATION"
     assert commit.gaps[0].stream_id != commit.segments[0].stream_id
     assert len(commit.watermarks) == 1
 

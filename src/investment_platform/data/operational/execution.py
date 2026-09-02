@@ -372,6 +372,55 @@ class SemanticNoOpObservationProof(_FrozenExecutionModel):
         return self
 
 
+class SemanticNoOpReconciliation(_FrozenExecutionModel):
+    """Pure, pre-verified gap/watermark effect of one semantic no-op."""
+
+    calendar_snapshot_id: str = Field(pattern=_DURABLE_ID)
+    policy_snapshot_id: str = Field(pattern=_DURABLE_ID)
+    prior_gaps: Annotated[tuple[GapFinding, ...], Field(min_length=1)]
+    resolved_gaps: Annotated[tuple[GapFinding, ...], Field(min_length=1)]
+    prior_watermarks: Annotated[tuple[MaterializedWatermark, ...], Field(min_length=1)]
+    watermarks: Annotated[tuple[MaterializedWatermark, ...], Field(min_length=1)]
+
+    @model_validator(mode="after")
+    def validate_reconciliation(self) -> Self:
+        prior_gap_ids = tuple(value.gap_id for value in self.prior_gaps)
+        gap_ids = tuple(value.gap_id for value in self.resolved_gaps)
+        prior_watermark_streams = tuple(value.stream_id for value in self.prior_watermarks)
+        watermark_streams = tuple(value.stream_id for value in self.watermarks)
+        if prior_gap_ids != gap_ids or gap_ids != tuple(sorted(set(gap_ids))):
+            raise ValueError("semantic no-op gap resolutions must be unique and ordered")
+        if prior_watermark_streams != watermark_streams or watermark_streams != tuple(
+            sorted(set(watermark_streams))
+        ):
+            raise ValueError("semantic no-op watermarks must be unique and ordered")
+        if any(
+            prior.status not in {GapStatus.OPEN, GapStatus.REPAIRING}
+            or resolved.status is not GapStatus.RESOLVED
+            or resolved.model_copy(update={"status": prior.status, "resolved_at": None})
+            != prior.model_copy(update={"canonical_batch_id": resolved.canonical_batch_id})
+            for prior, resolved in zip(self.prior_gaps, self.resolved_gaps, strict=True)
+        ):
+            raise ValueError("semantic no-op reconciliation may contain only resolved gaps")
+        if {value.stream_id for value in self.resolved_gaps} != set(watermark_streams):
+            raise ValueError("every reconciled gap stream requires one rebuilt watermark")
+        if any(
+            current.verification_state is not CoverageVerificationState.VERIFIED
+            or current.invalidated_at is not None
+            or current.calendar_snapshot_id != self.calendar_snapshot_id
+            or current.policy_snapshot_id != self.policy_snapshot_id
+            or prior.calendar_snapshot_id != self.calendar_snapshot_id
+            or prior.policy_snapshot_id != self.policy_snapshot_id
+            or current.stream_id != prior.stream_id
+            or current.coverage_start != prior.coverage_start
+            or current.exclusive_frontier < prior.exclusive_frontier
+            or current.generation != prior.generation + 1
+            for prior, current in zip(self.prior_watermarks, self.watermarks, strict=True)
+        ):
+            raise ValueError("semantic no-op reconciliation requires exact VERIFIED watermarks")
+        return self
+
+
 class SemanticNoOpCommitRequest(_FrozenExecutionModel):
     identity: AttemptIdentity
     specification: RequestSpecification
@@ -379,6 +428,7 @@ class SemanticNoOpCommitRequest(_FrozenExecutionModel):
     processing_signature: ProcessingSignature
     batch_context_id: str = Field(pattern=r"^batch_context_v1_[0-9a-f]{64}$")
     duplicate_observations: Annotated[tuple[SemanticNoOpObservationProof, ...], Field(min_length=1)]
+    reconciliation: SemanticNoOpReconciliation | None = None
 
     @property
     def supporting_batch_ids(self) -> tuple[str, ...]:
@@ -418,6 +468,15 @@ class SemanticNoOpCommitRequest(_FrozenExecutionModel):
             != self.specification.request_spec_hash
         ):
             raise ValueError("semantic no-op authorization belongs to another request")
+        if self.reconciliation is not None:
+            stream_ids = {value.stream_id for value in self.specification.stream_keys()}
+            if any(
+                gap.stream_id not in stream_ids
+                or gap.start < self.specification.start
+                or gap.end > self.specification.end
+                for gap in self.reconciliation.resolved_gaps
+            ):
+                raise ValueError("semantic no-op reconciliation exceeds the exact request")
         return self
 
 
@@ -2368,7 +2427,7 @@ class IngestionExecutionRepository:
         *,
         committed_at: datetime | None = None,
     ) -> SemanticNoOpCommitResult:
-        """Terminalize an all-duplicate request without filesystem or coverage effects."""
+        """Terminalize an all-duplicate request and reconcile proven retained evidence."""
 
         committed = (
             self._store._now()
@@ -2406,6 +2465,7 @@ class IngestionExecutionRepository:
         }
         proof_hash = _hash_json(proof_payload)
         with self._store._leased_transaction(lease) as connection:
+            policy_checked_at = max(committed, self._store._now())
             acquisition = self._require_completed_acquisition(connection, request.identity)
             row = connection.execute(
                 """
@@ -2415,7 +2475,8 @@ class IngestionExecutionRepository:
                        attempt.status AS attempt_status,
                        acquisition.authorization_hash,
                        acquisition.authorization_json,
-                       context.batch_context_id, contract.processing_signature_hash,
+                       context.batch_context_id, context.calendar_snapshot_id,
+                       contract.processing_signature_hash,
                        contract.processing_signature_json,
                        active.status AS active_status,
                        active.policy_snapshot_id AS active_policy_snapshot_id,
@@ -2469,7 +2530,7 @@ class IngestionExecutionRepository:
                 or row["active_unavailable_at"] is not None
                 or (
                     row["active_expires_at"] is not None
-                    and _parse_utc(str(row["active_expires_at"])) <= committed
+                    and _parse_utc(str(row["active_expires_at"])) <= policy_checked_at
                 )
             ):
                 raise ExecutionIntegrityError(
@@ -2583,6 +2644,15 @@ class IngestionExecutionRepository:
                 raise ExecutionIdentityCollisionError(
                     "semantic no-op supporting batch proof differs"
                 )
+            if existing is None and request.reconciliation is not None:
+                self._apply_semantic_noop_reconciliation(
+                    connection,
+                    request,
+                    calendar_snapshot_id=str(row["calendar_snapshot_id"]),
+                    policy_snapshot_id=str(row["policy_snapshot_id"]),
+                    run_id=str(row["run_id"]),
+                    committed_at=committed,
+                )
             attempt_status = str(acquisition["attempt_status"])
             if attempt_status == "RAW_COMPLETE":
                 connection.execute(
@@ -2629,6 +2699,296 @@ class IngestionExecutionRepository:
             supporting_batch_ids=supporting_batch_ids,
             committed_at=committed,
             replayed=replayed,
+        )
+
+    def _apply_semantic_noop_reconciliation(
+        self,
+        connection: sqlite3.Connection,
+        request: SemanticNoOpCommitRequest,
+        *,
+        calendar_snapshot_id: str,
+        policy_snapshot_id: str,
+        run_id: str,
+        committed_at: datetime,
+    ) -> None:
+        """Persist a pre-verified semantic repair with bounded relational CAS checks."""
+
+        reconciliation = request.reconciliation
+        if reconciliation is None:  # pragma: no cover - narrowed by the caller
+            return
+        if (
+            reconciliation.calendar_snapshot_id != calendar_snapshot_id
+            or reconciliation.policy_snapshot_id != policy_snapshot_id
+            or any(
+                gap.resolved_at != committed_at
+                or gap.canonical_batch_id not in request.supporting_batch_ids
+                for gap in reconciliation.resolved_gaps
+            )
+            or any(
+                watermark.computed_at != committed_at
+                or watermark.last_run_id != run_id
+                or watermark.last_batch_id not in request.supporting_batch_ids
+                for watermark in reconciliation.watermarks
+            )
+        ):
+            raise ExecutionIntegrityError(
+                "semantic no-op reconciliation differs from its transaction context"
+            )
+
+        gap_columns = (
+            "gap_id",
+            "stream_id",
+            "interval_start",
+            "interval_end",
+            "gap_type",
+            "status",
+            "blocking",
+            "detected_at",
+            "resolved_at",
+            "request_instance_id",
+            "canonical_batch_id",
+        )
+        for prior, resolved in zip(
+            reconciliation.prior_gaps,
+            reconciliation.resolved_gaps,
+            strict=True,
+        ):
+            row = connection.execute(
+                "SELECT * FROM gaps WHERE gap_id = ?",
+                (prior.gap_id,),
+            ).fetchone()
+            prior_values = (
+                prior.gap_id,
+                prior.stream_id,
+                _format_utc(prior.start),
+                _format_utc(prior.end),
+                prior.gap_type.value,
+                prior.status.value,
+                int(prior.blocking),
+                _format_utc(prior.detected_at),
+                None,
+                prior.request_instance_id,
+                prior.canonical_batch_id,
+            )
+            if row is None or _row_tuple(row, gap_columns) != prior_values:
+                raise ExecutionStateConflictError(
+                    "semantic no-op gap changed after its proof snapshot"
+                )
+            if not self._semantic_gap_has_relational_support(
+                connection,
+                resolved,
+                calendar_snapshot_id=calendar_snapshot_id,
+                policy_snapshot_id=policy_snapshot_id,
+            ):
+                raise ExecutionIntegrityError(
+                    "semantic no-op does not integrally prove the selected gap"
+                )
+
+        watermark_columns = (
+            "stream_id",
+            "coverage_start",
+            "exclusive_frontier",
+            "verification_state",
+            "generation",
+            "calendar_snapshot_id",
+            "policy_snapshot_id",
+            "last_run_id",
+            "last_batch_id",
+            "last_verified_session",
+            "blocking_gap_count",
+            "computed_at",
+            "invalidated_at",
+        )
+        for prior_watermark in reconciliation.prior_watermarks:
+            watermark_row = connection.execute(
+                "SELECT * FROM watermarks WHERE stream_id = ?",
+                (prior_watermark.stream_id,),
+            ).fetchone()
+            prior_watermark_values = (
+                prior_watermark.stream_id,
+                _format_utc(prior_watermark.coverage_start),
+                _format_utc(prior_watermark.exclusive_frontier),
+                prior_watermark.verification_state.value,
+                prior_watermark.generation,
+                prior_watermark.calendar_snapshot_id,
+                prior_watermark.policy_snapshot_id,
+                prior_watermark.last_run_id,
+                prior_watermark.last_batch_id,
+                prior_watermark.last_verified_session.isoformat(),
+                prior_watermark.blocking_gap_count,
+                _format_utc(prior_watermark.computed_at),
+                (
+                    None
+                    if prior_watermark.invalidated_at is None
+                    else _format_utc(prior_watermark.invalidated_at)
+                ),
+            )
+            if (
+                watermark_row is None
+                or _row_tuple(watermark_row, watermark_columns) != prior_watermark_values
+            ):
+                raise ExecutionStateConflictError(
+                    "semantic no-op watermark changed after its proof snapshot"
+                )
+
+        for prior, resolved in zip(
+            reconciliation.prior_gaps,
+            reconciliation.resolved_gaps,
+            strict=True,
+        ):
+            changed = connection.execute(
+                """
+                UPDATE gaps
+                SET status = 'RESOLVED', resolved_at = ?, canonical_batch_id = ?
+                WHERE gap_id = ? AND status = ?
+                """,
+                (
+                    _format_utc(committed_at),
+                    resolved.canonical_batch_id,
+                    prior.gap_id,
+                    prior.status.value,
+                ),
+            )
+            if changed.rowcount != 1:
+                raise ExecutionStateConflictError(
+                    "semantic no-op gap transition lost its compare-and-swap"
+                )
+
+        resolved_batches_by_stream = {
+            stream_id: {
+                gap.canonical_batch_id
+                for gap in reconciliation.resolved_gaps
+                if gap.stream_id == stream_id
+            }
+            for stream_id in {gap.stream_id for gap in reconciliation.resolved_gaps}
+        }
+        for prior_watermark, rebuilt_watermark in zip(
+            reconciliation.prior_watermarks,
+            reconciliation.watermarks,
+            strict=True,
+        ):
+            active_gap_count = int(
+                connection.execute(
+                    """
+                    SELECT COUNT(*) FROM gaps
+                    WHERE stream_id = ? AND blocking = 1
+                      AND status IN ('OPEN', 'REPAIRING')
+                    """,
+                    (rebuilt_watermark.stream_id,),
+                ).fetchone()[0]
+            )
+            prefix_gap = connection.execute(
+                """
+                SELECT 1 FROM gaps
+                WHERE stream_id = ? AND blocking = 1
+                  AND status IN ('OPEN', 'REPAIRING')
+                  AND interval_start < ? AND interval_end > ?
+                LIMIT 1
+                """,
+                (
+                    rebuilt_watermark.stream_id,
+                    _format_utc(rebuilt_watermark.exclusive_frontier),
+                    _format_utc(rebuilt_watermark.coverage_start),
+                ),
+            ).fetchone()
+            if (
+                rebuilt_watermark.blocking_gap_count != active_gap_count
+                or prefix_gap is not None
+                or rebuilt_watermark.last_batch_id
+                not in resolved_batches_by_stream[rebuilt_watermark.stream_id]
+            ):
+                raise ExecutionIntegrityError(
+                    "semantic no-op watermark disagrees with the resolved gap set"
+                )
+            changed = connection.execute(
+                """
+                UPDATE watermarks
+                SET coverage_start = ?, exclusive_frontier = ?,
+                    verification_state = 'VERIFIED', generation = ?,
+                    calendar_snapshot_id = ?, policy_snapshot_id = ?,
+                    last_run_id = ?, last_batch_id = ?,
+                    last_verified_session = ?, blocking_gap_count = ?,
+                    computed_at = ?, invalidated_at = NULL
+                WHERE stream_id = ? AND generation = ?
+                """,
+                (
+                    _format_utc(rebuilt_watermark.coverage_start),
+                    _format_utc(rebuilt_watermark.exclusive_frontier),
+                    rebuilt_watermark.generation,
+                    rebuilt_watermark.calendar_snapshot_id,
+                    rebuilt_watermark.policy_snapshot_id,
+                    rebuilt_watermark.last_run_id,
+                    rebuilt_watermark.last_batch_id,
+                    rebuilt_watermark.last_verified_session.isoformat(),
+                    rebuilt_watermark.blocking_gap_count,
+                    _format_utc(rebuilt_watermark.computed_at),
+                    rebuilt_watermark.stream_id,
+                    prior_watermark.generation,
+                ),
+            )
+            if changed.rowcount != 1:
+                raise ExecutionStateConflictError(
+                    "semantic no-op watermark update lost its compare-and-swap"
+                )
+
+    @staticmethod
+    def _semantic_gap_has_relational_support(
+        connection: sqlite3.Connection,
+        gap: GapFinding,
+        *,
+        calendar_snapshot_id: str,
+        policy_snapshot_id: str,
+    ) -> bool:
+        """Confirm the pure proof still names one exact verified retained segment."""
+
+        if gap.canonical_batch_id is None:
+            return False
+        return (
+            connection.execute(
+                """
+                SELECT 1
+                FROM coverage_segments AS coverage
+                JOIN coverage_request_proofs AS proof
+                  ON proof.coverage_id = coverage.coverage_id
+                JOIN attempt_acquisition_records AS acquisition
+                  ON acquisition.attempt_id = proof.attempt_id
+                JOIN request_terminal_proofs AS terminal
+                  ON terminal.request_instance_id = proof.request_instance_id
+                 AND terminal.canonical_batch_id = coverage.canonical_batch_id
+                JOIN publication_commits AS publication
+                  ON publication.request_instance_id = proof.request_instance_id
+                 AND publication.canonical_batch_id = coverage.canonical_batch_id
+                JOIN canonical_batches AS batch
+                  ON batch.canonical_batch_id = coverage.canonical_batch_id
+                WHERE coverage.stream_id = ?
+                  AND coverage.canonical_batch_id = ?
+                  AND coverage.calendar_snapshot_id = ?
+                  AND coverage.policy_snapshot_id = ?
+                  AND coverage.interval_start <= ? AND coverage.interval_end >= ?
+                  AND coverage.classification = 'OBSERVED'
+                  AND coverage.verification_state = 'VERIFIED'
+                  AND coverage.retained = 1 AND coverage.invalidated_at IS NULL
+                  AND coverage.request_completed = 1
+                  AND coverage.pagination_verified = 1
+                  AND proof.terminal_page_verified = 1
+                  AND proof.canonical_batch_verified = 1
+                  AND proof.relational_provenance_verified = 1
+                  AND proof.canonical_file_count > 0 AND proof.raw_artifact_count > 0
+                  AND acquisition.pagination_complete = 1
+                  AND acquisition.terminal_page_verified = 1
+                  AND batch.state = 'VERIFIED'
+                LIMIT 1
+                """,
+                (
+                    gap.stream_id,
+                    gap.canonical_batch_id,
+                    calendar_snapshot_id,
+                    policy_snapshot_id,
+                    _format_utc(gap.start),
+                    _format_utc(gap.end),
+                ),
+            ).fetchone()
+            is not None
         )
 
     def fail_processing_request(
@@ -2711,7 +3071,7 @@ class IngestionExecutionRepository:
                     gap.stream_id not in stream_ids
                     or gap.start != specification.start
                     or gap.end != specification.end
-                    or gap.gap_type.value != "INTEGRITY"
+                    or gap.gap_type not in {GapType.INTEGRITY, GapType.EXPECTED_OBSERVATION}
                     or gap.status.value != "OPEN"
                     or not gap.blocking
                     or gap.resolved_at is not None
@@ -2951,6 +3311,46 @@ class IngestionExecutionRepository:
         gap: GapFinding,
         invalidated_at: datetime,
     ) -> None:
+        run = connection.execute(
+            "SELECT run_id FROM request_instances WHERE request_instance_id = ?",
+            (gap.request_instance_id,),
+        ).fetchone()
+        if run is None:
+            raise ExecutionIntegrityError("terminal gap has no originating run")
+        run_id = str(run["run_id"])
+        # A gap that starts at the exclusive frontier does not invalidate the
+        # already proven prefix, but it is a durable state transition.  Keep
+        # its supporting batch while atomically refreshing the active-gap
+        # cache, generation, and transition-run provenance.
+        connection.execute(
+            """
+            UPDATE watermarks
+            SET blocking_gap_count = (
+                    SELECT COUNT(*) FROM gaps
+                    WHERE stream_id = ? AND blocking = 1
+                      AND status IN ('OPEN', 'REPAIRING')
+                ),
+                generation = generation + 1,
+                last_run_id = ?, computed_at = ?
+            WHERE stream_id = ?
+              AND verification_state = 'VERIFIED'
+              AND invalidated_at IS NULL
+              AND exclusive_frontier = ?
+              AND blocking_gap_count <> (
+                    SELECT COUNT(*) FROM gaps
+                    WHERE stream_id = ? AND blocking = 1
+                      AND status IN ('OPEN', 'REPAIRING')
+                )
+            """,
+            (
+                gap.stream_id,
+                run_id,
+                _format_utc(invalidated_at),
+                gap.stream_id,
+                _format_utc(gap.start),
+                gap.stream_id,
+            ),
+        )
         connection.execute(
             """
             UPDATE watermarks
@@ -4791,5 +5191,6 @@ __all__ = [
     "SemanticNoOpCommitRequest",
     "SemanticNoOpCommitResult",
     "SemanticNoOpObservationProof",
+    "SemanticNoOpReconciliation",
     "TerminalFailureResult",
 ]

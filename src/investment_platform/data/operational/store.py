@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import hashlib
+import importlib
+import os
 import re
 import sqlite3
 import stat
@@ -24,6 +26,8 @@ _APPLICATION_ID: Final = 0x49504C54  # ASCII "IPLT".
 _IDENTIFIER_PATTERN: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}\Z")
 _MINIMUM_LEASE_TTL: Final = timedelta(seconds=1)
 _MAXIMUM_LEASE_TTL: Final = timedelta(days=1)
+_SQLITE_HEADER_PREFIX: Final = b"SQLite format 3\x00"
+_LIFECYCLE_LOCK_OFFSET: Final = 1 << 20
 
 
 class OperationalStateError(RuntimeError):
@@ -125,12 +129,14 @@ def _validate_phase2_lease_name(value: str) -> str:
     return value
 
 
-def _validate_database_file(path: Path) -> None:
+def _validate_database_file(path: Path, *, require_existing: bool = False) -> None:
     if path.is_symlink():
         raise OperationalStateError("operational database must not be a symlink")
     try:
         details = path.lstat()
     except FileNotFoundError:
+        if require_existing:
+            raise OperationalStateError("operational database does not exist") from None
         return
     except OSError as error:
         raise OperationalStateError("cannot inspect the operational database file") from error
@@ -144,6 +150,124 @@ def _validate_database_file(path: Path) -> None:
         raise OperationalStateError(
             "operational database must be a direct regular non-link file with one hard link"
         )
+
+
+type _WalSidecarIdentity = tuple[tuple[int, int], tuple[int, int]]
+
+
+def _wal_sidecar_identity(path: Path) -> _WalSidecarIdentity | None:
+    identities: list[tuple[int, int] | None] = []
+    for sidecar in (Path(f"{path}-wal"), Path(f"{path}-shm")):
+        try:
+            details = sidecar.lstat()
+        except FileNotFoundError:
+            identities.append(None)
+            continue
+        except OSError as error:
+            raise OperationalStateError("cannot inspect an operational WAL sidecar") from error
+        reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+        attributes = getattr(details, "st_file_attributes", 0)
+        if (
+            not stat.S_ISREG(details.st_mode)
+            or details.st_nlink != 1
+            or bool(reparse_flag and attributes & reparse_flag)
+        ):
+            raise OperationalStateError(
+                "operational WAL sidecars must be direct regular non-link files"
+            )
+        identities.append((details.st_dev, details.st_ino))
+    if (identities[0] is None) != (identities[1] is None):
+        raise OperationalStateError("operational WAL sidecar state is incomplete")
+    if identities[0] is None:
+        return None
+    first, second = identities
+    assert first is not None and second is not None
+    return (first, second)
+
+
+@contextmanager
+def _database_lifecycle_lock(
+    sentinel_path: Path,
+    *,
+    shared: bool,
+    timeout_ms: int,
+) -> Iterator[None]:
+    """Serialize diagnostic opening with cooperative writer close without new files."""
+
+    try:
+        descriptor = os.open(sentinel_path, os.O_RDONLY)
+    except OSError as error:
+        raise OperationalStateError(
+            "cannot open the operational database lifecycle lock"
+        ) from error
+    acquired = False
+    deadline = monotonic() + timeout_ms / 1_000
+    platform_lock: object | None = None
+    try:
+        if os.name == "nt":
+            platform_lock = importlib.import_module("msvcrt")
+            mode = getattr(
+                platform_lock,
+                "LK_NBRLCK" if shared else "LK_NBLCK",
+            )
+            while True:
+                try:
+                    os.lseek(descriptor, _LIFECYCLE_LOCK_OFFSET, os.SEEK_SET)
+                    platform_lock.locking(descriptor, mode, 1)
+                    acquired = True
+                    break
+                except OSError as error:
+                    if monotonic() >= deadline:
+                        raise OperationalStateError(
+                            "operational database lifecycle lock is busy"
+                        ) from error
+                    sleep(0.01)
+        else:
+            platform_lock = importlib.import_module("fcntl")
+            mode = platform_lock.LOCK_SH if shared else platform_lock.LOCK_EX
+            while True:
+                try:
+                    platform_lock.flock(
+                        descriptor,
+                        mode | platform_lock.LOCK_NB,
+                    )
+                    acquired = True
+                    break
+                except OSError as error:
+                    if monotonic() >= deadline:
+                        raise OperationalStateError(
+                            "operational database lifecycle lock is busy"
+                        ) from error
+                    sleep(0.01)
+        yield
+    finally:
+        if acquired and platform_lock is not None:
+            if os.name == "nt":
+                os.lseek(descriptor, _LIFECYCLE_LOCK_OFFSET, os.SEEK_SET)
+                platform_lock.locking(  # type: ignore[attr-defined]
+                    descriptor,
+                    platform_lock.LK_UNLCK,  # type: ignore[attr-defined]
+                    1,
+                )
+            else:
+                platform_lock.flock(  # type: ignore[attr-defined]
+                    descriptor,
+                    platform_lock.LOCK_UN,  # type: ignore[attr-defined]
+                )
+        os.close(descriptor)
+
+
+def _database_header_uses_wal(path: Path) -> bool:
+    try:
+        with path.open("rb") as source:
+            header = source.read(20)
+    except OSError as error:
+        raise OperationalStateError("cannot read the operational database header") from error
+    return (
+        len(header) == 20
+        and header.startswith(_SQLITE_HEADER_PREFIX)
+        and header[18:20] == b"\x02\x02"
+    )
 
 
 def _migration_table_sql() -> str:
@@ -178,6 +302,9 @@ class OperationalStateStore:
         self._data_root = data_root
         self._busy_timeout_ms = busy_timeout_ms
         self._clock = clock
+        self._diagnostic_immutable = False
+        self._diagnostic_read_only = False
+        self._diagnostic_sidecar_identity: _WalSidecarIdentity | None = None
         sentinel = data_root.validate()
         self._root_id = sentinel.root_id
         operational_directory = data_root.ensure_directory(
@@ -198,7 +325,7 @@ class OperationalStateStore:
             data_root.validate(expected_root_id=self._root_id)
             self._migrate(root_id=str(sentinel.root_id))
         except BaseException:
-            self._connection.close()
+            self.close()
             raise
 
     @classmethod
@@ -212,6 +339,69 @@ class OperationalStateStore:
         """Open, configure, migrate, and bind the fixed database to ``data_root``."""
 
         return cls(data_root, busy_timeout_ms=busy_timeout_ms, clock=clock)
+
+    @classmethod
+    def open_read_only(
+        cls,
+        data_root: PrivateDataRoot,
+        *,
+        busy_timeout_ms: int = DEFAULT_BUSY_TIMEOUT_MS,
+        clock: Callable[[], datetime] = _utc_now,
+    ) -> Self:
+        """Open an existing current-schema database without bootstrap, WAL setup, or migration."""
+
+        if not 1 <= busy_timeout_ms <= 60_000:
+            raise ValueError("busy_timeout_ms must be between 1 and 60000")
+        opened = cls.__new__(cls)
+        opened._data_root = data_root
+        opened._busy_timeout_ms = busy_timeout_ms
+        opened._clock = clock
+        opened._diagnostic_read_only = True
+        sentinel = data_root.validate()
+        opened._root_id = sentinel.root_id
+        expected_path = data_root.managed_path(
+            DATABASE_RELATIVE_PATH, expected_root_id=sentinel.root_id
+        )
+        if expected_path != data_root.root / DATABASE_RELATIVE_PATH:
+            raise OperationalStateError(
+                "operational database location is not the fixed managed path"
+            )
+        _validate_database_file(expected_path, require_existing=True)
+        opened._path = expected_path
+        with _database_lifecycle_lock(
+            data_root.sentinel_path,
+            shared=True,
+            timeout_ms=busy_timeout_ms,
+        ):
+            sidecar_identity = _wal_sidecar_identity(expected_path)
+            immutable = sidecar_identity is None
+            if immutable and not _database_header_uses_wal(expected_path):
+                raise OperationalStateError("operational database header is not in WAL mode")
+            opened._diagnostic_immutable = immutable
+            opened._diagnostic_sidecar_identity = sidecar_identity
+            opened._connection = opened._connect_read_only(expected_path, immutable=immutable)
+            try:
+                current_sidecars = _wal_sidecar_identity(expected_path)
+                if immutable and current_sidecars is not None:
+                    opened._connection.close()
+                    opened._diagnostic_immutable = False
+                    opened._diagnostic_sidecar_identity = current_sidecars
+                    opened._connection = opened._connect_read_only(
+                        expected_path,
+                        immutable=False,
+                    )
+                elif not immutable and current_sidecars != sidecar_identity:
+                    raise OperationalStateError(
+                        "operational WAL sidecars changed during diagnostic opening"
+                    )
+                _validate_database_file(expected_path, require_existing=True)
+                data_root.validate(expected_root_id=opened._root_id)
+                opened._verify_read_only_schema(root_id=str(sentinel.root_id))
+                opened._assert_diagnostic_snapshot_stable()
+            except BaseException:
+                opened._connection.close()
+                raise
+        return opened
 
     def __enter__(self) -> Self:
         return self
@@ -242,10 +432,29 @@ class OperationalStateStore:
         return self._busy_timeout_ms
 
     def close(self) -> None:
-        self._connection.close()
+        if self._diagnostic_read_only:
+            self._connection.close()
+            return
+        with _database_lifecycle_lock(
+            self._data_root.sentinel_path,
+            shared=False,
+            timeout_ms=self._busy_timeout_ms,
+        ):
+            self._connection.close()
 
     def _now(self) -> datetime:
         return _as_utc(self._clock(), label="clock value")
+
+    def _assert_diagnostic_snapshot_stable(self) -> None:
+        current_sidecars = _wal_sidecar_identity(self._path)
+        if self._diagnostic_immutable and current_sidecars is not None:
+            raise OperationalStateError("operational state changed during diagnostic access")
+        if (
+            self._diagnostic_read_only
+            and not self._diagnostic_immutable
+            and current_sidecars != self._diagnostic_sidecar_identity
+        ):
+            raise OperationalStateError("operational WAL sidecars changed during diagnostic access")
 
     def _managed_regular_file_is_present(self, relative_path: str) -> bool:
         """Fail closed when cataloged private-root content is absent or link-like."""
@@ -363,6 +572,35 @@ class OperationalStateStore:
             raise
         return connection
 
+    def _connect_read_only(
+        self,
+        path: Path,
+        *,
+        immutable: bool,
+    ) -> sqlite3.Connection:
+        immutable_parameter = "&immutable=1" if immutable else ""
+        try:
+            connection = sqlite3.connect(
+                f"{path.as_uri()}?mode=ro{immutable_parameter}",
+                uri=True,
+                timeout=self._busy_timeout_ms / 1_000,
+                isolation_level=None,
+            )
+        except sqlite3.DatabaseError as error:
+            raise OperationalStateError(
+                "operational database could not be opened read-only"
+            ) from error
+        connection.row_factory = sqlite3.Row
+        try:
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.execute(f"PRAGMA busy_timeout = {self._busy_timeout_ms}")
+            connection.execute("PRAGMA query_only = ON")
+            self._verify_connection_contract(connection, immutable=immutable)
+        except BaseException:
+            connection.close()
+            raise
+        return connection
+
     def _enable_wal_mode(self, connection: sqlite3.Connection) -> sqlite3.Row | None:
         deadline = monotonic() + (self._busy_timeout_ms / 1_000)
         while True:
@@ -381,14 +619,20 @@ class OperationalStateStore:
                     raise
                 sleep(min(0.01, remaining))
 
-    def _verify_connection_contract(self, connection: sqlite3.Connection) -> None:
+    def _verify_connection_contract(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        immutable: bool = False,
+    ) -> None:
         foreign_keys = connection.execute("PRAGMA foreign_keys").fetchone()
         journal_mode = connection.execute("PRAGMA journal_mode").fetchone()
         synchronous = connection.execute("PRAGMA synchronous").fetchone()
         busy_timeout = connection.execute("PRAGMA busy_timeout").fetchone()
         if foreign_keys is None or int(foreign_keys[0]) != 1:
             raise OperationalStateError("SQLite foreign-key enforcement is not active")
-        if journal_mode is None or str(journal_mode[0]).casefold() != "wal":
+        expected_journal_mode = "delete" if immutable else "wal"
+        if journal_mode is None or str(journal_mode[0]).casefold() != expected_journal_mode:
             raise OperationalStateError("SQLite journal mode is not WAL")
         if synchronous is None or int(synchronous[0]) != 2:
             raise OperationalStateError("SQLite synchronous mode is not FULL")
@@ -511,6 +755,64 @@ class OperationalStateStore:
                 "operational schema migration failed atomically"
             ) from error
 
+    def _verify_read_only_schema(self, *, root_id: str) -> None:
+        try:
+            user_version_row = self._connection.execute("PRAGMA user_version").fetchone()
+            application_row = self._connection.execute("PRAGMA application_id").fetchone()
+            if user_version_row is None or application_row is None:
+                raise OperationalSchemaError("SQLite did not report schema identity")
+            user_version = int(user_version_row[0])
+            if user_version > LATEST_SCHEMA_VERSION:
+                raise OperationalSchemaTooNewError(
+                    f"operational schema {user_version} is newer than supported "
+                    f"{LATEST_SCHEMA_VERSION}"
+                )
+            if user_version != LATEST_SCHEMA_VERSION:
+                raise OperationalSchemaError(
+                    "operational schema requires migration; diagnostics are read-only"
+                )
+            if int(application_row[0]) != _APPLICATION_ID:
+                raise OperationalSchemaError("database has an invalid SQLite application identity")
+
+            rows = self._connection.execute(
+                """
+                SELECT version, name, checksum_sha256
+                FROM schema_migrations
+                ORDER BY version
+                """
+            ).fetchall()
+            if len(rows) != len(MIGRATIONS):
+                raise OperationalSchemaError("schema migration history is incomplete")
+            for row, expected in zip(rows, MIGRATIONS, strict=True):
+                if (
+                    int(row["version"]) != expected.version
+                    or str(row["name"]) != expected.name
+                    or str(row["checksum_sha256"]) != expected.checksum_sha256
+                ):
+                    raise OperationalSchemaError(
+                        f"schema migration {expected.version} identity does not match source"
+                    )
+
+            metadata = self._connection.execute(
+                """
+                SELECT root_id, schema_version
+                FROM store_metadata
+                WHERE singleton = 1
+                """
+            ).fetchone()
+            if metadata is None:
+                raise OperationalSchemaError("operational database is missing root metadata")
+            if str(metadata["root_id"]) != root_id:
+                raise OperationalSchemaError(
+                    "operational database is bound to a different private-root ID"
+                )
+            if int(metadata["schema_version"]) != LATEST_SCHEMA_VERSION:
+                raise OperationalSchemaError("store metadata and migration history disagree")
+        except OperationalSchemaError:
+            raise
+        except sqlite3.DatabaseError as error:
+            raise OperationalSchemaError("operational schema verification failed") from error
+
     @contextmanager
     def _transaction(self, *, write: bool = True) -> Iterator[sqlite3.Connection]:
         """Internal transaction primitive; public mutations are typed and lease-fenced."""
@@ -589,24 +891,23 @@ class OperationalStateStore:
 
         self._data_root.validate(expected_root_id=self._root_id)
         _validate_database_file(self._path)
-        connection = sqlite3.connect(
-            f"{self._path.as_uri()}?mode=ro",
-            uri=True,
-            timeout=self._busy_timeout_ms / 1_000,
-            isolation_level=None,
+        self._assert_diagnostic_snapshot_stable()
+        immutable = self._diagnostic_immutable
+        connection = self._connect_read_only(
+            self._path,
+            immutable=immutable,
         )
-        connection.row_factory = sqlite3.Row
         try:
-            connection.execute("PRAGMA foreign_keys = ON")
-            connection.execute(f"PRAGMA busy_timeout = {self._busy_timeout_ms}")
             yield connection
         finally:
             connection.close()
+        self._assert_diagnostic_snapshot_stable()
 
     def diagnostics(self) -> OperationalDiagnostics:
         """Run SQLite integrity and foreign-key checks without exposing private values."""
 
         self._data_root.validate(expected_root_id=self._root_id)
+        self._assert_diagnostic_snapshot_stable()
         integrity_messages = tuple(
             str(row[0]) for row in self._connection.execute("PRAGMA integrity_check").fetchall()
         )
@@ -616,10 +917,11 @@ class OperationalStateStore:
         busy_timeout = self._connection.execute("PRAGMA busy_timeout").fetchone()
         if journal_mode is None or synchronous is None or busy_timeout is None:
             raise OperationalStateError("SQLite did not return connection diagnostics")
+        self._assert_diagnostic_snapshot_stable()
         return OperationalDiagnostics(
             database_path=self._path,
             schema_version=self.schema_version,
-            journal_mode=str(journal_mode[0]).casefold(),
+            journal_mode=("wal" if self._diagnostic_immutable else str(journal_mode[0]).casefold()),
             synchronous=int(synchronous[0]),
             busy_timeout_ms=int(busy_timeout[0]),
             integrity_messages=integrity_messages,
@@ -631,10 +933,12 @@ class OperationalStateStore:
 
         lease_name = DEFAULT_WRITER_LEASE_NAME
         self._data_root.validate(expected_root_id=self._root_id)
+        self._assert_diagnostic_snapshot_stable()
         row = self._connection.execute(
             "SELECT * FROM writer_leases WHERE lease_name = ?",
             (lease_name,),
         ).fetchone()
+        self._assert_diagnostic_snapshot_stable()
         if (
             row is None
             or str(row["state"]) != "ACTIVE"

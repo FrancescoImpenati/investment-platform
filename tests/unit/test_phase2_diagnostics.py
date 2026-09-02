@@ -27,8 +27,11 @@ from investment_platform.data.ingestion.identity import (
 from investment_platform.data.models import AdjustmentState, Timeframe, TradingSession
 from investment_platform.data.operational import (
     LATEST_SCHEMA_VERSION,
+    CalendarSnapshotRepository,
     IngestionExecutionRepository,
+    IngestionPlanRepository,
     OperationalStateStore,
+    RestartProjectionReader,
 )
 from investment_platform.data.retention import (
     RetentionPolicyCatalog,
@@ -52,6 +55,8 @@ from tests.unit.test_ingestion_execution_repository import (
     MutableClock as ExecutionClock,
 )
 from tests.unit.test_ingestion_execution_repository import (
+    _calendar,
+    _plan,
     _prepare_scenario,
 )
 from tests.unit.test_ingestion_execution_repository import (
@@ -339,6 +344,108 @@ def test_status_omits_stored_error_message_and_private_identifiers(
     assert run_id not in serialized
     assert str(root.root) not in serialized
     assert "CHECK_FAILED" in serialized
+
+
+def test_status_boundedly_exposes_non_terminal_run_ids_for_hard_crash_recovery(
+    diagnostic_runtime: tuple[PrivateDataRoot, OperationalStateStore, Phase2OperationalDiagnostics],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, store, diagnostics = diagnostic_runtime
+    run_ids = tuple(UUID(int=index + 1) for index in range(21))
+    enforcer = RetentionPolicyEnforcer(
+        RetentionPolicyCatalog.load_default(),
+        clock=lambda: _NOW,
+    )
+    lease = store.acquire_writer_lease("crashed-process", timedelta(minutes=5))
+    CalendarSnapshotRepository(store).persist(lease, _calendar())
+    template = _plan(enforcer)
+    plans = IngestionPlanRepository(store)
+    for run_id in run_ids:
+        plans.persist(
+            lease,
+            template.model_copy(
+                update={
+                    "run_id": run_id,
+                    "reason": f"hard-crash-recovery-{run_id.int}",
+                }
+            ),
+        )
+
+    status = diagnostics.status()
+
+    assert status.active_writer_lease
+    assert status.non_terminal_run_count == len(run_ids)
+    assert len(status.non_terminal_runs) == 20
+    assert status.non_terminal_runs[0].run_id == run_ids[-1]
+    assert {run.run_id for run in status.non_terminal_runs} == set(run_ids[1:])
+    assert {run.next_action for run in status.non_terminal_runs} == {"WAIT_FOR_WRITER"}
+    assert RestartProjectionReader(store).load_run(run_ids[-1]).run_id == run_ids[-1]
+    with OperationalStateStore.open_read_only(root, clock=lambda: _NOW) as diagnostic_store:
+        reopened = Phase2OperationalDiagnostics(
+            root,
+            diagnostic_store,
+            clock=lambda: _NOW,
+        ).status()
+    assert reopened.non_terminal_run_count == len(run_ids)
+    assert reopened.non_terminal_runs[0].run_id == run_ids[-1]
+    assert {run.next_action for run in reopened.non_terminal_runs} == {"WAIT_FOR_WRITER"}
+
+    original_connect = store._connect_read_only
+    terminalized_during_status = False
+    with sqlite3.connect(store.path) as racing_writer:
+
+        def connect_with_race(path: Path, *, immutable: bool) -> sqlite3.Connection:
+            connection = original_connect(path, immutable=immutable)
+
+            def terminalize_latest_run(statement: str) -> None:
+                nonlocal terminalized_during_status
+                if (
+                    terminalized_during_status
+                    or "SELECT run_id, environment" not in statement
+                    or "FROM ingestion_runs AS recoverable" not in statement
+                ):
+                    return
+                racing_writer.execute(
+                    """
+                    UPDATE ingestion_runs
+                    SET status = 'FAILED', completed_at = ?
+                    WHERE run_id = ?
+                    """,
+                    (_NOW.isoformat(), str(run_ids[-1])),
+                )
+                racing_writer.commit()
+                terminalized_during_status = True
+
+            connection.set_trace_callback(terminalize_latest_run)
+            return connection
+
+        monkeypatch.setattr(store, "_connect_read_only", connect_with_race)
+        raced = diagnostics.status()
+
+    assert terminalized_during_status
+    assert raced.non_terminal_run_count == len(run_ids)
+    assert raced.non_terminal_runs[0].run_id == run_ids[-1]
+    monkeypatch.setattr(store, "_connect_read_only", original_connect)
+
+    with sqlite3.connect(store.path) as connection:
+        connection.execute(
+            """
+            UPDATE writer_leases
+            SET acquired_at = ?, heartbeat_at = ?, expires_at = ?
+            WHERE lease_name = ?
+            """,
+            (
+                (_NOW - timedelta(seconds=3)).isoformat(),
+                (_NOW - timedelta(seconds=2)).isoformat(),
+                (_NOW - timedelta(seconds=1)).isoformat(),
+                lease.lease_name,
+            ),
+        )
+
+    expired = diagnostics.status()
+
+    assert not expired.active_writer_lease
+    assert {run.next_action for run in expired.non_terminal_runs} == {"RESUME"}
 
 
 def test_status_reports_stream_dimensions_and_open_gap_without_observations(

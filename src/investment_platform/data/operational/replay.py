@@ -52,6 +52,7 @@ from investment_platform.data.storage.canonical_batches import (
     CanonicalPublicationProvenance,
     PublishedCanonicalBatch,
 )
+from investment_platform.runtime import RuntimeEnvironment
 
 _SHA256 = r"^[0-9a-f]{64}$"
 _DURABLE_ID = r"^[A-Za-z0-9][A-Za-z0-9._:@-]{0,191}$"
@@ -255,6 +256,7 @@ class RawReplayOperation(_FrozenReplayModel):
     operation_id: UUID
     specification: RequestSpecification
     eligibility: RawReplayEligibility
+    environment: RuntimeEnvironment
     status: RawReplayOperationStatus
     requested_at: datetime
     started_at: datetime | None = None
@@ -1005,6 +1007,7 @@ class OperationalReplayRepository:
                 operation_id=UUID(str(row["operation_id"])),
                 specification=specification,
                 eligibility=eligibility,
+                environment=RuntimeEnvironment(str(row["run_environment"])),
                 status=RawReplayOperationStatus(str(row["status"])),
                 requested_at=_parse_utc(str(row["requested_at"])),
                 started_at=(

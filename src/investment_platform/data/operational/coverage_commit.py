@@ -18,6 +18,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import polars as pl
 
+from investment_platform.data.calendar import CalendarSnapshot
 from investment_platform.data.ingestion.coverage import (
     CoverageRequestTerminalState,
     CoverageSegment,
@@ -32,13 +33,17 @@ from investment_platform.data.ingestion.coverage import (
     reconstruct_frontier,
     transition_gap,
 )
-from investment_platform.data.ingestion.identity import StreamKey
+from investment_platform.data.ingestion.identity import RequestSpecification, StreamKey
 from investment_platform.data.ingestion.planner import (
     CoverageClassification,
     CoverageVerificationState,
 )
 from investment_platform.data.market_time import to_utc
-from investment_platform.data.operational.execution import CoverageCommit
+from investment_platform.data.operational.execution import (
+    CoverageCommit,
+    SemanticNoOpObservationProof,
+    SemanticNoOpReconciliation,
+)
 from investment_platform.data.retention import DatasetRetentionPolicy, DatasetRuntimeStatus
 from investment_platform.data.storage import (
     CanonicalBatchManifest,
@@ -104,6 +109,12 @@ def _gap_id(
     return f"{_GAP_ID_VERSION}_{digest}"
 
 
+def _blocked_gap_type(outcome: CanonicalStreamOutcome) -> GapType:
+    if outcome.validation_codes == ("NO_CANONICAL_ROWS",):
+        return GapType.EXPECTED_OBSERVATION
+    return GapType.INTEGRITY
+
+
 def build_blocking_integrity_gaps(
     *,
     stream_outcomes: Sequence[CanonicalStreamOutcome],
@@ -113,33 +124,36 @@ def build_blocking_integrity_gaps(
     """Create deterministic durable findings for streams blocked before publication.
 
     This is the no-publication companion to :func:`build_publication_coverage_commit`.
-    It deliberately creates neither coverage nor watermarks: the only durable fact
-    available after deterministic processing blocks a stream is an open integrity
-    gap over that stream's exact bounded request interval.
+    It deliberately creates neither coverage nor watermarks.  A stream with no
+    canonical rows is an expected-observation gap; other deterministic validation
+    failures remain integrity gaps over the exact bounded request interval.
     """
 
     now = to_utc(detected_at)
-    gaps = tuple(
-        GapFinding(
-            gap_id=_gap_id(
+    gaps: list[GapFinding] = []
+    for outcome in stream_outcomes:
+        if outcome.outcome is not StreamPublicationOutcome.BLOCKED:
+            continue
+        gap_type = _blocked_gap_type(outcome)
+        gaps.append(
+            GapFinding(
+                gap_id=_gap_id(
+                    stream_id=outcome.stream_id,
+                    start=outcome.request_start,
+                    end=outcome.request_end,
+                    gap_type=gap_type,
+                    episode_id=str(request_instance_id),
+                ),
                 stream_id=outcome.stream_id,
                 start=outcome.request_start,
                 end=outcome.request_end,
-                gap_type=GapType.INTEGRITY,
-                episode_id=str(request_instance_id),
-            ),
-            stream_id=outcome.stream_id,
-            start=outcome.request_start,
-            end=outcome.request_end,
-            gap_type=GapType.INTEGRITY,
-            status=GapStatus.OPEN,
-            blocking=True,
-            detected_at=now,
-            request_instance_id=str(request_instance_id),
+                gap_type=gap_type,
+                status=GapStatus.OPEN,
+                blocking=True,
+                detected_at=now,
+                request_instance_id=str(request_instance_id),
+            )
         )
-        for outcome in stream_outcomes
-        if outcome.outcome is StreamPublicationOutcome.BLOCKED
-    )
     if len({gap.gap_id for gap in gaps}) != len(gaps):
         raise CoverageCommitBuildError("blocked stream outcomes contain duplicate identities")
     return tuple(sorted(gaps, key=lambda gap: gap.gap_id))
@@ -376,6 +390,207 @@ def _existing_segment_supports_slot(
     )
 
 
+def build_semantic_noop_reconciliation(
+    *,
+    specification: RequestSpecification,
+    duplicate_observations: Sequence[SemanticNoOpObservationProof],
+    calendar_snapshot: CalendarSnapshot,
+    calendar_snapshot_id: str,
+    policy_snapshot_id: str,
+    policy: DatasetRetentionPolicy,
+    runtime_status: DatasetRuntimeStatus | None,
+    run_id: UUID,
+    coverage_start: datetime,
+    frontier_domain_end: datetime,
+    verified_at: datetime,
+    existing_segments: Sequence[CoverageSegment],
+    existing_gaps: Sequence[GapFinding],
+    existing_watermarks: Sequence[MaterializedWatermark],
+) -> SemanticNoOpReconciliation | None:
+    """Rebuild only streams whose complete gap is proven by retained equal values."""
+
+    now = to_utc(verified_at)
+    origin = _existing_coverage_start(
+        coverage_start,
+        existing_segments,
+        existing_watermarks,
+    )
+    domain_end = max(to_utc(frontier_domain_end), specification.end)
+    watermarks_by_stream = {value.stream_id: value for value in existing_watermarks}
+    if len(watermarks_by_stream) != len(existing_watermarks):
+        raise CoverageCommitBuildError("existing watermark projection contains duplicates")
+    proofs_by_stream: dict[
+        str,
+        dict[tuple[datetime, datetime], SemanticNoOpObservationProof],
+    ] = {}
+    for proof in duplicate_observations:
+        proof_slot = (proof.start, proof.end)
+        stream_proofs = proofs_by_stream.setdefault(proof.stream_id, {})
+        if proof_slot in stream_proofs:
+            raise CoverageCommitBuildError("semantic duplicate slot proofs contain duplicates")
+        stream_proofs[proof_slot] = proof
+
+    prior_gaps: list[GapFinding] = []
+    resolved_gaps: list[GapFinding] = []
+    prior_watermarks: list[MaterializedWatermark] = []
+    watermarks: list[MaterializedWatermark] = []
+    for stream in specification.stream_keys():
+        prior_watermark = watermarks_by_stream.get(stream.stream_id)
+        if prior_watermark is None:
+            continue
+        stream_segments = tuple(
+            segment for segment in existing_segments if segment.stream_id == stream.stream_id
+        )
+        stream_gaps = tuple(gap for gap in existing_gaps if gap.stream_id == stream.stream_id)
+        stream_proofs = proofs_by_stream.get(stream.stream_id, {})
+        proposed: list[GapFinding] = []
+        for gap in stream_gaps:
+            if (
+                not gap.actively_blocks
+                or gap.start < specification.start
+                or gap.end > specification.end
+            ):
+                continue
+            slots = tuple(
+                slot
+                for slot in calendar_snapshot.expected_slots(stream.timeframe)
+                if slot.start_utc >= gap.start and slot.end_utc <= gap.end
+            )
+            slot_keys = {(slot.start_utc, slot.end_utc) for slot in slots}
+            gap_proof_keys = {
+                slot for slot in stream_proofs if slot[0] >= gap.start and slot[1] <= gap.end
+            }
+            if (
+                not slots
+                or slots[0].start_utc != gap.start
+                or slots[-1].end_utc != gap.end
+                or gap_proof_keys != slot_keys
+            ):
+                continue
+            common_batches: set[str] | None = None
+            fully_proven = True
+            for calendar_slot in slots:
+                proof = stream_proofs[(calendar_slot.start_utc, calendar_slot.end_utc)]
+                supported = {
+                    segment.canonical_batch_id
+                    for segment in stream_segments
+                    if segment.canonical_batch_id in proof.matching_supporting_batch_ids
+                    and _existing_segment_supports_slot(
+                        segment,
+                        stream_id=stream.stream_id,
+                        start=calendar_slot.start_utc,
+                        end=calendar_slot.end_utc,
+                        calendar_snapshot_id=calendar_snapshot_id,
+                        calendar_snapshot_checksum=calendar_snapshot.checksum,
+                        policy_snapshot_id=policy_snapshot_id,
+                    )
+                }
+                if not supported:
+                    fully_proven = False
+                    break
+                common_batches = supported if common_batches is None else common_batches & supported
+                if not common_batches:
+                    fully_proven = False
+                    break
+            if not fully_proven or not common_batches:
+                continue
+            common_batches = {
+                batch_id
+                for batch_id in common_batches
+                if any(
+                    segment.canonical_batch_id == batch_id
+                    and _existing_segment_supports_slot(
+                        segment,
+                        stream_id=stream.stream_id,
+                        start=gap.start,
+                        end=gap.end,
+                        calendar_snapshot_id=calendar_snapshot_id,
+                        calendar_snapshot_checksum=calendar_snapshot.checksum,
+                        policy_snapshot_id=policy_snapshot_id,
+                    )
+                    for segment in stream_segments
+                )
+            }
+            if not common_batches:
+                continue
+            supporting_batch_id = next(iter(sorted(common_batches)))
+            proposed.append(
+                transition_gap(
+                    gap,
+                    GapStatus.RESOLVED,
+                    transitioned_at=now,
+                ).model_copy(update={"canonical_batch_id": supporting_batch_id})
+            )
+        if not proposed:
+            continue
+
+        projected_gaps = _replace_gaps(stream_gaps, proposed)
+        evaluation = reconstruct_frontier(
+            stream=stream,
+            calendar_snapshot=calendar_snapshot,
+            calendar_snapshot_id=calendar_snapshot_id,
+            policy=policy,
+            policy_snapshot_id=policy_snapshot_id,
+            runtime_status=runtime_status,
+            coverage_start=origin,
+            domain_end=max(
+                domain_end,
+                prior_watermark.exclusive_frontier,
+                *(segment.end for segment in stream_segments),
+                *(gap.end for gap in stream_gaps),
+            ),
+            coverage=stream_segments,
+            gaps=projected_gaps,
+            evaluated_at=now,
+        )
+        candidate = evaluation.candidate
+        resolution_batches = {
+            value.canonical_batch_id for value in proposed if value.canonical_batch_id is not None
+        }
+        changing_batches = (
+            set(candidate.supporting_batch_ids) & resolution_batches
+            if candidate is not None
+            else set()
+        )
+        if (
+            candidate is None
+            or candidate.exclusive_frontier < prior_watermark.exclusive_frontier
+            or not changing_batches
+        ):
+            continue
+        rebuilt = materialize_watermark(
+            candidate,
+            WatermarkChangeContext(
+                generation=prior_watermark.generation + 1,
+                last_run_id=str(run_id),
+                last_batch_id=next(iter(sorted(changing_batches))),
+                computed_at=now,
+            ),
+        )
+        prior_gaps.extend(
+            sorted(
+                (gap for gap in stream_gaps if gap.gap_id in {value.gap_id for value in proposed}),
+                key=lambda value: value.gap_id,
+            )
+        )
+        resolved_gaps.extend(sorted(proposed, key=lambda value: value.gap_id))
+        prior_watermarks.append(prior_watermark)
+        watermarks.append(rebuilt)
+
+    if not resolved_gaps:
+        return None
+    ordered_prior_gaps = tuple(sorted(prior_gaps, key=lambda value: value.gap_id))
+    ordered_resolved_gaps = tuple(sorted(resolved_gaps, key=lambda value: value.gap_id))
+    return SemanticNoOpReconciliation(
+        calendar_snapshot_id=calendar_snapshot_id,
+        policy_snapshot_id=policy_snapshot_id,
+        prior_gaps=ordered_prior_gaps,
+        resolved_gaps=ordered_resolved_gaps,
+        prior_watermarks=tuple(sorted(prior_watermarks, key=lambda value: value.stream_id)),
+        watermarks=tuple(sorted(watermarks, key=lambda value: value.stream_id)),
+    )
+
+
 def build_publication_coverage_commit(
     *,
     manifest: CanonicalBatchManifest,
@@ -463,11 +678,12 @@ def build_publication_coverage_commit(
         stream = outcome.stream
         stream_id = stream.stream_id
         if outcome.outcome is StreamPublicationOutcome.BLOCKED:
+            gap_type = _blocked_gap_type(outcome)
             identifier = _gap_id(
                 stream_id=stream_id,
                 start=outcome.request_start,
                 end=outcome.request_end,
-                gap_type=GapType.INTEGRITY,
+                gap_type=gap_type,
                 episode_id=str(request_instance_id),
             )
             existing_gap = next(
@@ -481,7 +697,7 @@ def build_publication_coverage_commit(
                     stream_id=stream_id,
                     start=outcome.request_start,
                     end=outcome.request_end,
-                    gap_type=GapType.INTEGRITY,
+                    gap_type=gap_type,
                     status=GapStatus.OPEN,
                     blocking=True,
                     detected_at=now,
@@ -852,4 +1068,5 @@ __all__ = [
     "build_blocking_acquisition_gaps",
     "build_blocking_integrity_gaps",
     "build_publication_coverage_commit",
+    "build_semantic_noop_reconciliation",
 ]

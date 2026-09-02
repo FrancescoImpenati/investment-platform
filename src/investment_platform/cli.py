@@ -367,7 +367,7 @@ def _run_status_or_verify(
     json_output: bool,
     stdout: TextIO,
 ) -> int:
-    with OperationalStateStore.open(root) as store:
+    with OperationalStateStore.open_read_only(root) as store:
         diagnostics = Phase2OperationalDiagnostics(root, store)
         if command == "status":
             snapshot = diagnostics.status()
@@ -429,6 +429,23 @@ def _run_status_or_verify(
                         "Last run: "
                         f"{snapshot.latest_run.provider}/{snapshot.latest_run.dataset} "
                         f"{snapshot.latest_run.mode} {snapshot.latest_run.status}\n"
+                    )
+                if snapshot.non_terminal_run_count:
+                    stdout.write(
+                        "Non-terminal runs: "
+                        f"{snapshot.non_terminal_run_count} "
+                        f"(showing {len(snapshot.non_terminal_runs)})\n"
+                    )
+                for run in snapshot.non_terminal_runs:
+                    next_action = (
+                        "wait for the active writer"
+                        if run.next_action == "WAIT_FOR_WRITER"
+                        else f"investment-platform resume --run-id {run.run_id}"
+                    )
+                    stdout.write(
+                        "Non-terminal run: "
+                        f"{run.run_id} {run.provider}/{run.dataset} "
+                        f"{run.mode} {run.status} next_action={next_action}\n"
                     )
                 if snapshot.latest_error is not None:
                     stdout.write(

@@ -13,7 +13,7 @@ import hashlib
 import json
 import re
 import sqlite3
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from datetime import UTC, date, datetime
 from decimal import Decimal, InvalidOperation
 from enum import StrEnum
@@ -377,7 +377,12 @@ class RestartProjectionReader:
     def __init__(self, store: OperationalStateStore) -> None:
         self._store = store
 
-    def load_run(self, run_id: UUID) -> RestartRunContext:
+    def load_run(
+        self,
+        run_id: UUID,
+        *,
+        before_artifact_access: Callable[[str, str, RuntimeEnvironment], None] | None = None,
+    ) -> RestartRunContext:
         """Load one complete plan/run projection or fail without partial output."""
 
         try:
@@ -385,7 +390,11 @@ class RestartProjectionReader:
                 connection.execute("PRAGMA query_only = ON")
                 connection.execute("BEGIN")
                 try:
-                    result = self._load_run(connection, run_id)
+                    result = self._load_run(
+                        connection,
+                        run_id,
+                        before_artifact_access=before_artifact_access,
+                    )
                 finally:
                     connection.rollback()
             return result
@@ -479,7 +488,13 @@ class RestartProjectionReader:
                 "durable stream proofs contain invalid typed metadata"
             ) from None
 
-    def _load_run(self, connection: sqlite3.Connection, run_id: UUID) -> RestartRunContext:
+    def _load_run(
+        self,
+        connection: sqlite3.Connection,
+        run_id: UUID,
+        *,
+        before_artifact_access: Callable[[str, str, RuntimeEnvironment], None] | None,
+    ) -> RestartRunContext:
         evaluated_at = self._store._now()
         row = connection.execute(
             """
@@ -535,6 +550,12 @@ class RestartProjectionReader:
             eligible_before=_parse_utc(str(row["safe_end"])),
             authorized_at=authorized_at,
         )
+        if before_artifact_access is not None:
+            before_artifact_access(
+                str(row["provider"]),
+                str(row["dataset"]),
+                environment,
+            )
         streams = self._load_plan_streams(connection, run_id)
         request_rows = connection.execute(
             """
@@ -1493,7 +1514,7 @@ class RestartProjectionReader:
             raise RestartProjectionIntegrityError(
                 "partial non-publication quarantine proof is malformed"
             )
-        blocked: list[tuple[str, datetime, datetime]] = []
+        blocked: list[tuple[str, datetime, datetime, str]] = []
         for value in summary["blocked_streams"]:
             if (
                 not isinstance(value, dict)
@@ -1513,6 +1534,11 @@ class RestartProjectionReader:
                     value["stream_id"],
                     _parse_utc(value["request_start"]),
                     _parse_utc(value["request_end"]),
+                    (
+                        "EXPECTED_OBSERVATION"
+                        if value["validation_codes"] == ["NO_CANONICAL_ROWS"]
+                        else "INTEGRITY"
+                    ),
                 )
             )
         gap_rows = connection.execute(
@@ -1530,6 +1556,7 @@ class RestartProjectionReader:
                 str(value["stream_id"]),
                 _parse_utc(str(value["interval_start"])),
                 _parse_utc(str(value["interval_end"])),
+                str(value["gap_type"]),
             )
             for value in gap_rows
         )
@@ -1547,12 +1574,11 @@ class RestartProjectionReader:
                 stream_id not in expected_streams
                 or start != specification.start
                 or end != specification.end
-                for stream_id, start, end in blocked
+                for stream_id, start, end, _ in blocked
             )
             or tuple(sorted(blocked)) != gaps
             or any(
-                str(value["gap_type"]) != "INTEGRITY"
-                or str(value["status"]) != "OPEN"
+                str(value["status"]) != "OPEN"
                 or not _as_bool(value["blocking"])
                 or value["resolved_at"] is not None
                 or value["canonical_batch_id"] is not None
@@ -2039,15 +2065,43 @@ class RestartProjectionReader:
         )
         relational = connection.execute(
             """
-            SELECT 1 FROM publication_commits AS publication
-            JOIN request_instances AS instance
-              ON instance.request_instance_id = publication.request_instance_id
-            JOIN canonical_batches AS batch
-              ON batch.canonical_batch_id = publication.canonical_batch_id
-            WHERE instance.run_id = ? AND publication.canonical_batch_id = ?
-              AND batch.state IN ('VERIFIED', 'INVALID', 'PURGED')
+            SELECT 1
+            WHERE EXISTS(
+                SELECT 1 FROM publication_commits AS publication
+                JOIN request_instances AS instance
+                  ON instance.request_instance_id = publication.request_instance_id
+                JOIN canonical_batches AS batch
+                  ON batch.canonical_batch_id = publication.canonical_batch_id
+                WHERE instance.run_id = ? AND publication.canonical_batch_id = ?
+                  AND batch.state IN ('VERIFIED', 'INVALID', 'PURGED')
+            ) OR EXISTS(
+                SELECT 1 FROM semantic_noop_commits AS noop
+                JOIN request_instances AS instance
+                  ON instance.request_instance_id = noop.request_instance_id
+                JOIN semantic_noop_supporting_batches AS support
+                  ON support.request_instance_id = noop.request_instance_id
+                JOIN canonical_batches AS batch
+                  ON batch.canonical_batch_id = support.canonical_batch_id
+                WHERE instance.run_id = ? AND support.canonical_batch_id = ?
+                  AND batch.state IN ('VERIFIED', 'INVALID', 'PURGED')
+            ) OR EXISTS(
+                SELECT 1 FROM gaps
+                JOIN request_instances AS instance
+                  ON instance.request_instance_id = gaps.request_instance_id
+                WHERE instance.run_id = ? AND gaps.stream_id = ?
+                  AND gaps.interval_start = ? AND gaps.blocking = 1
+                  AND gaps.status IN ('OPEN', 'REPAIRING')
+            )
             """,
-            (watermark.last_run_id, watermark.last_batch_id),
+            (
+                watermark.last_run_id,
+                watermark.last_batch_id,
+                watermark.last_run_id,
+                watermark.last_batch_id,
+                watermark.last_run_id,
+                watermark.stream_id,
+                _format_utc(watermark.exclusive_frontier),
+            ),
         ).fetchone()
         if relational is None:
             raise RestartProjectionIntegrityError("watermark publication provenance is absent")

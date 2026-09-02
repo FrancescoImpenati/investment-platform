@@ -19,7 +19,10 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from investment_platform.data.operational.schema import LATEST_SCHEMA_VERSION
-from investment_platform.data.operational.store import OperationalStateStore
+from investment_platform.data.operational.store import (
+    DEFAULT_WRITER_LEASE_NAME,
+    OperationalStateStore,
+)
 from investment_platform.data.retention import (
     DatasetPolicyDenied,
     DatasetPolicyStatus,
@@ -59,6 +62,7 @@ from investment_platform.data.storage.transport_spool import (
 from investment_platform.data_root import PrivateDataRoot, PrivateDataRootError
 
 _SAFE_OUTPUT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}\Z")
+_STATUS_NON_TERMINAL_RUN_LIMIT: Final = 20
 _RAW_DIRECTORY = re.compile(
     r"raw/provider=[a-z0-9][a-z0-9._-]{0,127}/"
     r"dataset=[a-z0-9][a-z0-9._-]{0,127}/artifacts/artifact=[0-9a-f]{32}\Z"
@@ -88,6 +92,13 @@ class DiagnosticStatus(StrEnum):
     PASS = "PASS"
     WARN = "WARN"
     FAIL = "FAIL"
+
+
+class DiagnosticRunNextAction(StrEnum):
+    """Fixed operator actions for a durable non-terminal ingestion run."""
+
+    RESUME = "RESUME"
+    WAIT_FOR_WRITER = "WAIT_FOR_WRITER"
 
 
 class _FrozenDiagnosticModel(BaseModel):
@@ -122,6 +133,19 @@ class LatestRunSummary(_FrozenDiagnosticModel):
     mode: str
     status: str
     observed_at: datetime
+
+
+class NonTerminalRunSummary(_FrozenDiagnosticModel):
+    """Bounded, sanitized identity needed to recover work after process loss."""
+
+    run_id: UUID
+    environment: str
+    provider: str
+    dataset: str
+    mode: str
+    status: str
+    observed_at: datetime
+    next_action: DiagnosticRunNextAction
 
 
 class LatestErrorSummary(_FrozenDiagnosticModel):
@@ -187,6 +211,10 @@ class OperationalStatusSnapshot(_FrozenDiagnosticModel):
     quarantine_artifact_count: int = Field(ge=0)
     active_writer_lease: bool
     latest_run: LatestRunSummary | None
+    non_terminal_run_count: int = Field(ge=0)
+    non_terminal_runs: tuple[NonTerminalRunSummary, ...] = Field(
+        max_length=_STATUS_NON_TERMINAL_RUN_LIMIT
+    )
     latest_error: LatestErrorSummary | None
     dataset_policies: tuple[DatasetPolicySummary, ...]
     streams: tuple[StreamStatusSummary, ...]
@@ -296,11 +324,28 @@ class Phase2OperationalDiagnostics:
 
         self._data_root.validate(expected_root_id=self._root_id)
         sqlite_status = self._store.diagnostics()
+        observed_at = self._now()
         with self._store.read_only_connection() as connection:
+            connection.execute("BEGIN")
             counts = connection.execute(
                 """
                 SELECT
                     (SELECT count(*) FROM ingestion_runs) AS run_count,
+                    (SELECT count(*) FROM ingestion_runs AS recoverable
+                     WHERE recoverable.status IN ('PLANNED', 'RUNNING')
+                       AND (
+                           EXISTS(
+                               SELECT 1 FROM ingestion_plan_records AS plan
+                               JOIN ingestion_execution_limits AS limits USING (run_id)
+                               WHERE plan.run_id = recoverable.run_id
+                           )
+                           OR EXISTS(
+                               SELECT 1 FROM raw_replay_operations AS replay
+                               WHERE replay.operation_id = recoverable.run_id
+                                 AND replay.status IN ('PLANNED', 'RUNNING')
+                           )
+                       ))
+                        AS non_terminal_run_count,
                     (SELECT count(*) FROM request_instances) AS request_count,
                     (SELECT count(*) FROM stream_keys) AS stream_count,
                     (SELECT count(*) FROM gaps
@@ -329,6 +374,29 @@ class Phase2OperationalDiagnostics:
                 ORDER BY observed_at DESC, run_id DESC LIMIT 1
                 """
             ).fetchone()
+            non_terminal_run_rows = connection.execute(
+                """
+                SELECT run_id, environment, provider, dataset, mode, status,
+                       coalesce(started_at, created_at) AS observed_at
+                FROM ingestion_runs AS recoverable
+                WHERE recoverable.status IN ('PLANNED', 'RUNNING')
+                  AND (
+                      EXISTS(
+                          SELECT 1 FROM ingestion_plan_records AS plan
+                          JOIN ingestion_execution_limits AS limits USING (run_id)
+                          WHERE plan.run_id = recoverable.run_id
+                      )
+                      OR EXISTS(
+                          SELECT 1 FROM raw_replay_operations AS replay
+                          WHERE replay.operation_id = recoverable.run_id
+                            AND replay.status IN ('PLANNED', 'RUNNING')
+                      )
+                  )
+                ORDER BY observed_at DESC, run_id DESC
+                LIMIT ?
+                """,
+                (_STATUS_NON_TERMINAL_RUN_LIMIT,),
+            ).fetchall()
             # Deliberately omit sanitized_message and every request/provider identifier.
             latest_error_row = connection.execute(
                 """
@@ -369,7 +437,22 @@ class Phase2OperationalDiagnostics:
                          stream.timeframe, stream.session, stream.adjustment
                 """
             ).fetchall()
+            writer_lease_row = connection.execute(
+                """
+                SELECT state, expires_at
+                FROM writer_leases
+                WHERE lease_name = ?
+                """,
+                (DEFAULT_WRITER_LEASE_NAME,),
+            ).fetchone()
+            connection.rollback()
 
+        self._store._assert_diagnostic_snapshot_stable()
+        active_writer_lease = bool(
+            writer_lease_row is not None
+            and str(writer_lease_row["state"]) == "ACTIVE"
+            and _parse_utc(writer_lease_row["expires_at"]) > observed_at
+        )
         latest_run = None
         if latest_run_row is not None:
             latest_run = LatestRunSummary(
@@ -387,6 +470,24 @@ class Phase2OperationalDiagnostics:
                 code=_safe_output(latest_error_row["code"]),
                 occurred_at=_parse_utc(latest_error_row["occurred_at"]),
             )
+        next_action = (
+            DiagnosticRunNextAction.WAIT_FOR_WRITER
+            if active_writer_lease
+            else DiagnosticRunNextAction.RESUME
+        )
+        non_terminal_runs = tuple(
+            NonTerminalRunSummary(
+                run_id=UUID(str(row["run_id"])),
+                environment=_safe_output(row["environment"]),
+                provider=_safe_output(row["provider"]),
+                dataset=_safe_output(row["dataset"]),
+                mode=_safe_output(row["mode"]),
+                status=_safe_output(row["status"]),
+                observed_at=_parse_utc(row["observed_at"]),
+                next_action=next_action,
+            )
+            for row in non_terminal_run_rows
+        )
         policies = tuple(
             DatasetPolicySummary(
                 provider=_safe_output(row["provider"]),
@@ -442,8 +543,10 @@ class Phase2OperationalDiagnostics:
             parquet_part_count=int(counts["part_count"]),
             canonical_row_count=int(counts["row_count"]),
             quarantine_artifact_count=int(counts["quarantine_count"]),
-            active_writer_lease=self._store.get_writer_lease() is not None,
+            active_writer_lease=active_writer_lease,
             latest_run=latest_run,
+            non_terminal_run_count=int(counts["non_terminal_run_count"]),
+            non_terminal_runs=non_terminal_runs,
             latest_error=latest_error,
             dataset_policies=policies,
             streams=streams,
@@ -1429,9 +1532,11 @@ class Phase2OperationalDiagnostics:
 __all__ = [
     "DatasetPolicySummary",
     "DiagnosticCheck",
+    "DiagnosticRunNextAction",
     "DiagnosticStatus",
     "LatestErrorSummary",
     "LatestRunSummary",
+    "NonTerminalRunSummary",
     "OperationalStatusSnapshot",
     "Phase2OperationalDiagnostics",
     "Phase2VerificationReport",

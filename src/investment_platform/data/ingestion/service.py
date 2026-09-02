@@ -77,6 +77,7 @@ from investment_platform.data.operational.coverage_commit import (
     build_blocking_acquisition_gaps,
     build_blocking_integrity_gaps,
     build_publication_coverage_commit,
+    build_semantic_noop_reconciliation,
 )
 from investment_platform.data.operational.execution import (
     CoverageCommit,
@@ -419,6 +420,15 @@ class LivingIngestionService:
         run_id = request.run_id or self._uuid_factory()
         lease = self._store.acquire_writer_lease(self._lease_owner_id, self._lease_ttl)
         try:
+            for provider, dataset in sorted(
+                {(stream.provider, stream.dataset) for stream in request.streams}
+            ):
+                self._policy_enforcer.authorize_processing(
+                    provider,
+                    dataset,
+                    environment=request.environment,
+                    runtime_status=request.runtime_status,
+                )
             if request.intent is IngestionIntent.UPDATE:
                 try:
                     reconciled = self._replay_repository.reconcile_stream_integrity(
@@ -490,12 +500,25 @@ class LivingIngestionService:
         finally:
             self._release_lease(lease)
 
-    def reconcile_integrity(self, streams: Sequence[StreamKey]) -> bool:
+    def reconcile_integrity(
+        self,
+        streams: Sequence[StreamKey],
+        *,
+        environment: RuntimeEnvironment,
+        runtime_status: DatasetRuntimeStatus | None = None,
+    ) -> bool:
         """Recheck selected verified support without constructing a provider."""
 
         stream_ids = tuple(sorted({stream.stream_id for stream in streams}))
         if not stream_ids or len(stream_ids) != len(streams):
             raise ValueError("integrity reconciliation requires unique streams")
+        for provider, dataset in sorted({(stream.provider, stream.dataset) for stream in streams}):
+            self._policy_enforcer.authorize_processing(
+                provider,
+                dataset,
+                environment=environment,
+                runtime_status=runtime_status,
+            )
         lease = self._store.acquire_writer_lease(self._lease_owner_id, self._lease_ttl)
         try:
             results = self._replay_repository.reconcile_stream_integrity(
@@ -595,6 +618,12 @@ class LivingIngestionService:
         )
         if operation.status is not RawReplayOperationStatus.RUNNING:
             raise LivingIngestionIncomplete(f"RAW_REPLAY_{operation.status.value}")
+        self._policy_enforcer.authorize_processing(
+            operation.specification.provider,
+            operation.specification.dataset,
+            environment=operation.environment,
+            runtime_status=runtime_status,
+        )
         replay = self._replay_repository.find_latest_replayable_acquisition(
             operation.specification,
             operation.eligibility,
@@ -679,13 +708,28 @@ class LivingIngestionService:
         faults: LivingIngestionFaults,
         runtime_status: DatasetRuntimeStatus | None,
     ) -> LivingIngestionRunResult:
+        def authorize_artifact_access(
+            provider: str,
+            dataset: str,
+            environment: RuntimeEnvironment,
+        ) -> None:
+            self._policy_enforcer.authorize_processing(
+                provider,
+                dataset,
+                environment=environment,
+                runtime_status=runtime_status,
+            )
+
         iterations = 0
         while True:
             iterations += 1
             if iterations > 10_000:
                 raise LivingIngestionServiceError("restart state did not converge")
             self._heartbeat(lease)
-            context = self._restart_reader.load_run(run_id)
+            context = self._restart_reader.load_run(
+                run_id,
+                before_artifact_access=authorize_artifact_access,
+            )
             unfinished = tuple(
                 request for request in context.requests if request.status not in _TERMINAL_REQUESTS
             )
@@ -697,7 +741,12 @@ class LivingIngestionService:
                         fault_injector=faults.operational,
                     )
                     continue
-                return self._result(self._restart_reader.load_run(run_id))
+                return self._result(
+                    self._restart_reader.load_run(
+                        run_id,
+                        before_artifact_access=authorize_artifact_access,
+                    )
+                )
 
             current = unfinished[0]
             if current.action is RestartAction.DISPATCH:
@@ -1195,6 +1244,12 @@ class LivingIngestionService:
         authorization = latest.acquisition_authorization
         if authorization is None:
             raise LivingIngestionServiceError("processing lacks acquisition authorization")
+        processing_policy = self._policy_enforcer.authorize_processing(
+            request.specification.provider,
+            request.specification.dataset,
+            environment=authorization.request.environment,
+            runtime_status=runtime_status,
+        )
         identity = AttemptIdentity(
             attempt_id=latest.attempt_id,
             request_instance_id=request.request_instance_id,
@@ -1331,6 +1386,45 @@ class LivingIngestionService:
             comparison is not None
             and comparison.disposition is CandidateBatchDisposition.SEMANTIC_NO_OP
         ):
+            duplicate_observations = tuple(
+                SemanticNoOpObservationProof(
+                    observation_id=value.observation_id,
+                    value_fingerprint=value.value_fingerprint,
+                    stream_id=value.stream_id,
+                    start=value.start,
+                    end=value.end,
+                    matching_supporting_batch_ids=(value.matching_canonical_batch_ids),
+                )
+                for value in comparison.semantic_duplicate_slots
+            )
+            committed_at = max(self._now(), fixed_time)
+            stream_proofs = self._restart_reader.load_stream_proofs(
+                tuple(sorted(stream.stream_id for stream in request.specification.stream_keys()))
+            )
+            policy_snapshot_id = deterministic_policy_snapshot_id(
+                context.plan.policy_authorization.policy_snapshot
+            )
+            reconciliation = build_semantic_noop_reconciliation(
+                specification=request.specification,
+                duplicate_observations=duplicate_observations,
+                calendar_snapshot=calendar,
+                calendar_snapshot_id=context.calendar_snapshot_id,
+                policy_snapshot_id=policy_snapshot_id,
+                policy=processing_policy,
+                runtime_status=runtime_status,
+                run_id=context.run_id,
+                coverage_start=self._coverage_start(context.plan, stream_proofs),
+                frontier_domain_end=max(
+                    request.specification.end,
+                    *(segment.end for segment in stream_proofs.coverage),
+                    *(gap.end for gap in stream_proofs.gaps),
+                    *(value.exclusive_frontier for value in stream_proofs.watermarks),
+                ),
+                verified_at=committed_at,
+                existing_segments=stream_proofs.coverage,
+                existing_gaps=stream_proofs.gaps,
+                existing_watermarks=stream_proofs.watermarks,
+            )
             self._execution_repository.commit_semantic_noop(
                 lease,
                 SemanticNoOpCommitRequest(
@@ -1341,19 +1435,10 @@ class LivingIngestionService:
                         prepared.batch_context.batch_identity.processing_signature
                     ),
                     batch_context_id=prepared.batch_context.batch_context_id,
-                    duplicate_observations=tuple(
-                        SemanticNoOpObservationProof(
-                            observation_id=value.observation_id,
-                            value_fingerprint=value.value_fingerprint,
-                            stream_id=value.stream_id,
-                            start=value.start,
-                            end=value.end,
-                            matching_supporting_batch_ids=(value.matching_canonical_batch_ids),
-                        )
-                        for value in comparison.semantic_duplicate_slots
-                    ),
+                    duplicate_observations=duplicate_observations,
+                    reconciliation=reconciliation,
                 ),
-                committed_at=max(self._now(), fixed_time),
+                committed_at=committed_at,
             )
             _invoke(faults.service, LivingIngestionFaultPoint.SQLITE_COMMITTED)
             return
@@ -1738,7 +1823,26 @@ class _ProductionCommandRunner(IngestionCommandRunner):
                         policy_enforcer=enforcer,
                     )
                     return self._raw_replay_result(replay_service.resume_raw_replay(run_id))
-                context = RestartProjectionReader(store).load_run(run_id)
+
+                def authorize_artifact_access(
+                    provider: str,
+                    dataset: str,
+                    environment: RuntimeEnvironment,
+                ) -> None:
+                    if environment is not self._settings.environment:
+                        raise LivingIngestionServiceError(
+                            "durable run environment differs from the active runtime"
+                        )
+                    enforcer.authorize_processing(
+                        provider,
+                        dataset,
+                        environment=environment,
+                    )
+
+                context = RestartProjectionReader(store).load_run(
+                    run_id,
+                    before_artifact_access=authorize_artifact_access,
+                )
                 provider_required = any(
                     request.action
                     in {
@@ -1822,7 +1926,10 @@ class _ProductionCommandRunner(IngestionCommandRunner):
                 policy_enforcer=enforcer,
             )
             try:
-                integrity_loss = integrity.reconcile_integrity(streams)
+                integrity_loss = integrity.reconcile_integrity(
+                    streams,
+                    environment=self._settings.environment,
+                )
                 raw_replay_requested = (
                     request.intent is IngestionIntent.REPAIR
                     and request.repair_strategy is RepairStrategy.RAW_REPLAY
